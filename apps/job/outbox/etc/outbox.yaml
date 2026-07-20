@@ -1,0 +1,24 @@
+Name: outbox.job
+
+Mysql:
+  DataSource: root:123456@tcp(127.0.0.1:3308)/feedsystem_zero?charset=utf8mb4&parseTime=true&loc=Local
+
+Kafka:
+  Brokers:
+    - 127.0.0.1:9094
+  RequiredAcks: 1
+  BatchSize: 100
+  BatchBytes: 1048576
+  FlushMs: 100
+  RetryMax: 3
+
+Outbox:
+  BatchSize: 100
+  WorkerCount: 4
+  PollIntervalMs: 1000
+  MaxRetry: 10
+  RetryBaseMs: 1000
+  RetryMaxMs: 60000
+  ClaimTimeoutSeconds: 60
+  EventTimeoutMs: 10000
+  PublishTimeoutMs: 5000

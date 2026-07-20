@@ -1,0 +1,382 @@
+syntax = "v1"
+
+type (
+	//验证服务
+	VerificationReq {
+		Email string `json:"email"`
+	}
+	VerificationResp {
+		Verification string `json:"verification"`
+	}
+	//注册服务
+	RegisterReq {
+		Username     string `json:"username"`
+		Password     string `json:"password"`
+		Email        string `json:"email"`
+		Verification string `json:"verification"`
+	}
+	RegisterResp {
+		Msg string `json:"msg"`
+	}
+	//登录服务
+	LoginReq {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	LoginResp {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	//登出服务
+	LogoutReq  {}
+	LogoutResp {
+		Msg string `json:"msg"`
+	}
+	//刷新token
+	RefreshTokenReq {
+		RefreshToken string `json:"refresh_token"`
+	}
+	RefreshTokenResp {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	//获取用户信息
+	GetProfileReq  {}
+	GetProfileResp {
+		Userid    uint64 `json:"user_id"`
+		Username  string `json:"username"`
+		Email     string `json:"email"`
+		Avatarurl string `json:"avatar_url"`
+		Bio       string `json:"bio"`
+	}
+	//更新用户信息
+	UpdateProfileReq {
+		Username  string  `json:"username,optional"`
+		Avatarurl string  `json:"avatar_url,optional"`
+		Bio       *string `json:"bio,optional"`
+	}
+	UpdateProfileResp {
+		Msg string `json:"msg"`
+	}
+	//上传视频文件
+	UploadVideoResp {
+		Msg     string `json:"msg"`
+		Playurl string `json:"play_url"`
+	}
+	//初始化分片上传
+	InitVideoUploadReq {
+		Filename    string `json:"filename"`
+		Filehash    string `json:"file_hash"`
+		Filesize    int64  `json:"file_size"`
+		Chunksize   int64  `json:"chunk_size,optional"`
+		Totalchunks int64  `json:"total_chunks,optional"`
+	}
+	InitVideoUploadResp {
+		Msg                 string  `json:"msg"`
+		Uploadid            string  `json:"upload_id"`
+		Needupload          bool    `json:"need_upload"`
+		Needchunk           bool    `json:"need_chunk"`
+		Playurl             string  `json:"play_url"`
+		Uploadedchunks      []int64 `json:"uploaded_chunks"`
+		Chunksize           int64   `json:"chunk_size"`
+		Chunkthresholdbytes int64   `json:"chunk_threshold_bytes"`
+	}
+	//上传单个视频分片，handler 中读取 multipart/form-data
+	UploadVideoChunkReq {
+		Uploadid   string `form:"upload_id"`
+		Chunkindex int64  `form:"chunk_index"`
+		Chunkhash  string `form:"chunk_hash"`
+	}
+	UploadVideoChunkResp {
+		Msg            string  `json:"msg"`
+		Uploadid       string  `json:"upload_id"`
+		Chunkindex     int64   `json:"chunk_index"`
+		Uploadedchunks []int64 `json:"uploaded_chunks"`
+	}
+	//查询分片上传状态
+	VideoUploadStatusReq {
+		Uploadid string `form:"upload_id"`
+		Filehash string `form:"file_hash,optional"`
+	}
+	VideoUploadStatusResp {
+		Uploadid       string  `json:"upload_id"`
+		Uploadedchunks []int64 `json:"uploaded_chunks"`
+		Totalchunks    int64   `json:"total_chunks"`
+		Completed      bool    `json:"completed"`
+		Playurl        string  `json:"play_url"`
+	}
+	//完成分片上传并合并文件
+	CompleteVideoUploadReq {
+		Uploadid    string `json:"upload_id"`
+		Filename    string `json:"filename"`
+		Filehash    string `json:"file_hash"`
+		Filesize    int64  `json:"file_size"`
+		Totalchunks int64  `json:"total_chunks"`
+	}
+	CompleteVideoUploadResp {
+		Msg      string `json:"msg"`
+		Playurl  string `json:"play_url"`
+		Filehash string `json:"file_hash"`
+	}
+	//上传封面
+	UploadCoverResp {
+		Msg      string `json:"msg"`
+		Coverurl string `json:"cover_url"`
+	}
+	//视频基础信息
+	VideoInfo {
+		Videoid        uint64   `json:"video_id"`
+		Authorid       uint64   `json:"author_id"`
+		Authorusername string   `json:"author_username"`
+		Title          string   `json:"title"`
+		Description    string   `json:"description"`
+		Playurl        string   `json:"play_url"`
+		Coverurl       string   `json:"cover_url"`
+		Likescount     int64    `json:"likes_count"`
+		Commentscount  int64    `json:"comments_count"`
+		Popularity     int64    `json:"popularity"`
+		Status         int32    `json:"status"`
+		Createdat      int64    `json:"created_at"`
+		Updatedat      int64    `json:"updated_at"`
+		Isliked        bool     `json:"is_liked"`
+		Tags           []string `json:"tags"`
+	}
+	//发布视频
+	PublishVideoReq {
+		Title       string   `json:"title"`
+		Description string   `json:"description,optional"`
+		Playurl     string   `json:"play_url"`
+		Coverurl    string   `json:"cover_url"`
+		Tags        []string `json:"tags,optional"`
+	}
+	PublishVideoResp {
+		Msg   string    `json:"msg"`
+		Video VideoInfo `json:"video"`
+	}
+	//获取视频信息
+	GetVideoReq {
+		Videoid uint64 `path:"id"`
+	}
+	GetVideoResp {
+		Video VideoInfo `json:"video"`
+	}
+	//显示某用户发布的视频
+	ListUserVideosReq {
+		Authorid        uint64 `path:"author_id"`
+		Cursorcreatedat int64  `form:"cursor_created_at,optional"`
+		Cursorvideoid   uint64 `form:"cursor_video_id,optional"`
+		Pagesize        int64  `form:"page_size,optional"`
+	}
+	ListUserVideosResp {
+		Videos              []VideoInfo `json:"videos"`
+		Nextcursorcreatedat int64       `json:"next_cursor_created_at"`
+		Nextcursorvideoid   uint64      `json:"next_cursor_video_id"`
+		Hasmore             bool        `json:"has_more"`
+	}
+	//删除视频
+	DeleteVideoReq {
+		Videoid uint64 `path:"id"`
+	}
+	DeleteVideoResp {
+		Msg string `json:"msg"`
+	}
+	//点赞视频
+	LikeVideoReq {
+		Videoid uint64 `path:"id"`
+	}
+	LikeVideoResp {
+		Msg        string `json:"msg"`
+		Liked      bool   `json:"liked"`
+		Likescount int64  `json:"likes_count"`
+	}
+	//取消点赞
+	UnlikeVideoReq {
+		Videoid uint64 `path:"id"`
+	}
+	UnlikeVideoResp {
+		Msg        string `json:"msg"`
+		Liked      bool   `json:"liked"`
+		Likescount int64  `json:"likes_count"`
+	}
+	//查询是否点赞，未登录时返回 false
+	IsLikedReq {
+		Videoid uint64 `path:"id"`
+	}
+	IsLikedResp {
+		Liked bool `json:"liked"`
+	}
+	//当前用户喜欢列表，gateway 会补齐视频基础信息和互动统计
+	LikedVideoInfo {
+		Likeid  uint64    `json:"like_id"`
+		Likedat int64     `json:"liked_at"`
+		Video   VideoInfo `json:"video"`
+	}
+	ListMyLikedVideosReq {
+		Cursorcreatedat int64  `form:"cursor_created_at,optional"`
+		Cursorlikeid    uint64 `form:"cursor_like_id,optional"`
+		Pagesize        int64  `form:"page_size,optional"`
+	}
+	ListMyLikedVideosResp {
+		Likedvideos         []LikedVideoInfo `json:"liked_videos"`
+		Nextcursorcreatedat int64            `json:"next_cursor_created_at"`
+		Nextcursorlikeid    uint64           `json:"next_cursor_like_id"`
+		Hasmore             bool             `json:"has_more"`
+	}
+	//评论信息
+	CommentInfo {
+		Commentid uint64 `json:"comment_id"`
+		Videoid   uint64 `json:"video_id"`
+		Userid    uint64 `json:"user_id"`
+		Username  string `json:"username"`
+		Content   string `json:"content"`
+		Createdat int64  `json:"created_at"`
+		Updatedat int64  `json:"updated_at"`
+		Candelete bool   `json:"can_delete"`
+	}
+	//发布评论
+	PublishCommentReq {
+		Videoid   uint64 `path:"id"`
+		Content   string `json:"content"`
+		Requestid string `json:"request_id,optional"`
+	}
+	PublishCommentResp {
+		Msg           string      `json:"msg"`
+		Comment       CommentInfo `json:"comment"`
+		Commentscount int64       `json:"comments_count"`
+	}
+	//删除评论
+	DeleteCommentReq {
+		Commentid uint64 `path:"comment_id"`
+	}
+	DeleteCommentResp {
+		Msg           string `json:"msg"`
+		Deleted       bool   `json:"deleted"`
+		Commentscount int64  `json:"comments_count"`
+	}
+	//查询评论列表
+	ListCommentsReq {
+		Videoid         uint64 `path:"id"`
+		Cursorcreatedat int64  `form:"cursor_created_at,optional"`
+		Cursorcommentid uint64 `form:"cursor_comment_id,optional"`
+		Pagesize        int64  `form:"page_size,optional"`
+	}
+	ListCommentsResp {
+		Comments            []CommentInfo `json:"comments"`
+		Nextcursorcreatedat int64         `json:"next_cursor_created_at"`
+		Nextcursorcommentid uint64        `json:"next_cursor_comment_id"`
+		Hasmore             bool          `json:"has_more"`
+	}
+)
+
+@server (
+	prefix: /account
+)
+//user-api模块
+service gateway {
+	//不带JWT鉴权的
+	@handler SendVerification
+	post /verification (VerificationReq) returns (VerificationResp)
+
+	@handler Register
+	post /register (RegisterReq) returns (RegisterResp)
+
+	@handler Login
+	post /login (LoginReq) returns (LoginResp)
+
+	@handler RefreshToken
+	post /refresh_token (RefreshTokenReq) returns (RefreshTokenResp)
+}
+
+@server (
+	prefix:     /account
+	jwt:        Auth
+	middleware: TokenAuth
+)
+service gateway {
+	//带JWT鉴权的
+	@handler Logout
+	post /logout (LogoutReq) returns (LogoutResp)
+
+	@handler GetProfile
+	get /profile (GetProfileReq) returns (GetProfileResp)
+
+	@handler UpdateProfile
+	put /profile (UpdateProfileReq) returns (UpdateProfileResp)
+}
+
+@server (
+	prefix:     /video
+	middleware: OptionalTokenAuth
+)
+service gateway {
+	@handler ListUserVideos
+	get /user/:author_id (ListUserVideosReq) returns (ListUserVideosResp)
+
+	@handler GetVideo
+	get /:id (GetVideoReq) returns (GetVideoResp)
+}
+
+@server (
+	prefix:     /video
+	jwt:        Auth
+	middleware: TokenAuth
+)
+service gateway {
+	@handler UploadVideo
+	post /upload returns (UploadVideoResp)
+
+	@handler InitVideoUpload
+	post /upload/init (InitVideoUploadReq) returns (InitVideoUploadResp)
+
+	@handler UploadVideoChunk
+	post /upload/chunk (UploadVideoChunkReq) returns (UploadVideoChunkResp)
+
+	@handler VideoUploadStatus
+	get /upload/status (VideoUploadStatusReq) returns (VideoUploadStatusResp)
+
+	@handler CompleteVideoUpload
+	post /upload/complete (CompleteVideoUploadReq) returns (CompleteVideoUploadResp)
+
+	@handler UploadCover
+	post /cover returns (UploadCoverResp)
+
+	@handler PublishVideo
+	post /publish (PublishVideoReq) returns (PublishVideoResp)
+
+	@handler DeleteVideo
+	delete /:id (DeleteVideoReq) returns (DeleteVideoResp)
+}
+
+@server (
+	prefix:     /interaction
+	middleware: OptionalTokenAuth
+)
+service gateway {
+	@handler IsLiked
+	get /video/:id/liked (IsLikedReq) returns (IsLikedResp)
+
+	@handler ListComments
+	get /video/:id/comments (ListCommentsReq) returns (ListCommentsResp)
+}
+
+@server (
+	prefix:     /interaction
+	jwt:        Auth
+	middleware: TokenAuth
+)
+service gateway {
+	@handler LikeVideo
+	post /video/:id/like (LikeVideoReq) returns (LikeVideoResp)
+
+	@handler UnlikeVideo
+	delete /video/:id/like (UnlikeVideoReq) returns (UnlikeVideoResp)
+
+	@handler ListMyLikedVideos
+	get /likes (ListMyLikedVideosReq) returns (ListMyLikedVideosResp)
+
+	@handler PublishComment
+	post /video/:id/comments (PublishCommentReq) returns (PublishCommentResp)
+
+	@handler DeleteComment
+	delete /comments/:comment_id (DeleteCommentReq) returns (DeleteCommentResp)
+}

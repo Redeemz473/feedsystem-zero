@@ -1,0 +1,24 @@
+Name: interaction.rpc
+ListenOn: 0.0.0.0:9003
+
+Etcd:
+  Hosts:
+    - 127.0.0.1:23790
+  Key: interaction.rpc
+
+Mysql:
+  DataSource: root:123456@tcp(127.0.0.1:3308)/feedsystem_zero?charset=utf8mb4&parseTime=true&loc=Local
+
+BizRedis:
+  Addr: 127.0.0.1:6380
+  Password: "123456"
+  DB: 0
+
+Kafka:
+  Brokers:
+    - 127.0.0.1:9094
+  RequiredAcks: 1
+  BatchSize: 100
+  BatchBytes: 1048576
+  FlushMs: 100
+  RetryMax: 3

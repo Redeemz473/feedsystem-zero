@@ -1,0 +1,229 @@
+syntax = "proto3";
+
+package interaction;
+
+option go_package = "./interaction";
+
+// 评论信息，发布评论和查询评论列表都会复用这个结构。
+// can_delete 由服务端根据当前请求用户和评论归属计算，不能由前端传入。
+message CommentInfo {
+  uint64 comment_id = 1;
+  uint64 video_id = 2;
+  uint64 user_id = 3;
+  string username = 4;
+  string content = 5;
+  int64 created_at = 6; // Unix 毫秒时间戳
+  int64 updated_at = 7; // Unix 毫秒时间戳
+  bool can_delete = 8;
+}
+
+// 点赞接口必须保证幂等：
+// 同一个用户重复点赞同一个视频时，直接返回 liked=true，不重复增加计数。
+message LikeVideoReq {
+  uint64 user_id = 1;
+  uint64 video_id = 2;
+}
+
+message LikeVideoResp {
+  string msg = 1;
+  bool liked = 2;
+  int64 likes_count = 3;
+}
+
+// 取消点赞接口必须保证幂等：
+// 同一个用户重复取消点赞同一个视频时，直接返回 liked=false，不重复减少计数。
+message UnlikeVideoReq {
+  uint64 user_id = 1;
+  uint64 video_id = 2;
+}
+
+message UnlikeVideoResp {
+  string msg = 1;
+  bool liked = 2;
+  int64 likes_count = 3;
+}
+
+message IsLikedReq {
+  uint64 user_id = 1;
+  uint64 video_id = 2;
+}
+
+message IsLikedResp {
+  bool liked = 1;
+}
+
+// 用户点赞过的视频列表项。
+// 这里只返回 video_id，视频详情由 gateway 再批量调用 video/feed 服务补全。
+message LikedVideoItem {
+  uint64 like_id = 1;
+  uint64 video_id = 2;
+  int64 liked_at = 3; // Unix 毫秒时间戳
+}
+
+// 查询当前用户点赞过的视频。
+// 这里只返回视频 ID 和点赞时间，不直接返回完整视频详情，避免 interaction 服务耦合 video 服务。
+message ListMyLikedVideosReq {
+  uint64 user_id = 1;
+  int64 cursor_created_at = 2;
+  uint64 cursor_like_id = 3;
+  int64 page_size = 4;
+}
+
+message ListMyLikedVideosResp {
+  repeated LikedVideoItem liked_videos = 1;
+  int64 next_cursor_created_at = 2;
+  uint64 next_cursor_like_id = 3;
+  bool has_more = 4;
+}
+
+// 发布评论。
+// request_id 必填，建议由 gateway 或前端生成，用于评论发布幂等。
+message PublishCommentReq {
+  uint64 user_id = 1;
+  string username = 2;
+  uint64 video_id = 3;
+  string content = 4;
+  string request_id = 5;
+}
+
+message PublishCommentResp {
+  string msg = 1;
+  CommentInfo comment = 2;
+  int64 comments_count = 3;
+}
+
+message DeleteCommentReq {
+  uint64 user_id = 1;
+  uint64 comment_id = 2;
+}
+
+message DeleteCommentResp {
+  string msg = 1;
+  bool deleted = 2;
+  int64 comments_count = 3;
+}
+
+message ListCommentsReq {
+  uint64 video_id = 1;
+  uint64 viewer_id = 2;
+  int64 cursor_created_at = 3;
+  uint64 cursor_comment_id = 4;
+  int64 page_size = 5;
+}
+
+message ListCommentsResp {
+  repeated CommentInfo comments = 1;
+  int64 next_cursor_created_at = 2;
+  uint64 next_cursor_comment_id = 3;
+  bool has_more = 4;
+}
+
+message VideoInteractionStats {
+  uint64 video_id = 1;
+  int64 likes_count = 2;
+  int64 comments_count = 3;
+  int64 popularity = 4;
+  bool is_liked = 5;
+}
+
+// 批量查询视频互动统计。
+// gateway/video/feed 可以用它给视频详情页、列表页补充点赞数、评论数、热度和是否点赞。
+message BatchGetVideoStatsReq {
+  uint64 viewer_id = 1;
+  repeated uint64 video_ids = 2;
+}
+
+message BatchGetVideoStatsResp {
+  repeated VideoInteractionStats stats = 1;
+}
+
+// 内部事件类型，主要给 job/worker 批处理或补偿使用。
+enum LikeAction {
+  LIKE_ACTION_UNKNOWN = 0;
+  LIKE_ACTION_LIKE = 1;
+  LIKE_ACTION_UNLIKE = 2;
+}
+
+enum CommentAction {
+  COMMENT_ACTION_UNKNOWN = 0;
+  COMMENT_ACTION_CREATE = 1;
+  COMMENT_ACTION_DELETE = 2;
+}
+
+message LikeEvent {
+  string event_id = 1;
+  uint64 video_id = 2;
+  uint64 user_id = 3;
+  LikeAction action = 4;
+  int64 event_time = 5; // Unix 毫秒时间戳
+}
+
+message CommentEvent {
+  string event_id = 1;
+  uint64 video_id = 2;
+  uint64 comment_id = 3;
+  uint64 user_id = 4;
+  CommentAction action = 5;
+  int64 event_time = 6; // Unix 毫秒时间戳
+}
+
+// 点赞事件批量刷库接口。
+// 内部补偿/批处理接口。
+message FlushLikeEventsReq {
+  repeated LikeEvent events = 1;
+}
+
+message FlushLikeEventsResp {
+  int64 success_count = 1;
+  repeated string failed_event_ids = 2;
+}
+
+// 评论事件批量处理接口。
+// 主要用于异步维护评论计数、热度、通知等派生数据。
+message FlushCommentEventsReq {
+  repeated CommentEvent events = 1;
+}
+
+message FlushCommentEventsResp {
+  int64 success_count = 1;
+  repeated string failed_event_ids = 2;
+}
+
+// 重建视频互动统计。
+// 这是内部修复接口，用于 Redis/MySQL 计数不一致时重新计算点赞数、评论数和热度。
+message RebuildVideoInteractionStatsReq {
+  repeated uint64 video_ids = 1;
+}
+
+message RebuildVideoInteractionStatsResp {
+  repeated VideoInteractionStats stats = 1;
+}
+
+//互动服务
+service Interaction {
+  // 点赞视频
+  rpc LikeVideo(LikeVideoReq) returns (LikeVideoResp);
+  // 取消点赞
+  rpc UnlikeVideo(UnlikeVideoReq) returns (UnlikeVideoResp);
+  // 查询当前用户是否点赞某视频
+  rpc IsLiked(IsLikedReq) returns (IsLikedResp);
+  // 查询当前用户点赞过的视频 ID 列表
+  rpc ListMyLikedVideos(ListMyLikedVideosReq) returns (ListMyLikedVideosResp);
+
+  // 发布评论
+  rpc PublishComment(PublishCommentReq) returns (PublishCommentResp);
+  // 删除评论
+  rpc DeleteComment(DeleteCommentReq) returns (DeleteCommentResp);
+  // 查询视频评论列表
+  rpc ListComments(ListCommentsReq) returns (ListCommentsResp);
+
+  // 批量查询视频互动统计
+  rpc BatchGetVideoStats(BatchGetVideoStatsReq) returns (BatchGetVideoStatsResp);
+
+  // 内部接口：批量处理点赞事件
+  rpc FlushLikeEvents(FlushLikeEventsReq) returns (FlushLikeEventsResp);
+  // 内部接口：批量处理评论事件
+  rpc FlushCommentEvents(FlushCommentEventsReq) returns (FlushCommentEventsResp);
+  // 内部接口：重建视频互动统计
+  rpc RebuildVideoInteractionStats(RebuildVideoInteractionStatsReq) returns (RebuildVideoInteractionStatsResp);
+}

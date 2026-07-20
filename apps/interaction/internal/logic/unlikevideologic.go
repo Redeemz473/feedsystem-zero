@@ -1,0 +1,224 @@
+package logic
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strconv"
+	"time"
+
+	"feedsystem-zero/apps/interaction/interaction"
+	"feedsystem-zero/apps/interaction/internal/model"
+	"feedsystem-zero/apps/interaction/internal/svc"
+	"feedsystem-zero/common/eventx"
+	"feedsystem-zero/common/rediskey"
+
+	"github.com/zeromicro/go-zero/core/logx"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"gorm.io/gorm"
+)
+
+type UnlikeVideoLogic struct {
+	ctx    context.Context
+	svcCtx *svc.ServiceContext
+	logx.Logger
+}
+
+func NewUnlikeVideoLogic(ctx context.Context, svcCtx *svc.ServiceContext) *UnlikeVideoLogic {
+	return &UnlikeVideoLogic{
+		ctx:    ctx,
+		svcCtx: svcCtx,
+		Logger: logx.WithContext(ctx),
+	}
+}
+
+var errNoActiveRecord = errors.New("no active record")
+
+func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interaction.UnlikeVideoResp, error) {
+	// 1. 校验 user_id、video_id 都不能为 0。
+	userID := in.GetUserId()
+	if userID == 0 {
+		return nil, status.Error(codes.Unauthenticated, "用户未登录")
+	}
+	videoID := in.GetVideoId()
+	if videoID == 0 {
+		return nil, status.Error(codes.InvalidArgument, "视频ID不能为空")
+	}
+	var video model.Video
+	if err := l.svcCtx.GormDB.WithContext(l.ctx).
+		Where("id = ? AND status = ? AND deleted_at IS NULL", videoID, model.VideoStatusNormal).
+		First(&video).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, status.Error(codes.NotFound, "视频不存在或已删除")
+		}
+		l.Errorf("get video failed, video_id: %d, error: %v", videoID, err)
+		return nil, status.Error(codes.Internal, "查询视频失败")
+	}
+
+	if err := rejectIfStatsRebuildRunning(l.ctx, l.svcCtx.RedisCli); err != nil {
+		if status.Code(err) == codes.Aborted {
+			return nil, err
+		}
+		l.Errorf("check rebuild stats lock failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+	}
+
+	// 2. 使用 rediskey.LikeActionLockKey(video_id,user_id) 加短 TTL 锁，和 LikeVideo 共用同一把锁。
+	lockKey := rediskey.LikeActionLockKey(videoID, userID)
+	lockToken, err := randomHex(16)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "生成点击锁失败")
+	}
+	locked, err := l.svcCtx.RedisCli.SetNX(l.ctx, lockKey, lockToken, likeActionLockTTL).Result()
+	if err != nil {
+		return nil, status.Error(codes.Internal, "获取点击锁失败")
+	}
+	if !locked {
+		return nil, status.Error(codes.Aborted, "操作过于频繁，请稍后重试")
+	}
+	defer func() {
+		if err := releaseRedisLock(l.ctx, l.svcCtx.RedisCli, lockKey, lockToken); err != nil {
+			l.Errorf("release like action lock failed, key: %s, error: %v", lockKey, err)
+		}
+	}()
+	// 3. 先查 Redis LikeStateKey：
+	liked, hit, err := loadLikeStateFromRedis(l.ctx, l.svcCtx.RedisCli, videoID, userID)
+	if err != nil {
+		l.Errorf("get like state from redis failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+		return nil, status.Error(codes.Internal, "查询点赞状态失败")
+	}
+	//    - 如果已经是 0，说明已取消点赞，直接幂等返回 liked=false。
+	if hit && !liked {
+		return &interaction.UnlikeVideoResp{
+			Msg:        "已取消点赞",
+			Liked:      false,
+			LikesCount: realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video),
+		}, nil
+	}
+	//    - 如果未命中，再查 MySQL likes 表中 status=1 的记录兜底。
+	if !hit {
+		dbLiked, err := loadLikeStateFromDB(l.ctx, l.svcCtx.GormDB, videoID, userID)
+		if err != nil {
+			l.Errorf("get like state from db failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+			return nil, status.Error(codes.Internal, "查询点赞状态失败")
+		}
+		// 4.  MySQL 也没有有效点赞记录，把 Redis 状态补齐后幂等返回。
+		if !dbLiked {
+			if err := fillUnlikedState(l.ctx, l.svcCtx.RedisCli, videoID, userID); err != nil {
+				l.Errorf("fill redis unliked state failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+			}
+			return &interaction.UnlikeVideoResp{
+				Msg:        "已取消点赞",
+				Liked:      false,
+				LikesCount: realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video),
+			}, nil
+		}
+	}
+
+	// Redis 命中 liked=true 或 MySQL 确认已点赞时，继续执行取消点赞。
+	//创建并封装事件
+	eventID, err := newEventID("unlike")
+	if err != nil {
+		return nil, status.Error(codes.Internal, "生成事件ID失败")
+	}
+	now := time.Now()
+	occurredAt := now.UnixMilli()
+
+	unlikeEvent := eventx.LikeEvent{
+		EventID:    eventID,
+		VideoID:    videoID,
+		UserID:     userID,
+		Action:     eventx.LikeActionUnlike,
+		Delta:      -1,
+		OccurredAt: occurredAt,
+	}
+
+	payloadBytes, err := json.Marshal(unlikeEvent)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "序列化取消点赞事件失败")
+	}
+	envelopeBytes, err := json.Marshal(eventx.Envelope{
+		EventID:       eventID,
+		EventType:     eventx.EventTypeLikeDeleted,
+		AggregateType: eventx.AggregateLike,
+		AggregateID:   strconv.FormatUint(videoID, 10) + ":" + strconv.FormatUint(userID, 10),
+		Producer:      "interaction-rpc",
+		OccurredAt:    occurredAt,
+		Payload:       payloadBytes,
+	})
+	if err != nil {
+		return nil, status.Error(codes.Internal, "序列化 outbox 事件失败")
+	}
+
+	// 5. MySQL 事务：先软删除点赞关系，再写 interaction_events 和 outbox_events。
+	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.Like{}).
+			Where(
+				"video_id = ? AND user_id = ? AND status = ? AND deleted_at IS NULL",
+				videoID,
+				userID,
+				model.LikeStatusActive,
+			).
+			Updates(map[string]any{
+				"status":     model.LikeStatusDeleted,
+				"deleted_at": now,
+				"updated_at": now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return errNoActiveRecord
+		}
+
+		if err := tx.Create(&model.InteractionEvent{
+			EventID:   eventID,
+			EventType: eventx.EventTypeLikeDeleted,
+			VideoID:   videoID,
+			UserID:    userID,
+			Action:    eventx.LikeActionUnlike,
+			Delta:     -1,
+			Payload:   string(payloadBytes),
+			CreatedAt: now,
+		}).Error; err != nil {
+			return err
+		}
+
+		return tx.Create(&model.OutboxEvent{
+			EventID:       eventID,
+			Topic:         eventx.TopicInteractionLikeEvents,
+			EventType:     eventx.EventTypeLikeDeleted,
+			AggregateType: eventx.AggregateLike,
+			AggregateID:   strconv.FormatUint(videoID, 10),
+			Payload:       string(envelopeBytes),
+			Status:        model.OutboxStatusPending,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}).Error
+	}); err != nil {
+		if errors.Is(err, errNoActiveRecord) {
+			if err := fillUnlikedState(l.ctx, l.svcCtx.RedisCli, videoID, userID); err != nil {
+				l.Errorf("fill redis unliked state failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+			}
+			return &interaction.UnlikeVideoResp{
+				Msg:        "已取消点赞",
+				Liked:      false,
+				LikesCount: realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video),
+			}, nil
+		}
+		l.Errorf("unlike video transaction failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+		return nil, status.Error(codes.Internal, "取消点赞失败")
+	}
+
+	// 6. MySQL 已经成功后，再更新 Redis 实时状态和计数。
+	if err := applyRedisUnlikeState(l.ctx, l.svcCtx.RedisCli, videoID, userID); err != nil {
+		l.Errorf("apply redis unlike state failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+		return nil, status.Error(codes.Internal, "取消点赞状态刷新失败，请重试")
+	}
+
+	return &interaction.UnlikeVideoResp{
+		Msg:        "取消点赞成功",
+		Liked:      false,
+		LikesCount: realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video),
+	}, nil
+}

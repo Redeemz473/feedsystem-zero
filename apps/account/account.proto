@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package account;
+option go_package = "./account";
+
+   //验证服务
+message VerificationReq{
+    string email=1;
+  }
+message VerificationResp{
+    string verification=1;
+  }
+
+  //注册服务
+message RegisterReq{
+    string username=1;
+    string password=2;
+    string email=3;
+    string verification=4;
+  }
+message RegisterResp{
+    string msg =1;
+  }
+  
+  //登录服务
+message LoginReq{
+    string username=1;
+    string password=2;
+  }
+message LoginResp{
+    string access_token=1;
+    string refresh_token=2;
+  }
+
+  //登出服务
+message LogoutReq{
+    uint64 user_id=1;
+  }
+message LogoutResp{
+    string msg=1;
+  }
+
+  //刷新token
+  message RefreshTokenReq {
+    string refresh_token = 1;
+  }
+  
+  message RefreshTokenResp {
+    string access_token = 1;
+    string refresh_token = 2;
+  }
+  
+  //获取用户信息
+  message GetProfileReq {
+    uint64 user_id = 1;
+  }
+  
+  message GetProfileResp {
+    uint64 user_id = 1;
+    string username = 2;
+    string email = 3;
+    string avatar_url = 4;
+    string bio = 5;
+  }
+  
+  //更新用户信息
+  message UpdateProfileReq {
+    uint64 user_id = 1;
+    string username = 2;
+    string avatar_url = 3; //头像地址
+    optional string bio = 4; //用户个人简介，传空字符串表示清空
+  }
+  
+  message UpdateProfileResp {
+    string msg = 1;
+  }
+  //处理相应服务
+service Account {
+  //验证码
+  rpc SendVerification(VerificationReq) returns (VerificationResp);
+  //注册
+  rpc Register(RegisterReq) returns (RegisterResp);
+  //登录
+  rpc Login(LoginReq) returns (LoginResp);
+  //登出
+  rpc Logout(LogoutReq) returns (LogoutResp);
+  //刷新token
+  rpc RefreshToken(RefreshTokenReq)  returns (RefreshTokenResp);
+  //查用户
+  rpc GetProfile(GetProfileReq) returns (GetProfileResp);
+  //更新用户信息
+  rpc UpdateProfile(UpdateProfileReq) returns (UpdateProfileResp);
+}

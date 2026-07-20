@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package video;
+
+option go_package = "./video";
+
+// VideoInfo 是视频详情和列表共用的数据结构。
+// status: 1=正常, 2=作者删除, 3=审核下架。
+message VideoInfo {
+  uint64 video_id = 1;
+  uint64 author_id = 2;
+  string author_username = 3;
+  string title = 4;
+  string description = 5;
+  string play_url = 6;
+  string cover_url = 7;
+  int64 likes_count = 8;
+  int64 comments_count = 9;
+  int64 popularity = 10;
+  int32 status = 11;
+  int64 created_at = 12; // Unix milliseconds
+  int64 updated_at = 13; // Unix milliseconds
+  bool is_liked = 14;
+  repeated string tags = 15;
+}
+
+// PublishVideo 只发布视频元数据。
+// 视频文件和封面文件由 gateway 上传后生成 play_url/cover_url。
+message PublishVideoReq {
+  uint64 author_id = 1;
+  string author_username = 2;
+  string title = 3;
+  string description = 4;
+  string play_url = 5;
+  string cover_url = 6;
+  repeated string tags = 7;
+}
+
+message PublishVideoResp {
+  string msg = 1;
+  VideoInfo video = 2;
+}
+
+//获取视频信息
+// viewer_id 为 0 表示未登录访问；非 0 时后续可以补 is_liked。
+message GetVideoReq {
+  uint64 video_id = 1;
+  uint64 viewer_id = 2;
+}
+
+message GetVideoResp {
+  VideoInfo video = 1;
+}
+
+// 查询作者发布的视频列表。
+// 首次请求 cursor_created_at/cursor_video_id 传 0。
+// 后续请求使用上次返回的 next_cursor_created_at/next_cursor_video_id。
+message ListUserVideosReq {
+  uint64 author_id = 1;
+  uint64 viewer_id = 2;
+  int64 cursor_created_at = 3; // 游标：上一页最后一条视频的创建时间戳（毫秒级Unix）
+  uint64 cursor_video_id = 4; //游标：上一页最后一条视频ID（时间相同时用ID兜底排序）
+  int64 page_size = 5;
+}
+
+message ListUserVideosResp {
+  repeated VideoInfo videos = 1;
+  int64 next_cursor_created_at = 2; // 下一页需要携带的创建时间游标
+  uint64 next_cursor_video_id = 3; // 下一页需要携带的视频ID游标
+  bool has_more = 4;
+}
+
+// DeleteVideo 采用软删除。
+// operator_id 必须由 gateway 从 JWT 中解析后填入，不能信任前端传用户 ID。
+message DeleteVideoReq {
+  uint64 video_id = 1;
+  uint64 operator_id = 2;
+}
+
+message DeleteVideoResp {
+  string msg = 1;
+}
+
+//视频服务
+service Video {
+  // 发布视频
+  rpc PublishVideo(PublishVideoReq) returns (PublishVideoResp);
+  // 获取视频详情
+  rpc GetVideo(GetVideoReq) returns (GetVideoResp);
+  // 获取作者发布的视频列表
+  rpc ListUserVideos(ListUserVideosReq) returns (ListUserVideosResp);
+  // 删除视频
+  rpc DeleteVideo(DeleteVideoReq) returns (DeleteVideoResp);
+}

@@ -1,0 +1,45 @@
+Name: gateway
+Host: 0.0.0.0
+Port: 8888
+
+Auth:
+  AccessSecret: feedsystem-zero-dev-secret
+
+BizRedis:
+  Addr: 127.0.0.1:6380
+  Password: "123456"
+  DB: 0
+
+Mysql:
+  DataSource: root:123456@tcp(127.0.0.1:3308)/feedsystem_zero?charset=utf8mb4&parseTime=true&loc=Local
+
+AccountRpc:
+  Etcd:
+    Hosts:
+      - 127.0.0.1:23790
+    Key: account.rpc
+
+VideoRpc:
+  Etcd:
+    Hosts:
+      - 127.0.0.1:23790
+    Key: video.rpc
+
+InteractionRpc:
+  Etcd:
+    Hosts:
+      - 127.0.0.1:23790
+    Key: interaction.rpc
+
+Upload:
+  Dir: uploads
+  PublicPrefix: /uploads
+  MaxVideoBytes: 104857600
+  MaxCoverBytes: 10485760
+  ChunkThresholdBytes: 20971520
+  DefaultChunkBytes: 8388608
+  MaxChunkBytes: 10485760
+  ChunkSessionTTLSeconds: 86400
+  UploadedFileTTLSeconds: 604800
+  EnableInstantUpload: true
+  EnableChunkHashValidate: true
