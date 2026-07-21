@@ -228,7 +228,8 @@ func saveVideoUpload(r *http.Request, upload config.UploadConf) (*savedUploadAss
 	if upload.MaxVideoBytes > 0 && upload.MaxVideoBytes < maxBytes {
 		maxBytes = upload.MaxVideoBytes
 	}
-	return saveMultipartUpload(r, upload, "videos", maxBytes, videoExts, []string{"file", "video"})
+	expectedHash := normalizeFormHash(r, "file_hash")
+	return saveMultipartUpload(r, upload, "videos", maxBytes, videoExts, []string{"file", "video"}, expectedHash)
 }
 
 func saveCoverUpload(r *http.Request, upload config.UploadConf) (*savedUploadAsset, error) {
@@ -236,9 +237,28 @@ func saveCoverUpload(r *http.Request, upload config.UploadConf) (*savedUploadAss
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxCoverBytes
 	}
-	return saveMultipartUpload(r, upload, "covers", maxBytes, coverExts, []string{"file", "cover"})
+	expectedHash := normalizeFormHash(r, "file_hash")
+	return saveMultipartUpload(r, upload, "covers", maxBytes, coverExts, []string{"file", "cover"}, expectedHash)
 }
 
+// normalizeFormHash 从 multipart 表单中读取 file_hash 字段并归一化为标准哈希。
+// 字段不存在或为空时返回空串（表示前端未提供 hash，跳过校验，保持向后兼容）。
+func normalizeFormHash(r *http.Request, field string) string {
+	if r == nil || r.MultipartForm == nil || r.MultipartForm.Value == nil {
+		return ""
+	}
+	values := r.MultipartForm.Value[field]
+	if len(values) == 0 {
+		return ""
+	}
+	hash, err := normalizeUploadHash(values[0])
+	if err != nil {
+		return ""
+	}
+	return hash
+}
+
+// 整文件直传
 func saveMultipartUpload(
 	r *http.Request,
 	upload config.UploadConf,
@@ -246,6 +266,7 @@ func saveMultipartUpload(
 	maxBytes int64,
 	allowedExts map[string]struct{},
 	fieldNames []string,
+	expectedHash string,
 ) (*savedUploadAsset, error) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		return nil, status.Error(codes.InvalidArgument, "上传文件解析失败")
@@ -300,11 +321,20 @@ func saveMultipartUpload(
 		}
 
 		fileHash := hex.EncodeToString(hasher.Sum(nil))
+		// 整文件完整性对账：若前端提供了 file_hash，必须与后端计算值一致。
+		// 防止传输比特翻转 / 中间代理篡改等非断连型静默损坏（TCP checksum 不足以防御）。
+		if expectedHash != "" && fileHash != expectedHash {
+			_ = os.Remove(tmpPath)
+			return nil, status.Error(codes.InvalidArgument, "文件 hash 校验失败")
+		}
 		filename := fileHash + ext
 		targetPath := filepath.Join(targetDir, filename)
+		//判断目标路径是否存在
 		if _, err := os.Stat(targetPath); err == nil {
+			//存在直接删除临时文件
 			_ = os.Remove(tmpPath)
 		} else if errors.Is(err, os.ErrNotExist) {
+			//不存在 把临时文件重命名为目标路径，落盘
 			if err := os.Rename(tmpPath, targetPath); err != nil {
 				_ = os.Remove(tmpPath)
 				return nil, status.Error(codes.Internal, "保存上传文件失败")
@@ -364,6 +394,7 @@ func publicURL(upload config.UploadConf, subDir string, filename string) string 
 	return uploadPublicPrefix(upload) + "/" + strings.Trim(subDir, "/") + "/" + filename
 }
 
+// 防止yaml漏配置 设置分片阈值
 func chunkThresholdBytes(upload config.UploadConf) int64 {
 	if upload.ChunkThresholdBytes > 0 {
 		return upload.ChunkThresholdBytes

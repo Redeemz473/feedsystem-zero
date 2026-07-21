@@ -5,7 +5,6 @@ package logic
 
 import (
 	"context"
-	"errors"
 
 	"feedsystem-zero/apps/account/accountclient"
 	"feedsystem-zero/apps/gateway/internal/svc"
@@ -13,9 +12,6 @@ import (
 	"feedsystem-zero/apps/video/videoclient"
 
 	"github.com/zeromicro/go-zero/core/logx"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"gorm.io/gorm"
 )
 
 type PublishVideoLogic struct {
@@ -45,43 +41,10 @@ func (l *PublishVideoLogic) PublishVideo(req *types.PublishVideoReq) (resp *type
 		return nil, err
 	}
 
-	//如果是一个已经有资源的视频，则直接添加
-	if err := reserveFileAssetRefByURL(l.ctx, l.svcCtx.GormDB, req.Playurl); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, status.Error(codes.InvalidArgument, "视频资源不存在或已失效，请重新上传")
-		}
-		l.Errorf("reserve video file ref failed, play_url: %s, error: %v", req.Playurl, err)
-		return nil, status.Error(codes.Internal, "锁定视频资源失败")
-	}
-
-	//延迟回滚，把引用计数减一
-	videoReserved := true
-	coverReserved := false
-	defer func() {
-		if err == nil {
-			return
-		}
-		if coverReserved {
-			if releaseErr := releaseFileAssetRefByURL(l.ctx, l.svcCtx.GormDB, req.Coverurl); releaseErr != nil {
-				l.Errorf("release cover file ref failed, cover_url: %s, error: %v", req.Coverurl, releaseErr)
-			}
-		}
-		if videoReserved {
-			if releaseErr := releaseFileAssetRefByURL(l.ctx, l.svcCtx.GormDB, req.Playurl); releaseErr != nil {
-				l.Errorf("release video file ref failed, play_url: %s, error: %v", req.Playurl, releaseErr)
-			}
-		}
-	}()
-
-	if err := reserveFileAssetRefByURL(l.ctx, l.svcCtx.GormDB, req.Coverurl); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, status.Error(codes.InvalidArgument, "封面资源不存在或已失效，请重新上传")
-		}
-		l.Errorf("reserve cover file ref failed, cover_url: %s, error: %v", req.Coverurl, err)
-		return nil, status.Error(codes.Internal, "锁定封面资源失败")
-	}
-	coverReserved = true
-
+	// NOTE: file_assets.ref_count 的 +1（reserve）已经下沉到 video-rpc 的 PublishVideo 内部，
+	//       与 videos 插入共用同一个本地事务，任何失败都会自动回滚，
+	//       gateway 侧不再需要 reserve/release/defer 的补偿逻辑，
+	//       从根本上避免了跨库跨 RPC 的引用计数漂移问题。
 	rpcResp, err := l.svcCtx.VideoRpc.PublishVideo(l.ctx, &videoclient.PublishVideoReq{
 		AuthorId:       userID,
 		AuthorUsername: profile.GetUsername(),

@@ -33,28 +33,16 @@ func (l *DeleteVideoLogic) DeleteVideo(req *types.DeleteVideoReq) (resp *types.D
 		return nil, err
 	}
 
-	videoResp, err := l.svcCtx.VideoRpc.GetVideo(l.ctx, &videoclient.GetVideoReq{
-		VideoId:  req.Videoid,
-		ViewerId: userID,
-	})
-	if err != nil {
-		return nil, err
-	}
-
+	// NOTE: 视频软删、file_assets.ref_count -1、outbox 事件写入
+	//       全部在 video-rpc.DeleteVideo 的本地事务里完成，
+	//       gateway 只负责鉴权和转发，不再需要 GetVideo + 事务外清理的两阶段调用。
+	//       物理文件的磁盘清理由独立的 cleanup job 扫描 status=PendingDelete 后执行。
 	rpcResp, err := l.svcCtx.VideoRpc.DeleteVideo(l.ctx, &videoclient.DeleteVideoReq{
 		VideoId:    req.Videoid,
 		OperatorId: userID,
 	})
 	if err != nil {
 		return nil, err
-	}
-	if videoResp.GetVideo() != nil {
-		if err := decreaseFileAssetRefAndCleanup(l.ctx, l.svcCtx.GormDB, l.svcCtx.Config.Upload, videoResp.GetVideo().GetPlayUrl()); err != nil {
-			l.Errorf("cleanup video file asset failed, video_id: %d, play_url: %s, error: %v", req.Videoid, videoResp.GetVideo().GetPlayUrl(), err)
-		}
-		if err := decreaseFileAssetRefAndCleanup(l.ctx, l.svcCtx.GormDB, l.svcCtx.Config.Upload, videoResp.GetVideo().GetCoverUrl()); err != nil {
-			l.Errorf("cleanup cover file asset failed, video_id: %d, cover_url: %s, error: %v", req.Videoid, videoResp.GetVideo().GetCoverUrl(), err)
-		}
 	}
 
 	return &types.DeleteVideoResp{

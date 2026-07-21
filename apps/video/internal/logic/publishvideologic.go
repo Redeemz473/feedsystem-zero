@@ -2,11 +2,16 @@ package logic
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"strconv"
 	"strings"
+	"time"
 
 	"feedsystem-zero/apps/video/internal/model"
 	"feedsystem-zero/apps/video/internal/svc"
 	videopb "feedsystem-zero/apps/video/video"
+	"feedsystem-zero/common/eventx"
 
 	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
@@ -73,10 +78,38 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 		Status:         model.VideoStatusNormal,
 	}
 
+	// 预生成 outbox 事件 ID，事务里根据 videos.id 组装 payload 后落 outbox_events。
+	eventID, err := newEventID("video_published")
+	if err != nil {
+		return nil, status.Error(codes.Internal, "生成事件ID失败")
+	}
+
 	//开启事务，保证原子操作
 	//事务内任何err事务自动回滚
-	err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
-		//video写入mysql
+	//NOTE: file_assets.ref_count +1、videos 插入、outbox_events(video.published) 全部放在
+	//      同一个本地事务里，任一步失败都会自动回滚，从根本上杜绝
+	//      "视频存在但 ref_count 被回滚" / "ref_count 已加但视频未创建" / "视频已发布但下游无感知"
+	//      三类一致性漂移。
+	var assetErr error
+	err = l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+		// 1. 先在事务内 reserve 视频与封面的引用计数
+		//    资源不存在时记录到 assetErr，事务返回错误自动回滚
+		if rerr := reserveFileAssetRefByURL(l.ctx, tx, playURL); rerr != nil {
+			if errors.Is(rerr, gorm.ErrRecordNotFound) {
+				assetErr = status.Error(codes.InvalidArgument, "视频资源不存在或已失效，请重新上传")
+				return rerr
+			}
+			return rerr
+		}
+		if rerr := reserveFileAssetRefByURL(l.ctx, tx, coverURL); rerr != nil {
+			if errors.Is(rerr, gorm.ErrRecordNotFound) {
+				assetErr = status.Error(codes.InvalidArgument, "封面资源不存在或已失效，请重新上传")
+				return rerr
+			}
+			return rerr
+		}
+
+		// 2. video写入mysql
 		createdVideo := publishedVideo
 		if err := tx.Create(&createdVideo).Error; err != nil {
 			return err
@@ -133,9 +166,53 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 			}
 		}
 
+		// 3. 事务内写 outbox（video.published 事件，投递到 feed.video.events topic）
+		//    与删除路径对称：下游 feed/推荐/通知等异步消费者只需订阅一个 topic 即可感知两类事件。
+		now := time.Now()
+		occurredAt := now.UnixMilli()
+		payloadBytes, err := json.Marshal(eventx.FeedVideoEvent{
+			EventID:    eventID,
+			VideoID:    createdVideo.ID,
+			AuthorID:   authorID,
+			Action:     "publish",
+			Tags:       tags,
+			OccurredAt: occurredAt,
+		})
+		if err != nil {
+			return err
+		}
+		envelopeBytes, err := json.Marshal(eventx.Envelope{
+			EventID:       eventID,
+			EventType:     eventx.EventTypeVideoPublished,
+			AggregateType: eventx.AggregateVideo,
+			AggregateID:   strconv.FormatUint(createdVideo.ID, 10),
+			Producer:      "video-rpc",
+			OccurredAt:    occurredAt,
+			Payload:       payloadBytes,
+		})
+		if err != nil {
+			return err
+		}
+		if err := tx.Create(&model.OutboxEvent{
+			EventID:       eventID,
+			Topic:         eventx.TopicFeedVideoEvents,
+			EventType:     eventx.EventTypeVideoPublished,
+			AggregateType: eventx.AggregateVideo,
+			AggregateID:   strconv.FormatUint(createdVideo.ID, 10),
+			Payload:       string(envelopeBytes),
+			Status:        model.OutboxStatusPending,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}).Error; err != nil {
+			return err
+		}
+
 		return nil
 	})
 	if err != nil {
+		if assetErr != nil {
+			return nil, assetErr
+		}
 		l.Errorf("video publish failed, author_id: %d, play_url: %s, error: %v", authorID, playURL, err)
 		return nil, status.Error(codes.Internal, "发布视频失败")
 	}

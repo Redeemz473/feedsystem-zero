@@ -43,38 +43,15 @@ func upsertFileAsset(ctx context.Context, db *gorm.DB, fileType string, fileHash
 	}).Create(&asset).Error
 }
 
-func reserveFileAssetRefByURL(ctx context.Context, db *gorm.DB, url string) error {
-	if strings.TrimSpace(url) == "" {
-		return nil
-	}
-
-	result := db.WithContext(ctx).
-		Model(&model.FileAsset{}).
-		Where("url = ? AND status = ?", url, model.FileAssetStatusActive).
-		Updates(map[string]any{
-			"ref_count":  gorm.Expr("ref_count + 1"),
-			"status":     model.FileAssetStatusActive,
-			"deleted_at": nil,
-		})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
-}
-
-func releaseFileAssetRefByURL(ctx context.Context, db *gorm.DB, url string) error {
-	if strings.TrimSpace(url) == "" {
-		return nil
-	}
-
-	return db.WithContext(ctx).
-		Model(&model.FileAsset{}).
-		Where("url = ? AND status <> ?", url, model.FileAssetStatusDeleted).
-		Update("ref_count", gorm.Expr("GREATEST(ref_count - 1, 0)")).Error
-}
+// NOTE: file_assets 的引用计数变更 (+1 / -1) 已经全部下沉到 video-rpc 端，
+//       与 videos 表的写入放在同一个本地事务里保证强一致性；
+//       gateway 侧的 reserveFileAssetRefByURL / releaseFileAssetRefByURL 已删除。
+//
+//       decreaseFileAssetRefAndCleanup 和 removeLocalAssetFile 当前不再被调用，
+//       保留作为未来 asset_cleanup job 的参考实现——
+//       该 job 会扫 file_assets 中 status=PendingDelete 的记录，
+//       调用类似逻辑做磁盘物理清理并最终置 Deleted。
+//       等 job 独立成型后，这两个函数可以整体迁移到 apps/job/asset_cleanup 里删除。
 
 func decreaseFileAssetRefAndCleanup(ctx context.Context, db *gorm.DB, upload config.UploadConf, url string) error {
 	if strings.TrimSpace(url) == "" {
