@@ -166,6 +166,17 @@ func gatewayGeneratedRequestID(userID uint64, videoID uint64) (string, error) {
 	return fmt.Sprintf("gateway:%d:%d:%d:%s", userID, videoID, time.Now().UnixNano(), token), nil
 }
 
+// gatewayGeneratedPublishRequestID 用于视频发布幂等 request_id 兜底：
+// 当客户端未上送 request_id 时由 gateway 生成，能防住"网络抖动导致 gateway 层重试"这一类场景。
+// 客户端主动上送 request_id 时优先使用客户端值，可以进一步防住"客户端超时后自己发起的重试"。
+func gatewayGeneratedPublishRequestID(userID uint64) (string, error) {
+	token, err := randomHex(16)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("gateway:publish:%d:%d:%s", userID, time.Now().UnixNano(), token), nil
+}
+
 func loadHTTPVideosByIDs(
 	ctx context.Context,
 	videoRpc videoclient.Video,

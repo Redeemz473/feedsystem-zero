@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package social;
+
+option go_package = "./social";
+
+// 单向关注关系模型（类似微博/抖音）：
+// A 关注 B 是一条独立记录，不要求 B 反向关注 A。
+// follower_id = 主动关注者，following_id = 被关注者。
+
+message FollowReq {
+  uint64 follower_id = 1;   // 主动关注者，必须由 gateway 从 JWT 解析填入
+  uint64 following_id = 2;  // 被关注者
+}
+
+message FollowResp {
+  string msg = 1;
+  bool followed = 2;
+}
+
+message UnfollowReq {
+  uint64 follower_id = 1;
+  uint64 following_id = 2;
+}
+
+message UnfollowResp {
+  string msg = 1;
+  bool unfollowed = 2;
+}
+
+// 查询 follower_id 是否关注了 following_id。
+message IsFollowingReq {
+  uint64 follower_id = 1;
+  uint64 following_id = 2;
+}
+
+message IsFollowingResp {
+  bool following = 1;
+}
+
+// 分页游标：按 id 倒序（最新关注排前面）。
+// 首次请求 cursor_id 传 0；后续用上次返回的 next_cursor_id。
+message ListFollowersReq {
+  uint64 user_id = 1;        // 被关注者，查询其粉丝列表
+  uint64 viewer_id = 2;      // 当前查看者，用于后续判断是否互关（本期可忽略）
+  uint64 cursor_id = 3;
+  int64 page_size = 4;
+}
+
+message FollowRelation {
+  uint64 follower_id = 1;
+  uint64 following_id = 2;
+  int64 created_at = 3; // Unix milliseconds
+}
+
+message ListFollowersResp {
+  repeated FollowRelation followers = 1;
+  uint64 next_cursor_id = 2;
+  bool has_more = 3;
+}
+
+message ListFollowingsReq {
+  uint64 user_id = 1;        // 主动关注者，查询其关注列表
+  uint64 viewer_id = 2;
+  uint64 cursor_id = 3;
+  int64 page_size = 4;
+}
+
+message ListFollowingsResp {
+  repeated FollowRelation followings = 1;
+  uint64 next_cursor_id = 2;
+  bool has_more = 3;
+}
+
+// 社交关系服务
+service Social {
+  rpc Follow(FollowReq) returns (FollowResp);
+  rpc Unfollow(UnfollowReq) returns (UnfollowResp);
+  rpc IsFollowing(IsFollowingReq) returns (IsFollowingResp);
+  rpc ListFollowers(ListFollowersReq) returns (ListFollowersResp);
+  rpc ListFollowings(ListFollowingsReq) returns (ListFollowingsResp);
+}

@@ -148,6 +148,7 @@ type (
 		Playurl     string   `json:"play_url"`
 		Coverurl    string   `json:"cover_url"`
 		Tags        []string `json:"tags,optional"`
+		Requestid   string   `json:"request_id,optional"`
 	}
 	PublishVideoResp {
 		Msg   string    `json:"msg"`

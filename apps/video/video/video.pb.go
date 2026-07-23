@@ -7,11 +7,12 @@
 package video
 
 import (
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
+
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -190,6 +191,7 @@ type PublishVideoReq struct {
 	PlayUrl        string                 `protobuf:"bytes,5,opt,name=play_url,json=playUrl,proto3" json:"play_url,omitempty"`
 	CoverUrl       string                 `protobuf:"bytes,6,opt,name=cover_url,json=coverUrl,proto3" json:"cover_url,omitempty"`
 	Tags           []string               `protobuf:"bytes,7,rep,name=tags,proto3" json:"tags,omitempty"`
+	RequestId      string                 `protobuf:"bytes,8,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -271,6 +273,13 @@ func (x *PublishVideoReq) GetTags() []string {
 		return x.Tags
 	}
 	return nil
+}
+
+func (x *PublishVideoReq) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
 }
 
 type PublishVideoResp struct {

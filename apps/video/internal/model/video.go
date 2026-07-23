@@ -26,6 +26,7 @@ type Video struct {
 	Description    string     `gorm:"column:description"`
 	PlayURL        string     `gorm:"column:play_url"`
 	CoverURL       string     `gorm:"column:cover_url"`
+	RequestID      string     `gorm:"column:request_id"`
 	LikesCount     int64      `gorm:"column:likes_count"`
 	CommentsCount  int64      `gorm:"column:comments_count"`
 	Popularity     int64      `gorm:"column:popularity"`

@@ -26,6 +26,8 @@ message VideoInfo {
 
 // PublishVideo 只发布视频元数据。
 // 视频文件和封面文件由 gateway 上传后生成 play_url/cover_url。
+// request_id 建议由 gateway 或前端生成，用于视频发布幂等：同一 (author_id, request_id)
+// 只会真正创建一次视频，重试会直接回读已存在的视频。
 message PublishVideoReq {
   uint64 author_id = 1;
   string author_username = 2;
@@ -34,6 +36,7 @@ message PublishVideoReq {
   string play_url = 5;
   string cover_url = 6;
   repeated string tags = 7;
+  string request_id = 8;
 }
 
 message PublishVideoResp {

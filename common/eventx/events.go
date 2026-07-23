@@ -14,6 +14,9 @@ const (
 
 	EventTypeVideoStatDelta     = "video.stat.delta"
 	EventTypeNotificationCreate = "notification.create"
+
+	EventTypeFollowCreated = "follow.created"
+	EventTypeFollowDeleted = "follow.deleted"
 )
 
 const (
@@ -21,6 +24,7 @@ const (
 	AggregateLike         = "like"
 	AggregateComment      = "comment"
 	AggregateNotification = "notification"
+	AggregateFollow       = "follow"
 )
 
 const (
@@ -29,6 +33,9 @@ const (
 
 	CommentActionCreate = "create"
 	CommentActionDelete = "delete"
+
+	FollowActionFollow   = "follow"
+	FollowActionUnfollow = "unfollow"
 )
 
 type Envelope struct {
@@ -92,4 +99,14 @@ type NotificationEvent struct {
 	NotificationTy string `json:"notification_type"`
 	OccurredAt     int64  `json:"occurred_at"`
 	SourceEventID  string `json:"source_event_id,omitempty"`
+}
+
+// FollowEvent 单向关注关系事件（关注/取关）。
+// follower_id 主动关注/取关 following_id。
+type FollowEvent struct {
+	EventID     string `json:"event_id"`
+	FollowerID  uint64 `json:"follower_id"`
+	FollowingID uint64 `json:"following_id"`
+	Action      string `json:"action"` // "follow" | "unfollow"
+	OccurredAt  int64  `json:"occurred_at"`
 }

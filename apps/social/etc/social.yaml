@@ -1,0 +1,14 @@
+Name: social.rpc
+ListenOn: 0.0.0.0:8084
+Etcd:
+  Hosts:
+    - 127.0.0.1:2379
+  Key: social.rpc
+
+Mysql:
+  DataSource: root:password@tcp(127.0.0.1:3306)/feedsystem?charset=utf8mb4&parseTime=true&loc=Local
+
+BizRedis:
+  Addr: 127.0.0.1:6379
+  Password: ""
+  DB: 0

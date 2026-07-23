@@ -194,6 +194,7 @@ type PublishVideoReq struct {
 	Playurl     string   `json:"play_url"`
 	Coverurl    string   `json:"cover_url"`
 	Tags        []string `json:"tags,optional"`
+	Requestid   string   `json:"request_id,optional"`
 }
 
 type PublishVideoResp struct {

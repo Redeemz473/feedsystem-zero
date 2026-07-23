@@ -2,12 +2,14 @@ package logic
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"strings"
 
 	"feedsystem-zero/apps/video/internal/model"
 	videopb "feedsystem-zero/apps/video/video"
 
+	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -18,6 +20,41 @@ const maxVideoTags = 20
 
 // tag长度限制
 const maxTagNameLen = 50
+
+// errDuplicateVideoRequest 表示并发发布同一 (author_id, request_id) 时，
+// 后到的事务撞上了 uk_video_request 唯一键。外层需要回读已入库的视频再返回，实现幂等。
+var errDuplicateVideoRequest = errors.New("duplicate video request_id")
+
+// mysqlDuplicateEntryErrNo 是 MySQL 报 Duplicate entry 错误的固定 errno（1062）。
+const mysqlDuplicateEntryErrNo uint16 = 1062
+
+// isDuplicateKeyError 判断一个 GORM 返回的 error 是否由 MySQL 唯一键冲突产生。
+// 优先使用 gorm 提供的 ErrDuplicatedKey；对老版本或 driver 直接透出 *mysql.MySQLError 的情况兜底判断 errno=1062。
+func isDuplicateKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlDuplicateEntryErrNo {
+		return true
+	}
+	return false
+}
+
+// loadVideoByAuthorRequestID 用独立连接按 (author_id, request_id) 回读视频，
+// 用于并发抢占后事务已回滚的场景，把已经写入的那条视频返回给客户端。
+func loadVideoByAuthorRequestID(ctx context.Context, db *gorm.DB, authorID uint64, requestID string) (*model.Video, error) {
+	var v model.Video
+	if err := db.WithContext(ctx).
+		Where("author_id = ? AND request_id = ?", authorID, requestID).
+		Take(&v).Error; err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
 
 func extractTags(text string) []string {
 	matches := tagRegexp.FindAllStringSubmatch(text, -1)

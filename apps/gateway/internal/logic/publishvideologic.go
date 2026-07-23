@@ -5,6 +5,7 @@ package logic
 
 import (
 	"context"
+	"strings"
 
 	"feedsystem-zero/apps/account/accountclient"
 	"feedsystem-zero/apps/gateway/internal/svc"
@@ -12,6 +13,8 @@ import (
 	"feedsystem-zero/apps/video/videoclient"
 
 	"github.com/zeromicro/go-zero/core/logx"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type PublishVideoLogic struct {
@@ -34,6 +37,17 @@ func (l *PublishVideoLogic) PublishVideo(req *types.PublishVideoReq) (resp *type
 		return nil, err
 	}
 
+	// 发布视频幂等：优先使用客户端上送的 request_id，缺失时 gateway 兜底生成一个。
+	// 与 PublishComment 一致：客户端主动上送能防住"客户端超时后自己重试"，
+	// gateway 兜底只能防住"gateway 层内部重试或代理重试"，但至少保证到达 video-rpc 时 request_id 非空。
+	requestID := strings.TrimSpace(req.Requestid)
+	if requestID == "" {
+		requestID, err = gatewayGeneratedPublishRequestID(userID)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "生成视频发布幂等ID失败")
+		}
+	}
+
 	profile, err := l.svcCtx.AccountRpc.GetProfile(l.ctx, &accountclient.GetProfileReq{
 		UserId: userID,
 	})
@@ -53,6 +67,7 @@ func (l *PublishVideoLogic) PublishVideo(req *types.PublishVideoReq) (resp *type
 		PlayUrl:        req.Playurl,
 		CoverUrl:       req.Coverurl,
 		Tags:           req.Tags,
+		RequestId:      requestID,
 	})
 	if err != nil {
 		return nil, err

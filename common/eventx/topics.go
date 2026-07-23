@@ -6,6 +6,7 @@ const (
 	TopicVideoStatDeltaEvents     = "video.stat.delta.events"
 	TopicFeedVideoEvents          = "feed.video.events"
 	TopicNotificationEvents       = "notification.events"
+	TopicFollowEvents             = "social.follow.events"
 )
 
 const (
@@ -15,6 +16,7 @@ const (
 	ConsumerHotRank       = "hotrank-job"
 	ConsumerFeedTimeline  = "feed-timeline-job"
 	ConsumerNotification  = "notification-job"
+	ConsumerFollowSync    = "follow-sync-job"
 )
 
 func AllTopics() []string {
@@ -24,5 +26,6 @@ func AllTopics() []string {
 		TopicVideoStatDeltaEvents,
 		TopicFeedVideoEvents,
 		TopicNotificationEvents,
+		TopicFollowEvents,
 	}
 }
