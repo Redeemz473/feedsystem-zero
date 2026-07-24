@@ -635,6 +635,164 @@ func (x *GetProfileResp) GetBio() string {
 	return ""
 }
 
+// 公开用户资料，不包含邮箱、密码和 token 等敏感字段。
+type PublicProfile struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	UserId        uint64                 `protobuf:"varint,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	Username      string                 `protobuf:"bytes,2,opt,name=username,proto3" json:"username,omitempty"`
+	AvatarUrl     string                 `protobuf:"bytes,3,opt,name=avatar_url,json=avatarUrl,proto3" json:"avatar_url,omitempty"`
+	Bio           string                 `protobuf:"bytes,4,opt,name=bio,proto3" json:"bio,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PublicProfile) Reset() {
+	*x = PublicProfile{}
+	mi := &file_account_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublicProfile) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublicProfile) ProtoMessage() {}
+
+func (x *PublicProfile) ProtoReflect() protoreflect.Message {
+	mi := &file_account_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublicProfile.ProtoReflect.Descriptor instead.
+func (*PublicProfile) Descriptor() ([]byte, []int) {
+	return file_account_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *PublicProfile) GetUserId() uint64 {
+	if x != nil {
+		return x.UserId
+	}
+	return 0
+}
+
+func (x *PublicProfile) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *PublicProfile) GetAvatarUrl() string {
+	if x != nil {
+		return x.AvatarUrl
+	}
+	return ""
+}
+
+func (x *PublicProfile) GetBio() string {
+	if x != nil {
+		return x.Bio
+	}
+	return ""
+}
+
+// 给 gateway/social 等内部服务批量补齐用户资料，避免逐个 RPC 造成 N+1。
+type BatchGetProfilesReq struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	UserIds       []uint64               `protobuf:"varint,1,rep,packed,name=user_ids,json=userIds,proto3" json:"user_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchGetProfilesReq) Reset() {
+	*x = BatchGetProfilesReq{}
+	mi := &file_account_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchGetProfilesReq) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchGetProfilesReq) ProtoMessage() {}
+
+func (x *BatchGetProfilesReq) ProtoReflect() protoreflect.Message {
+	mi := &file_account_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchGetProfilesReq.ProtoReflect.Descriptor instead.
+func (*BatchGetProfilesReq) Descriptor() ([]byte, []int) {
+	return file_account_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *BatchGetProfilesReq) GetUserIds() []uint64 {
+	if x != nil {
+		return x.UserIds
+	}
+	return nil
+}
+
+type BatchGetProfilesResp struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Profiles      []*PublicProfile       `protobuf:"bytes,1,rep,name=profiles,proto3" json:"profiles,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchGetProfilesResp) Reset() {
+	*x = BatchGetProfilesResp{}
+	mi := &file_account_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchGetProfilesResp) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchGetProfilesResp) ProtoMessage() {}
+
+func (x *BatchGetProfilesResp) ProtoReflect() protoreflect.Message {
+	mi := &file_account_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchGetProfilesResp.ProtoReflect.Descriptor instead.
+func (*BatchGetProfilesResp) Descriptor() ([]byte, []int) {
+	return file_account_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *BatchGetProfilesResp) GetProfiles() []*PublicProfile {
+	if x != nil {
+		return x.Profiles
+	}
+	return nil
+}
+
 // 更新用户信息
 type UpdateProfileReq struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -648,7 +806,7 @@ type UpdateProfileReq struct {
 
 func (x *UpdateProfileReq) Reset() {
 	*x = UpdateProfileReq{}
-	mi := &file_account_proto_msgTypes[12]
+	mi := &file_account_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -660,7 +818,7 @@ func (x *UpdateProfileReq) String() string {
 func (*UpdateProfileReq) ProtoMessage() {}
 
 func (x *UpdateProfileReq) ProtoReflect() protoreflect.Message {
-	mi := &file_account_proto_msgTypes[12]
+	mi := &file_account_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -673,7 +831,7 @@ func (x *UpdateProfileReq) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateProfileReq.ProtoReflect.Descriptor instead.
 func (*UpdateProfileReq) Descriptor() ([]byte, []int) {
-	return file_account_proto_rawDescGZIP(), []int{12}
+	return file_account_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *UpdateProfileReq) GetUserId() uint64 {
@@ -713,7 +871,7 @@ type UpdateProfileResp struct {
 
 func (x *UpdateProfileResp) Reset() {
 	*x = UpdateProfileResp{}
-	mi := &file_account_proto_msgTypes[13]
+	mi := &file_account_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -725,7 +883,7 @@ func (x *UpdateProfileResp) String() string {
 func (*UpdateProfileResp) ProtoMessage() {}
 
 func (x *UpdateProfileResp) ProtoReflect() protoreflect.Message {
-	mi := &file_account_proto_msgTypes[13]
+	mi := &file_account_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -738,7 +896,7 @@ func (x *UpdateProfileResp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateProfileResp.ProtoReflect.Descriptor instead.
 func (*UpdateProfileResp) Descriptor() ([]byte, []int) {
-	return file_account_proto_rawDescGZIP(), []int{13}
+	return file_account_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *UpdateProfileResp) GetMsg() string {
@@ -788,7 +946,17 @@ const file_account_proto_rawDesc = "" +
 	"\x05email\x18\x03 \x01(\tR\x05email\x12\x1d\n" +
 	"\n" +
 	"avatar_url\x18\x04 \x01(\tR\tavatarUrl\x12\x10\n" +
-	"\x03bio\x18\x05 \x01(\tR\x03bio\"\x85\x01\n" +
+	"\x03bio\x18\x05 \x01(\tR\x03bio\"u\n" +
+	"\rPublicProfile\x12\x17\n" +
+	"\auser_id\x18\x01 \x01(\x04R\x06userId\x12\x1a\n" +
+	"\busername\x18\x02 \x01(\tR\busername\x12\x1d\n" +
+	"\n" +
+	"avatar_url\x18\x03 \x01(\tR\tavatarUrl\x12\x10\n" +
+	"\x03bio\x18\x04 \x01(\tR\x03bio\"0\n" +
+	"\x13BatchGetProfilesReq\x12\x19\n" +
+	"\buser_ids\x18\x01 \x03(\x04R\auserIds\"J\n" +
+	"\x14BatchGetProfilesResp\x122\n" +
+	"\bprofiles\x18\x01 \x03(\v2\x16.account.PublicProfileR\bprofiles\"\x85\x01\n" +
 	"\x10UpdateProfileReq\x12\x17\n" +
 	"\auser_id\x18\x01 \x01(\x04R\x06userId\x12\x1a\n" +
 	"\busername\x18\x02 \x01(\tR\busername\x12\x1d\n" +
@@ -797,7 +965,7 @@ const file_account_proto_rawDesc = "" +
 	"\x03bio\x18\x04 \x01(\tH\x00R\x03bio\x88\x01\x01B\x06\n" +
 	"\x04_bio\"%\n" +
 	"\x11UpdateProfileResp\x12\x10\n" +
-	"\x03msg\x18\x01 \x01(\tR\x03msg2\xba\x03\n" +
+	"\x03msg\x18\x01 \x01(\tR\x03msg2\x8b\x04\n" +
 	"\aAccount\x12G\n" +
 	"\x10SendVerification\x12\x18.account.VerificationReq\x1a\x19.account.VerificationResp\x127\n" +
 	"\bRegister\x12\x14.account.RegisterReq\x1a\x15.account.RegisterResp\x12.\n" +
@@ -805,7 +973,8 @@ const file_account_proto_rawDesc = "" +
 	"\x06Logout\x12\x12.account.LogoutReq\x1a\x13.account.LogoutResp\x12C\n" +
 	"\fRefreshToken\x12\x18.account.RefreshTokenReq\x1a\x19.account.RefreshTokenResp\x12=\n" +
 	"\n" +
-	"GetProfile\x12\x16.account.GetProfileReq\x1a\x17.account.GetProfileResp\x12F\n" +
+	"GetProfile\x12\x16.account.GetProfileReq\x1a\x17.account.GetProfileResp\x12O\n" +
+	"\x10BatchGetProfiles\x12\x1c.account.BatchGetProfilesReq\x1a\x1d.account.BatchGetProfilesResp\x12F\n" +
 	"\rUpdateProfile\x12\x19.account.UpdateProfileReq\x1a\x1a.account.UpdateProfileRespB\vZ\t./accountb\x06proto3"
 
 var (
@@ -820,43 +989,49 @@ func file_account_proto_rawDescGZIP() []byte {
 	return file_account_proto_rawDescData
 }
 
-var file_account_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_account_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_account_proto_goTypes = []any{
-	(*VerificationReq)(nil),   // 0: account.VerificationReq
-	(*VerificationResp)(nil),  // 1: account.VerificationResp
-	(*RegisterReq)(nil),       // 2: account.RegisterReq
-	(*RegisterResp)(nil),      // 3: account.RegisterResp
-	(*LoginReq)(nil),          // 4: account.LoginReq
-	(*LoginResp)(nil),         // 5: account.LoginResp
-	(*LogoutReq)(nil),         // 6: account.LogoutReq
-	(*LogoutResp)(nil),        // 7: account.LogoutResp
-	(*RefreshTokenReq)(nil),   // 8: account.RefreshTokenReq
-	(*RefreshTokenResp)(nil),  // 9: account.RefreshTokenResp
-	(*GetProfileReq)(nil),     // 10: account.GetProfileReq
-	(*GetProfileResp)(nil),    // 11: account.GetProfileResp
-	(*UpdateProfileReq)(nil),  // 12: account.UpdateProfileReq
-	(*UpdateProfileResp)(nil), // 13: account.UpdateProfileResp
+	(*VerificationReq)(nil),      // 0: account.VerificationReq
+	(*VerificationResp)(nil),     // 1: account.VerificationResp
+	(*RegisterReq)(nil),          // 2: account.RegisterReq
+	(*RegisterResp)(nil),         // 3: account.RegisterResp
+	(*LoginReq)(nil),             // 4: account.LoginReq
+	(*LoginResp)(nil),            // 5: account.LoginResp
+	(*LogoutReq)(nil),            // 6: account.LogoutReq
+	(*LogoutResp)(nil),           // 7: account.LogoutResp
+	(*RefreshTokenReq)(nil),      // 8: account.RefreshTokenReq
+	(*RefreshTokenResp)(nil),     // 9: account.RefreshTokenResp
+	(*GetProfileReq)(nil),        // 10: account.GetProfileReq
+	(*GetProfileResp)(nil),       // 11: account.GetProfileResp
+	(*PublicProfile)(nil),        // 12: account.PublicProfile
+	(*BatchGetProfilesReq)(nil),  // 13: account.BatchGetProfilesReq
+	(*BatchGetProfilesResp)(nil), // 14: account.BatchGetProfilesResp
+	(*UpdateProfileReq)(nil),     // 15: account.UpdateProfileReq
+	(*UpdateProfileResp)(nil),    // 16: account.UpdateProfileResp
 }
 var file_account_proto_depIdxs = []int32{
-	0,  // 0: account.Account.SendVerification:input_type -> account.VerificationReq
-	2,  // 1: account.Account.Register:input_type -> account.RegisterReq
-	4,  // 2: account.Account.Login:input_type -> account.LoginReq
-	6,  // 3: account.Account.Logout:input_type -> account.LogoutReq
-	8,  // 4: account.Account.RefreshToken:input_type -> account.RefreshTokenReq
-	10, // 5: account.Account.GetProfile:input_type -> account.GetProfileReq
-	12, // 6: account.Account.UpdateProfile:input_type -> account.UpdateProfileReq
-	1,  // 7: account.Account.SendVerification:output_type -> account.VerificationResp
-	3,  // 8: account.Account.Register:output_type -> account.RegisterResp
-	5,  // 9: account.Account.Login:output_type -> account.LoginResp
-	7,  // 10: account.Account.Logout:output_type -> account.LogoutResp
-	9,  // 11: account.Account.RefreshToken:output_type -> account.RefreshTokenResp
-	11, // 12: account.Account.GetProfile:output_type -> account.GetProfileResp
-	13, // 13: account.Account.UpdateProfile:output_type -> account.UpdateProfileResp
-	7,  // [7:14] is the sub-list for method output_type
-	0,  // [0:7] is the sub-list for method input_type
-	0,  // [0:0] is the sub-list for extension type_name
-	0,  // [0:0] is the sub-list for extension extendee
-	0,  // [0:0] is the sub-list for field type_name
+	12, // 0: account.BatchGetProfilesResp.profiles:type_name -> account.PublicProfile
+	0,  // 1: account.Account.SendVerification:input_type -> account.VerificationReq
+	2,  // 2: account.Account.Register:input_type -> account.RegisterReq
+	4,  // 3: account.Account.Login:input_type -> account.LoginReq
+	6,  // 4: account.Account.Logout:input_type -> account.LogoutReq
+	8,  // 5: account.Account.RefreshToken:input_type -> account.RefreshTokenReq
+	10, // 6: account.Account.GetProfile:input_type -> account.GetProfileReq
+	13, // 7: account.Account.BatchGetProfiles:input_type -> account.BatchGetProfilesReq
+	15, // 8: account.Account.UpdateProfile:input_type -> account.UpdateProfileReq
+	1,  // 9: account.Account.SendVerification:output_type -> account.VerificationResp
+	3,  // 10: account.Account.Register:output_type -> account.RegisterResp
+	5,  // 11: account.Account.Login:output_type -> account.LoginResp
+	7,  // 12: account.Account.Logout:output_type -> account.LogoutResp
+	9,  // 13: account.Account.RefreshToken:output_type -> account.RefreshTokenResp
+	11, // 14: account.Account.GetProfile:output_type -> account.GetProfileResp
+	14, // 15: account.Account.BatchGetProfiles:output_type -> account.BatchGetProfilesResp
+	16, // 16: account.Account.UpdateProfile:output_type -> account.UpdateProfileResp
+	9,  // [9:17] is the sub-list for method output_type
+	1,  // [1:9] is the sub-list for method input_type
+	1,  // [1:1] is the sub-list for extension type_name
+	1,  // [1:1] is the sub-list for extension extendee
+	0,  // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_account_proto_init() }
@@ -864,14 +1039,14 @@ func file_account_proto_init() {
 	if File_account_proto != nil {
 		return
 	}
-	file_account_proto_msgTypes[12].OneofWrappers = []any{}
+	file_account_proto_msgTypes[15].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_account_proto_rawDesc), len(file_account_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   14,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

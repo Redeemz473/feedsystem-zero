@@ -23,11 +23,22 @@ func NewIsFollowingLogic(ctx context.Context, svcCtx *svc.ServiceContext) *IsFol
 	}
 }
 
-// IsFollowing 是否关注查询（读多写少，可走 MySQL；若需极致低延迟可加 Redis 缓存）。
+// IsFollowing 是缓存旁路查询，建议按下面步骤实现：
 //
-//	查 follows 是否存在 (follower_id, following_id, status=FollowStatusActive) 记录。
+//  1. following_id 为 0 时返回 codes.InvalidArgument。
+//  2. follower_id=0 表示未登录访问，直接返回 following=false；
+//     follower_id==following_id 也直接返回 false。
+//  3. 查询 Redis SocialFollowingStateKey：
+//     - "1" 返回 true；
+//     - "0" 返回 false；
+//     - redis.Nil 表示未命中，继续查 MySQL；
+//     - Redis 故障记录日志后降级查 MySQL，不要让公开查询直接失败。
+//  4. MySQL 查询是否存在
+//     (follower_id, following_id, status=Active, deleted_at IS NULL)。
+//  5. 将结果按 "1"/"0" 回填 Redis，并设置 SocialFollowingStateTTL；
+//     必须缓存 false，防止不存在关系持续穿透数据库。
 func (l *IsFollowingLogic) IsFollowing(in *social.IsFollowingReq) (*social.IsFollowingResp, error) {
-	// TODO: 实现关注判定查询。
+	// TODO: 根据上面的步骤实现核心业务逻辑。
 	return &social.IsFollowingResp{
 		Following: false,
 	}, nil

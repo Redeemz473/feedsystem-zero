@@ -14,17 +14,22 @@ import (
 )
 
 type (
-	FollowRelation     = social.FollowRelation
-	FollowReq          = social.FollowReq
-	FollowResp         = social.FollowResp
-	IsFollowingReq     = social.IsFollowingReq
-	IsFollowingResp    = social.IsFollowingResp
-	ListFollowersReq   = social.ListFollowersReq
-	ListFollowersResp  = social.ListFollowersResp
-	ListFollowingsReq  = social.ListFollowingsReq
-	ListFollowingsResp = social.ListFollowingsResp
-	UnfollowReq        = social.UnfollowReq
-	UnfollowResp       = social.UnfollowResp
+	BatchIsFollowingReq  = social.BatchIsFollowingReq
+	BatchIsFollowingResp = social.BatchIsFollowingResp
+	FollowRelation       = social.FollowRelation
+	FollowReq            = social.FollowReq
+	FollowResp           = social.FollowResp
+	FollowingState       = social.FollowingState
+	GetFollowStatsReq    = social.GetFollowStatsReq
+	GetFollowStatsResp   = social.GetFollowStatsResp
+	IsFollowingReq       = social.IsFollowingReq
+	IsFollowingResp      = social.IsFollowingResp
+	ListFollowersReq     = social.ListFollowersReq
+	ListFollowersResp    = social.ListFollowersResp
+	ListFollowingsReq    = social.ListFollowingsReq
+	ListFollowingsResp   = social.ListFollowingsResp
+	UnfollowReq          = social.UnfollowReq
+	UnfollowResp         = social.UnfollowResp
 
 	Social interface {
 		Follow(ctx context.Context, in *FollowReq, opts ...grpc.CallOption) (*FollowResp, error)
@@ -32,6 +37,8 @@ type (
 		IsFollowing(ctx context.Context, in *IsFollowingReq, opts ...grpc.CallOption) (*IsFollowingResp, error)
 		ListFollowers(ctx context.Context, in *ListFollowersReq, opts ...grpc.CallOption) (*ListFollowersResp, error)
 		ListFollowings(ctx context.Context, in *ListFollowingsReq, opts ...grpc.CallOption) (*ListFollowingsResp, error)
+		BatchIsFollowing(ctx context.Context, in *BatchIsFollowingReq, opts ...grpc.CallOption) (*BatchIsFollowingResp, error)
+		GetFollowStats(ctx context.Context, in *GetFollowStatsReq, opts ...grpc.CallOption) (*GetFollowStatsResp, error)
 	}
 
 	defaultSocial struct {
@@ -68,4 +75,14 @@ func (m *defaultSocial) ListFollowers(ctx context.Context, in *ListFollowersReq,
 func (m *defaultSocial) ListFollowings(ctx context.Context, in *ListFollowingsReq, opts ...grpc.CallOption) (*ListFollowingsResp, error) {
 	client := social.NewSocialClient(m.cli.Conn())
 	return client.ListFollowings(ctx, in, opts...)
+}
+
+func (m *defaultSocial) BatchIsFollowing(ctx context.Context, in *BatchIsFollowingReq, opts ...grpc.CallOption) (*BatchIsFollowingResp, error) {
+	client := social.NewSocialClient(m.cli.Conn())
+	return client.BatchIsFollowing(ctx, in, opts...)
+}
+
+func (m *defaultSocial) GetFollowStats(ctx context.Context, in *GetFollowStatsReq, opts ...grpc.CallOption) (*GetFollowStatsResp, error) {
+	client := social.NewSocialClient(m.cli.Conn())
+	return client.GetFollowStats(ctx, in, opts...)
 }

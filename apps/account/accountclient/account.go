@@ -14,20 +14,23 @@ import (
 )
 
 type (
-	GetProfileReq     = account.GetProfileReq
-	GetProfileResp    = account.GetProfileResp
-	LoginReq          = account.LoginReq
-	LoginResp         = account.LoginResp
-	LogoutReq         = account.LogoutReq
-	LogoutResp        = account.LogoutResp
-	RefreshTokenReq   = account.RefreshTokenReq
-	RefreshTokenResp  = account.RefreshTokenResp
-	RegisterReq       = account.RegisterReq
-	RegisterResp      = account.RegisterResp
-	UpdateProfileReq  = account.UpdateProfileReq
-	UpdateProfileResp = account.UpdateProfileResp
-	VerificationReq   = account.VerificationReq
-	VerificationResp  = account.VerificationResp
+	BatchGetProfilesReq  = account.BatchGetProfilesReq
+	BatchGetProfilesResp = account.BatchGetProfilesResp
+	GetProfileReq        = account.GetProfileReq
+	GetProfileResp       = account.GetProfileResp
+	LoginReq             = account.LoginReq
+	LoginResp            = account.LoginResp
+	LogoutReq            = account.LogoutReq
+	LogoutResp           = account.LogoutResp
+	PublicProfile        = account.PublicProfile
+	RefreshTokenReq      = account.RefreshTokenReq
+	RefreshTokenResp     = account.RefreshTokenResp
+	RegisterReq          = account.RegisterReq
+	RegisterResp         = account.RegisterResp
+	UpdateProfileReq     = account.UpdateProfileReq
+	UpdateProfileResp    = account.UpdateProfileResp
+	VerificationReq      = account.VerificationReq
+	VerificationResp     = account.VerificationResp
 
 	Account interface {
 		// 验证码
@@ -42,6 +45,8 @@ type (
 		RefreshToken(ctx context.Context, in *RefreshTokenReq, opts ...grpc.CallOption) (*RefreshTokenResp, error)
 		// 查用户
 		GetProfile(ctx context.Context, in *GetProfileReq, opts ...grpc.CallOption) (*GetProfileResp, error)
+		// 批量查询公开用户资料
+		BatchGetProfiles(ctx context.Context, in *BatchGetProfilesReq, opts ...grpc.CallOption) (*BatchGetProfilesResp, error)
 		// 更新用户信息
 		UpdateProfile(ctx context.Context, in *UpdateProfileReq, opts ...grpc.CallOption) (*UpdateProfileResp, error)
 	}
@@ -91,6 +96,12 @@ func (m *defaultAccount) RefreshToken(ctx context.Context, in *RefreshTokenReq, 
 func (m *defaultAccount) GetProfile(ctx context.Context, in *GetProfileReq, opts ...grpc.CallOption) (*GetProfileResp, error) {
 	client := account.NewAccountClient(m.cli.Conn())
 	return client.GetProfile(ctx, in, opts...)
+}
+
+// 批量查询公开用户资料
+func (m *defaultAccount) BatchGetProfiles(ctx context.Context, in *BatchGetProfilesReq, opts ...grpc.CallOption) (*BatchGetProfilesResp, error) {
+	client := account.NewAccountClient(m.cli.Conn())
+	return client.BatchGetProfiles(ctx, in, opts...)
 }
 
 // 更新用户信息

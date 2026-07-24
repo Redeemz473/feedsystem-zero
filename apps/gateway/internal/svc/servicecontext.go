@@ -11,6 +11,7 @@ import (
 	"feedsystem-zero/apps/gateway/internal/config"
 	"feedsystem-zero/apps/gateway/internal/middleware"
 	"feedsystem-zero/apps/interaction/interactionclient"
+	"feedsystem-zero/apps/social/socialclient"
 	"feedsystem-zero/apps/video/videoclient"
 	"feedsystem-zero/common/gormx"
 
@@ -26,6 +27,7 @@ type ServiceContext struct {
 	AccountRpc        accountclient.Account
 	VideoRpc          videoclient.Video
 	InteractionRpc    interactionclient.Interaction
+	SocialRpc         socialclient.Social
 	RedisCli          *redis.Client
 	GormDB            *gorm.DB
 	TokenAuth         rest.Middleware
@@ -36,6 +38,7 @@ func NewServiceContext(c config.Config) *ServiceContext {
 	accountCli := zrpc.MustNewClient(c.AccountRpc)
 	videoCli := zrpc.MustNewClient(c.VideoRpc)
 	interactionCli := zrpc.MustNewClient(c.InteractionRpc)
+	socialCli := zrpc.MustNewClient(c.SocialRpc)
 	redisCli := redis.NewClient(&redis.Options{
 		Addr:     c.BizRedis.Addr,
 		Password: c.BizRedis.Password,
@@ -53,6 +56,7 @@ func NewServiceContext(c config.Config) *ServiceContext {
 		AccountRpc:        accountclient.NewAccount(accountCli),
 		VideoRpc:          videoclient.NewVideo(videoCli),
 		InteractionRpc:    interactionclient.NewInteraction(interactionCli),
+		SocialRpc:         socialclient.NewSocial(socialCli),
 		RedisCli:          redisCli,
 		GormDB:            db,
 		TokenAuth:         middleware.NewTokenAuthMiddleware(redisCli).Handle,

@@ -23,15 +23,24 @@ func NewListFollowingsLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Li
 	}
 }
 
-// ListFollowings 查某用户关注的人列表（他关注了谁）。
+// ListFollowings 查询“user_id 关注了谁”，分页规则与 ListFollowers 对称：
 //
-//	索引：idx_follower(follower_id)，按 id 倒序。
-//	游标分页与 ListFollowers 同策略，仅返回 status=FollowStatusActive。
+//  1. 校验 user_id、目标用户存在性、page_size 和双游标组合。
+//  2. 查询 follows：
+//     WHERE follower_id=? AND status=Active AND deleted_at IS NULL
+//     后续页使用 (updated_at, id) 复合游标，
+//     ORDER BY updated_at DESC, id DESC LIMIT pageSize+1。
+//  3. 收集本页 following_id，批量计算 viewer_id 对这些用户的关注状态。
+//     viewer_id=0 时全部为 false；不要循环访问 Redis/MySQL。
+//  4. 组装 FollowRelation，followed_at 使用 UpdatedAt.UnixMilli()。
+//  5. 截断多取的一条并计算 has_more、next_cursor_updated_at、
+//     next_cursor_follow_id。
 func (l *ListFollowingsLogic) ListFollowings(in *social.ListFollowingsReq) (*social.ListFollowingsResp, error) {
-	// TODO: 实现关注列表游标分页查询。
+	// TODO: 根据上面的步骤实现核心业务逻辑。
 	return &social.ListFollowingsResp{
-		Followings:   nil,
-		NextCursorId: 0,
-		HasMore:      false,
+		Followings:          nil,
+		NextCursorUpdatedAt: 0,
+		NextCursorFollowId:  0,
+		HasMore:             false,
 	}, nil
 }

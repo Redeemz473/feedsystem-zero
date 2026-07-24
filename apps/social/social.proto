@@ -38,38 +38,68 @@ message IsFollowingResp {
   bool following = 1;
 }
 
-// 分页游标：按 id 倒序（最新关注排前面）。
-// 首次请求 cursor_id 传 0；后续用上次返回的 next_cursor_id。
+// 分页游标按 updated_at DESC, id DESC 排序。
+// 软删除关系重新关注时 updated_at 会更新，因此能够重新出现在列表前面。
 message ListFollowersReq {
   uint64 user_id = 1;        // 被关注者，查询其粉丝列表
-  uint64 viewer_id = 2;      // 当前查看者，用于后续判断是否互关（本期可忽略）
-  uint64 cursor_id = 3;
-  int64 page_size = 4;
+  uint64 viewer_id = 2;      // 当前查看者，0 表示未登录
+  int64 cursor_updated_at = 3;
+  uint64 cursor_follow_id = 4;
+  int64 page_size = 5;
 }
 
 message FollowRelation {
-  uint64 follower_id = 1;
-  uint64 following_id = 2;
-  int64 created_at = 3; // Unix milliseconds
+  uint64 relation_id = 1;
+  uint64 follower_id = 2;
+  uint64 following_id = 3;
+  int64 followed_at = 4; // 关系最近生效时间，Unix milliseconds
+  bool viewer_is_following = 5;
 }
 
 message ListFollowersResp {
   repeated FollowRelation followers = 1;
-  uint64 next_cursor_id = 2;
-  bool has_more = 3;
+  int64 next_cursor_updated_at = 2;
+  uint64 next_cursor_follow_id = 3;
+  bool has_more = 4;
 }
 
 message ListFollowingsReq {
   uint64 user_id = 1;        // 主动关注者，查询其关注列表
-  uint64 viewer_id = 2;
-  uint64 cursor_id = 3;
-  int64 page_size = 4;
+  uint64 viewer_id = 2;      // 当前查看者，0 表示未登录
+  int64 cursor_updated_at = 3;
+  uint64 cursor_follow_id = 4;
+  int64 page_size = 5;
 }
 
 message ListFollowingsResp {
   repeated FollowRelation followings = 1;
-  uint64 next_cursor_id = 2;
-  bool has_more = 3;
+  int64 next_cursor_updated_at = 2;
+  uint64 next_cursor_follow_id = 3;
+  bool has_more = 4;
+}
+
+message FollowingState {
+  uint64 target_user_id = 1;
+  bool following = 2;
+}
+
+// Feed/推荐列表批量判断当前查看者是否关注多个作者，避免 N+1 RPC。
+message BatchIsFollowingReq {
+  uint64 viewer_id = 1; // 0 表示未登录
+  repeated uint64 target_user_ids = 2;
+}
+
+message BatchIsFollowingResp {
+  repeated FollowingState states = 1;
+}
+
+message GetFollowStatsReq {
+  uint64 user_id = 1;
+}
+
+message GetFollowStatsResp {
+  int64 followers_count = 1;
+  int64 followings_count = 2;
 }
 
 // 社交关系服务
@@ -79,4 +109,6 @@ service Social {
   rpc IsFollowing(IsFollowingReq) returns (IsFollowingResp);
   rpc ListFollowers(ListFollowersReq) returns (ListFollowersResp);
   rpc ListFollowings(ListFollowingsReq) returns (ListFollowingsResp);
+  rpc BatchIsFollowing(BatchIsFollowingReq) returns (BatchIsFollowingResp);
+  rpc GetFollowStats(GetFollowStatsReq) returns (GetFollowStatsResp);
 }

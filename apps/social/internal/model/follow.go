@@ -27,7 +27,7 @@ func (Follow) TableName() string {
 	return "follows"
 }
 
-// 供业务逻辑参考的索引建议（在 deploy/sql 的建表语句中体现，不在此处建索引）：
+// 供业务逻辑参考的索引（在 deploy/sql 的迁移中创建，不在此处自动建索引）：
 //   UNIQUE KEY uk_follower_following (follower_id, following_id)
-//   KEY idx_following (following_id)  -- 反查粉丝列表
-//   KEY idx_follower (follower_id)    -- 查关注列表
+//   KEY idx_following_status_updated (following_id, status, updated_at, id)
+//   KEY idx_follower_status_updated (follower_id, status, updated_at, id)

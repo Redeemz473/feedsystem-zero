@@ -12,6 +12,7 @@ topics=(
   "video.stat.delta.events"
   "feed.video.events"
   "notification.events"
+  "social.follow.events"
 )
 
 for topic in "${topics[@]}"; do

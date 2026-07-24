@@ -23,17 +23,32 @@ func NewListFollowersLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Lis
 	}
 }
 
-// ListFollowers 查某用户的粉丝列表（谁关注了他）。
+// ListFollowers 查询“谁关注了 user_id”，建议按下面步骤实现：
 //
-//	索引：idx_following(following_id)，按 id 倒序（最新关注排前）。
-//	游标分页：cursor_id=0 首页；之后用上一页最小 id 作为下一页 cursor_id，
-//	取 page_size+1 条判断是否 has_more，并回填 next_cursor_id。
-//	仅返回 status=FollowStatusActive 的关系。
+//  1. 校验 user_id 非 0，并通过 AccountRpc.GetProfile 确认用户存在。
+//  2. 统一 page_size：默认 20，最大 50；cursor_updated_at 和 cursor_follow_id
+//     必须同时为 0（首页）或同时非 0（后续页）。
+//  3. 查询 follows：
+//     WHERE following_id=? AND status=Active AND deleted_at IS NULL
+//     后续页追加：
+//     updated_at < cursorTime OR (updated_at = cursorTime AND id < cursorFollowID)
+//     ORDER BY updated_at DESC, id DESC LIMIT pageSize+1。
+//     cursor_updated_at 是 Unix 毫秒，使用 time.UnixMilli 转换。
+//  4. 多取的一条只用于判断 has_more，返回结果截断为 pageSize。
+//  5. 收集本页 follower_id；如果 viewer_id 非 0，批量查询
+//     viewer_id 是否关注这些 follower_id。建议抽到 socialhelper.go 复用，
+//     不要在循环中逐条调用 IsFollowing。
+//  6. 组装 FollowRelation：
+//     relation_id=row.ID、follower_id、following_id、
+//     followed_at=row.UpdatedAt.UnixMilli()、viewer_is_following。
+//  7. 下一页游标取本页最后一条的 updated_at 和 id；空列表返回 0。
+//     查询条件与 011_social_final_indexes.sql 的索引顺序保持一致。
 func (l *ListFollowersLogic) ListFollowers(in *social.ListFollowersReq) (*social.ListFollowersResp, error) {
-	// TODO: 实现粉丝列表游标分页查询。
+	// TODO: 根据上面的步骤实现核心业务逻辑。
 	return &social.ListFollowersResp{
-		Followers:    nil,
-		NextCursorId: 0,
-		HasMore:      false,
+		Followers:           nil,
+		NextCursorUpdatedAt: 0,
+		NextCursorFollowId:  0,
+		HasMore:             false,
 	}, nil
 }

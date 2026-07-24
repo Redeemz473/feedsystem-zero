@@ -138,13 +138,13 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 			[]rest.Route{
 				{
 					Method:  http.MethodGet,
-					Path:    "/video/:id/liked",
-					Handler: IsLikedHandler(serverCtx),
+					Path:    "/video/:id/comments",
+					Handler: ListCommentsHandler(serverCtx),
 				},
 				{
 					Method:  http.MethodGet,
-					Path:    "/video/:id/comments",
-					Handler: ListCommentsHandler(serverCtx),
+					Path:    "/video/:id/liked",
+					Handler: IsLikedHandler(serverCtx),
 				},
 			}...,
 		),
@@ -156,14 +156,9 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 			[]rest.Middleware{serverCtx.TokenAuth},
 			[]rest.Route{
 				{
-					Method:  http.MethodPost,
-					Path:    "/video/:id/like",
-					Handler: LikeVideoHandler(serverCtx),
-				},
-				{
 					Method:  http.MethodDelete,
-					Path:    "/video/:id/like",
-					Handler: UnlikeVideoHandler(serverCtx),
+					Path:    "/comments/:comment_id",
+					Handler: DeleteCommentHandler(serverCtx),
 				},
 				{
 					Method:  http.MethodGet,
@@ -176,13 +171,67 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 					Handler: PublishCommentHandler(serverCtx),
 				},
 				{
+					Method:  http.MethodPost,
+					Path:    "/video/:id/like",
+					Handler: LikeVideoHandler(serverCtx),
+				},
+				{
 					Method:  http.MethodDelete,
-					Path:    "/comments/:comment_id",
-					Handler: DeleteCommentHandler(serverCtx),
+					Path:    "/video/:id/like",
+					Handler: UnlikeVideoHandler(serverCtx),
 				},
 			}...,
 		),
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
 		rest.WithPrefix("/interaction"),
+	)
+
+	server.AddRoutes(
+		rest.WithMiddlewares(
+			[]rest.Middleware{serverCtx.OptionalTokenAuth},
+			[]rest.Route{
+				{
+					Method:  http.MethodGet,
+					Path:    "/users/:id/followers",
+					Handler: ListFollowersHandler(serverCtx),
+				},
+				{
+					Method:  http.MethodGet,
+					Path:    "/users/:id/following-status",
+					Handler: IsFollowingHandler(serverCtx),
+				},
+				{
+					Method:  http.MethodGet,
+					Path:    "/users/:id/followings",
+					Handler: ListFollowingsHandler(serverCtx),
+				},
+				{
+					Method:  http.MethodGet,
+					Path:    "/users/:id/stats",
+					Handler: GetFollowStatsHandler(serverCtx),
+				},
+			}...,
+		),
+		rest.WithPrefix("/social"),
+	)
+
+	server.AddRoutes(
+		rest.WithMiddlewares(
+			[]rest.Middleware{serverCtx.TokenAuth},
+			[]rest.Route{
+				{
+					Method:  http.MethodPost,
+					Path:    "/users/:id/follow",
+					Handler: FollowHandler(serverCtx),
+				},
+				{
+					Method:  http.MethodDelete,
+					Path:    "/users/:id/follow",
+					Handler: UnfollowHandler(serverCtx),
+				},
+			}...,
+		),
+		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
+		rest.WithPrefix("/social"),
 	)
 }

@@ -25,6 +25,7 @@ const (
 	Account_Logout_FullMethodName           = "/account.Account/Logout"
 	Account_RefreshToken_FullMethodName     = "/account.Account/RefreshToken"
 	Account_GetProfile_FullMethodName       = "/account.Account/GetProfile"
+	Account_BatchGetProfiles_FullMethodName = "/account.Account/BatchGetProfiles"
 	Account_UpdateProfile_FullMethodName    = "/account.Account/UpdateProfile"
 )
 
@@ -46,6 +47,8 @@ type AccountClient interface {
 	RefreshToken(ctx context.Context, in *RefreshTokenReq, opts ...grpc.CallOption) (*RefreshTokenResp, error)
 	// 查用户
 	GetProfile(ctx context.Context, in *GetProfileReq, opts ...grpc.CallOption) (*GetProfileResp, error)
+	// 批量查询公开用户资料
+	BatchGetProfiles(ctx context.Context, in *BatchGetProfilesReq, opts ...grpc.CallOption) (*BatchGetProfilesResp, error)
 	// 更新用户信息
 	UpdateProfile(ctx context.Context, in *UpdateProfileReq, opts ...grpc.CallOption) (*UpdateProfileResp, error)
 }
@@ -118,6 +121,16 @@ func (c *accountClient) GetProfile(ctx context.Context, in *GetProfileReq, opts 
 	return out, nil
 }
 
+func (c *accountClient) BatchGetProfiles(ctx context.Context, in *BatchGetProfilesReq, opts ...grpc.CallOption) (*BatchGetProfilesResp, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchGetProfilesResp)
+	err := c.cc.Invoke(ctx, Account_BatchGetProfiles_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *accountClient) UpdateProfile(ctx context.Context, in *UpdateProfileReq, opts ...grpc.CallOption) (*UpdateProfileResp, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(UpdateProfileResp)
@@ -146,6 +159,8 @@ type AccountServer interface {
 	RefreshToken(context.Context, *RefreshTokenReq) (*RefreshTokenResp, error)
 	// 查用户
 	GetProfile(context.Context, *GetProfileReq) (*GetProfileResp, error)
+	// 批量查询公开用户资料
+	BatchGetProfiles(context.Context, *BatchGetProfilesReq) (*BatchGetProfilesResp, error)
 	// 更新用户信息
 	UpdateProfile(context.Context, *UpdateProfileReq) (*UpdateProfileResp, error)
 	mustEmbedUnimplementedAccountServer()
@@ -175,6 +190,9 @@ func (UnimplementedAccountServer) RefreshToken(context.Context, *RefreshTokenReq
 }
 func (UnimplementedAccountServer) GetProfile(context.Context, *GetProfileReq) (*GetProfileResp, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetProfile not implemented")
+}
+func (UnimplementedAccountServer) BatchGetProfiles(context.Context, *BatchGetProfilesReq) (*BatchGetProfilesResp, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchGetProfiles not implemented")
 }
 func (UnimplementedAccountServer) UpdateProfile(context.Context, *UpdateProfileReq) (*UpdateProfileResp, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateProfile not implemented")
@@ -308,6 +326,24 @@ func _Account_GetProfile_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Account_BatchGetProfiles_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchGetProfilesReq)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AccountServer).BatchGetProfiles(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Account_BatchGetProfiles_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AccountServer).BatchGetProfiles(ctx, req.(*BatchGetProfilesReq))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Account_UpdateProfile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(UpdateProfileReq)
 	if err := dec(in); err != nil {
@@ -356,6 +392,10 @@ var Account_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetProfile",
 			Handler:    _Account_GetProfile_Handler,
+		},
+		{
+			MethodName: "BatchGetProfiles",
+			Handler:    _Account_BatchGetProfiles_Handler,
 		},
 		{
 			MethodName: "UpdateProfile",

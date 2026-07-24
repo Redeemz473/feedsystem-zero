@@ -267,6 +267,71 @@ type (
 		Nextcursorcommentid uint64        `json:"next_cursor_comment_id"`
 		Hasmore             bool          `json:"has_more"`
 	}
+	//公开用户资料
+	SocialUserInfo {
+		Userid    uint64 `json:"user_id"`
+		Username  string `json:"username"`
+		Avatarurl string `json:"avatar_url"`
+		Bio       string `json:"bio"`
+	}
+	//关注关系列表项
+	FollowRelationInfo {
+		Relationid        uint64         `json:"relation_id"`
+		User              SocialUserInfo `json:"user"`
+		Followedat        int64          `json:"followed_at"`
+		Viewerisfollowing bool           `json:"viewer_is_following"`
+	}
+	FollowReq {
+		Targetuserid uint64 `path:"id"`
+	}
+	FollowResp {
+		Msg      string `json:"msg"`
+		Followed bool   `json:"followed"`
+	}
+	UnfollowReq {
+		Targetuserid uint64 `path:"id"`
+	}
+	UnfollowResp {
+		Msg        string `json:"msg"`
+		Unfollowed bool   `json:"unfollowed"`
+	}
+	IsFollowingReq {
+		Targetuserid uint64 `path:"id"`
+	}
+	IsFollowingResp {
+		Following bool `json:"following"`
+	}
+	ListFollowersReq {
+		Userid          uint64 `path:"id"`
+		Cursorupdatedat int64  `form:"cursor_updated_at,optional"`
+		Cursorfollowid  uint64 `form:"cursor_follow_id,optional"`
+		Pagesize        int64  `form:"page_size,optional"`
+	}
+	ListFollowersResp {
+		Followers           []FollowRelationInfo `json:"followers"`
+		Nextcursorupdatedat int64                `json:"next_cursor_updated_at"`
+		Nextcursorfollowid  uint64               `json:"next_cursor_follow_id"`
+		Hasmore             bool                 `json:"has_more"`
+	}
+	ListFollowingsReq {
+		Userid          uint64 `path:"id"`
+		Cursorupdatedat int64  `form:"cursor_updated_at,optional"`
+		Cursorfollowid  uint64 `form:"cursor_follow_id,optional"`
+		Pagesize        int64  `form:"page_size,optional"`
+	}
+	ListFollowingsResp {
+		Followings          []FollowRelationInfo `json:"followings"`
+		Nextcursorupdatedat int64                `json:"next_cursor_updated_at"`
+		Nextcursorfollowid  uint64               `json:"next_cursor_follow_id"`
+		Hasmore             bool                 `json:"has_more"`
+	}
+	GetFollowStatsReq {
+		Userid uint64 `path:"id"`
+	}
+	GetFollowStatsResp {
+		Followerscount  int64 `json:"followers_count"`
+		Followingscount int64 `json:"followings_count"`
+	}
 )
 
 @server (
@@ -380,4 +445,35 @@ service gateway {
 
 	@handler DeleteComment
 	delete /comments/:comment_id (DeleteCommentReq) returns (DeleteCommentResp)
+}
+
+@server (
+	prefix:     /social
+	middleware: OptionalTokenAuth
+)
+service gateway {
+	@handler IsFollowing
+	get /users/:id/following-status (IsFollowingReq) returns (IsFollowingResp)
+
+	@handler ListFollowers
+	get /users/:id/followers (ListFollowersReq) returns (ListFollowersResp)
+
+	@handler ListFollowings
+	get /users/:id/followings (ListFollowingsReq) returns (ListFollowingsResp)
+
+	@handler GetFollowStats
+	get /users/:id/stats (GetFollowStatsReq) returns (GetFollowStatsResp)
+}
+
+@server (
+	prefix:     /social
+	jwt:        Auth
+	middleware: TokenAuth
+)
+service gateway {
+	@handler Follow
+	post /users/:id/follow (FollowReq) returns (FollowResp)
+
+	@handler Unfollow
+	delete /users/:id/follow (UnfollowReq) returns (UnfollowResp)
 }

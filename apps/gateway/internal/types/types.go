@@ -3,6 +3,17 @@
 
 package types
 
+type CommentInfo struct {
+	Commentid uint64 `json:"comment_id"`
+	Videoid   uint64 `json:"video_id"`
+	Userid    uint64 `json:"user_id"`
+	Username  string `json:"username"`
+	Content   string `json:"content"`
+	Createdat int64  `json:"created_at"`
+	Updatedat int64  `json:"updated_at"`
+	Candelete bool   `json:"can_delete"`
+}
+
 type CompleteVideoUploadReq struct {
 	Uploadid    string `json:"upload_id"`
 	Filename    string `json:"filename"`
@@ -17,84 +28,6 @@ type CompleteVideoUploadResp struct {
 	Filehash string `json:"file_hash"`
 }
 
-type DeleteVideoReq struct {
-	Videoid uint64 `path:"id"`
-}
-
-type DeleteVideoResp struct {
-	Msg string `json:"msg"`
-}
-
-type LikeVideoReq struct {
-	Videoid uint64 `path:"id"`
-}
-
-type LikeVideoResp struct {
-	Msg        string `json:"msg"`
-	Liked      bool   `json:"liked"`
-	Likescount int64  `json:"likes_count"`
-}
-
-type UnlikeVideoReq struct {
-	Videoid uint64 `path:"id"`
-}
-
-type UnlikeVideoResp struct {
-	Msg        string `json:"msg"`
-	Liked      bool   `json:"liked"`
-	Likescount int64  `json:"likes_count"`
-}
-
-type IsLikedReq struct {
-	Videoid uint64 `path:"id"`
-}
-
-type IsLikedResp struct {
-	Liked bool `json:"liked"`
-}
-
-type LikedVideoInfo struct {
-	Likeid  uint64    `json:"like_id"`
-	Likedat int64     `json:"liked_at"`
-	Video   VideoInfo `json:"video"`
-}
-
-type ListMyLikedVideosReq struct {
-	Cursorcreatedat int64  `form:"cursor_created_at,optional"`
-	Cursorlikeid    uint64 `form:"cursor_like_id,optional"`
-	Pagesize        int64  `form:"page_size,optional"`
-}
-
-type ListMyLikedVideosResp struct {
-	Likedvideos         []LikedVideoInfo `json:"liked_videos"`
-	Nextcursorcreatedat int64            `json:"next_cursor_created_at"`
-	Nextcursorlikeid    uint64           `json:"next_cursor_like_id"`
-	Hasmore             bool             `json:"has_more"`
-}
-
-type CommentInfo struct {
-	Commentid uint64 `json:"comment_id"`
-	Videoid   uint64 `json:"video_id"`
-	Userid    uint64 `json:"user_id"`
-	Username  string `json:"username"`
-	Content   string `json:"content"`
-	Createdat int64  `json:"created_at"`
-	Updatedat int64  `json:"updated_at"`
-	Candelete bool   `json:"can_delete"`
-}
-
-type PublishCommentReq struct {
-	Videoid   uint64 `path:"id"`
-	Content   string `json:"content"`
-	Requestid string `json:"request_id,optional"`
-}
-
-type PublishCommentResp struct {
-	Msg           string      `json:"msg"`
-	Comment       CommentInfo `json:"comment"`
-	Commentscount int64       `json:"comments_count"`
-}
-
 type DeleteCommentReq struct {
 	Commentid uint64 `path:"comment_id"`
 }
@@ -105,18 +38,37 @@ type DeleteCommentResp struct {
 	Commentscount int64  `json:"comments_count"`
 }
 
-type ListCommentsReq struct {
-	Videoid         uint64 `path:"id"`
-	Cursorcreatedat int64  `form:"cursor_created_at,optional"`
-	Cursorcommentid uint64 `form:"cursor_comment_id,optional"`
-	Pagesize        int64  `form:"page_size,optional"`
+type DeleteVideoReq struct {
+	Videoid uint64 `path:"id"`
 }
 
-type ListCommentsResp struct {
-	Comments            []CommentInfo `json:"comments"`
-	Nextcursorcreatedat int64         `json:"next_cursor_created_at"`
-	Nextcursorcommentid uint64        `json:"next_cursor_comment_id"`
-	Hasmore             bool          `json:"has_more"`
+type DeleteVideoResp struct {
+	Msg string `json:"msg"`
+}
+
+type FollowRelationInfo struct {
+	Relationid        uint64         `json:"relation_id"`
+	User              SocialUserInfo `json:"user"`
+	Followedat        int64          `json:"followed_at"`
+	Viewerisfollowing bool           `json:"viewer_is_following"`
+}
+
+type FollowReq struct {
+	Targetuserid uint64 `path:"id"`
+}
+
+type FollowResp struct {
+	Msg      string `json:"msg"`
+	Followed bool   `json:"followed"`
+}
+
+type GetFollowStatsReq struct {
+	Userid uint64 `path:"id"`
+}
+
+type GetFollowStatsResp struct {
+	Followerscount  int64 `json:"followers_count"`
+	Followingscount int64 `json:"followings_count"`
 }
 
 type GetProfileReq struct {
@@ -157,6 +109,93 @@ type InitVideoUploadResp struct {
 	Chunkthresholdbytes int64   `json:"chunk_threshold_bytes"`
 }
 
+type IsFollowingReq struct {
+	Targetuserid uint64 `path:"id"`
+}
+
+type IsFollowingResp struct {
+	Following bool `json:"following"`
+}
+
+type IsLikedReq struct {
+	Videoid uint64 `path:"id"`
+}
+
+type IsLikedResp struct {
+	Liked bool `json:"liked"`
+}
+
+type LikeVideoReq struct {
+	Videoid uint64 `path:"id"`
+}
+
+type LikeVideoResp struct {
+	Msg        string `json:"msg"`
+	Liked      bool   `json:"liked"`
+	Likescount int64  `json:"likes_count"`
+}
+
+type LikedVideoInfo struct {
+	Likeid  uint64    `json:"like_id"`
+	Likedat int64     `json:"liked_at"`
+	Video   VideoInfo `json:"video"`
+}
+
+type ListCommentsReq struct {
+	Videoid         uint64 `path:"id"`
+	Cursorcreatedat int64  `form:"cursor_created_at,optional"`
+	Cursorcommentid uint64 `form:"cursor_comment_id,optional"`
+	Pagesize        int64  `form:"page_size,optional"`
+}
+
+type ListCommentsResp struct {
+	Comments            []CommentInfo `json:"comments"`
+	Nextcursorcreatedat int64         `json:"next_cursor_created_at"`
+	Nextcursorcommentid uint64        `json:"next_cursor_comment_id"`
+	Hasmore             bool          `json:"has_more"`
+}
+
+type ListFollowersReq struct {
+	Userid          uint64 `path:"id"`
+	Cursorupdatedat int64  `form:"cursor_updated_at,optional"`
+	Cursorfollowid  uint64 `form:"cursor_follow_id,optional"`
+	Pagesize        int64  `form:"page_size,optional"`
+}
+
+type ListFollowersResp struct {
+	Followers           []FollowRelationInfo `json:"followers"`
+	Nextcursorupdatedat int64                `json:"next_cursor_updated_at"`
+	Nextcursorfollowid  uint64               `json:"next_cursor_follow_id"`
+	Hasmore             bool                 `json:"has_more"`
+}
+
+type ListFollowingsReq struct {
+	Userid          uint64 `path:"id"`
+	Cursorupdatedat int64  `form:"cursor_updated_at,optional"`
+	Cursorfollowid  uint64 `form:"cursor_follow_id,optional"`
+	Pagesize        int64  `form:"page_size,optional"`
+}
+
+type ListFollowingsResp struct {
+	Followings          []FollowRelationInfo `json:"followings"`
+	Nextcursorupdatedat int64                `json:"next_cursor_updated_at"`
+	Nextcursorfollowid  uint64               `json:"next_cursor_follow_id"`
+	Hasmore             bool                 `json:"has_more"`
+}
+
+type ListMyLikedVideosReq struct {
+	Cursorcreatedat int64  `form:"cursor_created_at,optional"`
+	Cursorlikeid    uint64 `form:"cursor_like_id,optional"`
+	Pagesize        int64  `form:"page_size,optional"`
+}
+
+type ListMyLikedVideosResp struct {
+	Likedvideos         []LikedVideoInfo `json:"liked_videos"`
+	Nextcursorcreatedat int64            `json:"next_cursor_created_at"`
+	Nextcursorlikeid    uint64           `json:"next_cursor_like_id"`
+	Hasmore             bool             `json:"has_more"`
+}
+
 type ListUserVideosReq struct {
 	Authorid        uint64 `path:"author_id"`
 	Cursorcreatedat int64  `form:"cursor_created_at,optional"`
@@ -186,6 +225,18 @@ type LogoutReq struct {
 
 type LogoutResp struct {
 	Msg string `json:"msg"`
+}
+
+type PublishCommentReq struct {
+	Videoid   uint64 `path:"id"`
+	Content   string `json:"content"`
+	Requestid string `json:"request_id,optional"`
+}
+
+type PublishCommentResp struct {
+	Msg           string      `json:"msg"`
+	Comment       CommentInfo `json:"comment"`
+	Commentscount int64       `json:"comments_count"`
 }
 
 type PublishVideoReq struct {
@@ -220,6 +271,32 @@ type RegisterReq struct {
 
 type RegisterResp struct {
 	Msg string `json:"msg"`
+}
+
+type SocialUserInfo struct {
+	Userid    uint64 `json:"user_id"`
+	Username  string `json:"username"`
+	Avatarurl string `json:"avatar_url"`
+	Bio       string `json:"bio"`
+}
+
+type UnfollowReq struct {
+	Targetuserid uint64 `path:"id"`
+}
+
+type UnfollowResp struct {
+	Msg        string `json:"msg"`
+	Unfollowed bool   `json:"unfollowed"`
+}
+
+type UnlikeVideoReq struct {
+	Videoid uint64 `path:"id"`
+}
+
+type UnlikeVideoResp struct {
+	Msg        string `json:"msg"`
+	Liked      bool   `json:"liked"`
+	Likescount int64  `json:"likes_count"`
 }
 
 type UpdateProfileReq struct {

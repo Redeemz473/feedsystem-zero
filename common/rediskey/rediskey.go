@@ -13,6 +13,14 @@ const prefix = "fsz"
 
 const VerificationCodeTTL = 5 * time.Minute
 
+const (
+	// SocialFollowingStateTTL 是单条关注状态缓存的有效期。
+	// value 使用 "1"/"0"，必须同时缓存未关注状态，避免不存在关系反复穿透 MySQL。
+	SocialFollowingStateTTL = 10 * time.Minute
+	// SocialFollowStatsTTL 是粉丝数/关注数缓存的有效期。
+	SocialFollowStatsTTL = 5 * time.Minute
+)
+
 // 账号模块
 // TokenKey 当前有效 access token，value 是 JWT 字符串。
 // 当前采用单设备/单会话模型：同一用户新登录会覆盖旧 token。
@@ -179,6 +187,21 @@ func CommentListCacheBuildLockKey(cacheKey string) string {
 // 格式: fsz:comment:list:version:{videoID}
 func CommentListVersionKey(videoID uint64) string {
 	return fmt.Sprintf("%s:comment:list:version:%d", prefix, videoID)
+}
+
+// ========================================
+// 社交关系模块
+// SocialFollowingStateKey 单向关注状态缓存，value=1/0。
+// 格式: fsz:social:following:{followerID}:{followingID}
+func SocialFollowingStateKey(followerID, followingID uint64) string {
+	return fmt.Sprintf("%s:social:following:%d:%d", prefix, followerID, followingID)
+}
+
+// SocialFollowStatsKey 用户粉丝数与关注数缓存，HASH。
+// fields: followers_count/followings_count
+// 格式: fsz:social:stats:{userID}
+func SocialFollowStatsKey(userID uint64) string {
+	return fmt.Sprintf("%s:social:stats:%d", prefix, userID)
 }
 
 // ========================================

@@ -47,3 +47,13 @@ func (s *SocialServer) ListFollowings(ctx context.Context, in *social.ListFollow
 	l := logic.NewListFollowingsLogic(ctx, s.svcCtx)
 	return l.ListFollowings(in)
 }
+
+func (s *SocialServer) BatchIsFollowing(ctx context.Context, in *social.BatchIsFollowingReq) (*social.BatchIsFollowingResp, error) {
+	l := logic.NewBatchIsFollowingLogic(ctx, s.svcCtx)
+	return l.BatchIsFollowing(in)
+}
+
+func (s *SocialServer) GetFollowStats(ctx context.Context, in *social.GetFollowStatsReq) (*social.GetFollowStatsResp, error) {
+	l := logic.NewGetFollowStatsLogic(ctx, s.svcCtx)
+	return l.GetFollowStats(in)
+}

@@ -23,16 +23,23 @@ func NewUnfollowLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Unfollow
 	}
 }
 
-// Unfollow 取关逻辑骨架（业务逻辑由你实现）：
-//  1. 幂等：若 follows 已无 active 记录，直接返回 unfollowed=true。
-//  2. 事务（同一 DB 事务内）：
-//     a. 将 follows 行 status 置为 FollowStatusDeleted（软删，保留审计）。
-//     b. 插入 OutboxEvent（event_type=EventTypeFollowDeleted, action=FollowActionUnfollow）。
-//  3. 返回 UnfollowResp{unfollowed:true}。
+// Unfollow 建议按下面顺序实现：
 //
-// 同样：follower_id 由 gateway 从 JWT 解析传入。
+//  1. 校验 follower_id/following_id 非 0；两者相等可以直接返回参数错误。
+//  2. 开启 MySQL 事务，按 (follower_id, following_id) SELECT ... FOR UPDATE：
+//     - 记录不存在或已经 Deleted：属于重复取关，直接幂等成功，不重复写 Outbox；
+//     - Active：更新 status=Deleted、deleted_at=now、updated_at=now。
+//  3. 只有状态真正由 Active 变为 Deleted 时，才在同一事务插入 OutboxEvent：
+//     - event_type=eventx.EventTypeFollowDeleted；
+//     - action=eventx.FollowActionUnfollow；
+//     - payload 使用 eventx.Envelope 包裹 FollowEvent。
+//  4. 事务提交后将 SocialFollowingStateKey 写 "0" 并设置 TTL，
+//     同时删除双方的 SocialFollowStatsKey。Redis 失败只记录日志。
+//  5. 返回 UnfollowResp{Msg:"取关成功", Unfollowed:true}。
+//
+// follower_id 同样只能来自 gateway 解析后的 JWT。
 func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, error) {
-	// TODO: 实现取关业务逻辑（参考上述注释步骤）。
+	// TODO: 根据上面的步骤实现核心业务逻辑。
 	return &social.UnfollowResp{
 		Msg:        "not implemented",
 		Unfollowed: false,

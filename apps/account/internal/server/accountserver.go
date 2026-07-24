@@ -59,6 +59,12 @@ func (s *AccountServer) GetProfile(ctx context.Context, in *account.GetProfileRe
 	return l.GetProfile(in)
 }
 
+// 批量查询公开用户资料
+func (s *AccountServer) BatchGetProfiles(ctx context.Context, in *account.BatchGetProfilesReq) (*account.BatchGetProfilesResp, error) {
+	l := logic.NewBatchGetProfilesLogic(ctx, s.svcCtx)
+	return l.BatchGetProfiles(in)
+}
+
 // 更新用户信息
 func (s *AccountServer) UpdateProfile(ctx context.Context, in *account.UpdateProfileReq) (*account.UpdateProfileResp, error) {
 	l := logic.NewUpdateProfileLogic(ctx, s.svcCtx)

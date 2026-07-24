@@ -60,8 +60,10 @@ func (ProcessedEvent) TableName() string {
 	return "processed_events"
 }
 
-// BuildFollowPayload 构造关注事件 payload（与 eventx 约定对齐）。
-// 业务逻辑在写 outbox 时调用，避免各 logic 自行拼 JSON。
+// BuildFollowPayload 只构造关注事件的业务 payload（与 eventx 约定对齐）。
+// 注意：它的返回值不能直接写入 outbox_events.payload。
+// Follow/Unfollow logic 还需要把它放入 eventx.Envelope.Payload，
+// 再序列化整个 Envelope 后写入 outbox，格式才能与 dispatcher 和下游消费者统一。
 func BuildFollowPayload(eventID string, followerID, followingID uint64, action string, occurredAt int64) ([]byte, error) {
 	p := eventx.FollowEvent{
 		EventID:     eventID,

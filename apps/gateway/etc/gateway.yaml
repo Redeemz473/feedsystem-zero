@@ -31,6 +31,12 @@ InteractionRpc:
       - 127.0.0.1:23790
     Key: interaction.rpc
 
+SocialRpc:
+  Etcd:
+    Hosts:
+      - 127.0.0.1:23790
+    Key: social.rpc
+
 Upload:
   Dir: uploads
   PublicPrefix: /uploads

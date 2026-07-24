@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             v7.35.1
-// source: apps/social/social.proto
+// source: social.proto
 
 package social
 
@@ -19,11 +19,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Social_Follow_FullMethodName         = "/social.Social/Follow"
-	Social_Unfollow_FullMethodName       = "/social.Social/Unfollow"
-	Social_IsFollowing_FullMethodName    = "/social.Social/IsFollowing"
-	Social_ListFollowers_FullMethodName  = "/social.Social/ListFollowers"
-	Social_ListFollowings_FullMethodName = "/social.Social/ListFollowings"
+	Social_Follow_FullMethodName           = "/social.Social/Follow"
+	Social_Unfollow_FullMethodName         = "/social.Social/Unfollow"
+	Social_IsFollowing_FullMethodName      = "/social.Social/IsFollowing"
+	Social_ListFollowers_FullMethodName    = "/social.Social/ListFollowers"
+	Social_ListFollowings_FullMethodName   = "/social.Social/ListFollowings"
+	Social_BatchIsFollowing_FullMethodName = "/social.Social/BatchIsFollowing"
+	Social_GetFollowStats_FullMethodName   = "/social.Social/GetFollowStats"
 )
 
 // SocialClient is the client API for Social service.
@@ -37,6 +39,8 @@ type SocialClient interface {
 	IsFollowing(ctx context.Context, in *IsFollowingReq, opts ...grpc.CallOption) (*IsFollowingResp, error)
 	ListFollowers(ctx context.Context, in *ListFollowersReq, opts ...grpc.CallOption) (*ListFollowersResp, error)
 	ListFollowings(ctx context.Context, in *ListFollowingsReq, opts ...grpc.CallOption) (*ListFollowingsResp, error)
+	BatchIsFollowing(ctx context.Context, in *BatchIsFollowingReq, opts ...grpc.CallOption) (*BatchIsFollowingResp, error)
+	GetFollowStats(ctx context.Context, in *GetFollowStatsReq, opts ...grpc.CallOption) (*GetFollowStatsResp, error)
 }
 
 type socialClient struct {
@@ -97,6 +101,26 @@ func (c *socialClient) ListFollowings(ctx context.Context, in *ListFollowingsReq
 	return out, nil
 }
 
+func (c *socialClient) BatchIsFollowing(ctx context.Context, in *BatchIsFollowingReq, opts ...grpc.CallOption) (*BatchIsFollowingResp, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchIsFollowingResp)
+	err := c.cc.Invoke(ctx, Social_BatchIsFollowing_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *socialClient) GetFollowStats(ctx context.Context, in *GetFollowStatsReq, opts ...grpc.CallOption) (*GetFollowStatsResp, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetFollowStatsResp)
+	err := c.cc.Invoke(ctx, Social_GetFollowStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SocialServer is the server API for Social service.
 // All implementations must embed UnimplementedSocialServer
 // for forward compatibility.
@@ -108,6 +132,8 @@ type SocialServer interface {
 	IsFollowing(context.Context, *IsFollowingReq) (*IsFollowingResp, error)
 	ListFollowers(context.Context, *ListFollowersReq) (*ListFollowersResp, error)
 	ListFollowings(context.Context, *ListFollowingsReq) (*ListFollowingsResp, error)
+	BatchIsFollowing(context.Context, *BatchIsFollowingReq) (*BatchIsFollowingResp, error)
+	GetFollowStats(context.Context, *GetFollowStatsReq) (*GetFollowStatsResp, error)
 	mustEmbedUnimplementedSocialServer()
 }
 
@@ -132,6 +158,12 @@ func (UnimplementedSocialServer) ListFollowers(context.Context, *ListFollowersRe
 }
 func (UnimplementedSocialServer) ListFollowings(context.Context, *ListFollowingsReq) (*ListFollowingsResp, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListFollowings not implemented")
+}
+func (UnimplementedSocialServer) BatchIsFollowing(context.Context, *BatchIsFollowingReq) (*BatchIsFollowingResp, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchIsFollowing not implemented")
+}
+func (UnimplementedSocialServer) GetFollowStats(context.Context, *GetFollowStatsReq) (*GetFollowStatsResp, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFollowStats not implemented")
 }
 func (UnimplementedSocialServer) mustEmbedUnimplementedSocialServer() {}
 func (UnimplementedSocialServer) testEmbeddedByValue()                {}
@@ -244,6 +276,42 @@ func _Social_ListFollowings_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Social_BatchIsFollowing_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchIsFollowingReq)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SocialServer).BatchIsFollowing(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Social_BatchIsFollowing_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SocialServer).BatchIsFollowing(ctx, req.(*BatchIsFollowingReq))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Social_GetFollowStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetFollowStatsReq)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SocialServer).GetFollowStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Social_GetFollowStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SocialServer).GetFollowStats(ctx, req.(*GetFollowStatsReq))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Social_ServiceDesc is the grpc.ServiceDesc for Social service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -271,7 +339,15 @@ var Social_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "ListFollowings",
 			Handler:    _Social_ListFollowings_Handler,
 		},
+		{
+			MethodName: "BatchIsFollowing",
+			Handler:    _Social_BatchIsFollowing_Handler,
+		},
+		{
+			MethodName: "GetFollowStats",
+			Handler:    _Social_GetFollowStats_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "apps/social/social.proto",
+	Metadata: "social.proto",
 }

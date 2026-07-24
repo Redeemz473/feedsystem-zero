@@ -4,8 +4,9 @@ import "github.com/zeromicro/go-zero/zrpc"
 
 type Config struct {
 	zrpc.RpcServerConf
-	Mysql    MysqlConf
-	BizRedis RedisConf
+	Mysql      MysqlConf
+	BizRedis   RedisConf
+	AccountRpc zrpc.RpcClientConf
 }
 
 type MysqlConf struct {
