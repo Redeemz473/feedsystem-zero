@@ -14,17 +14,17 @@ import (
 )
 
 type (
+	FollowRelation     = social.FollowRelation
 	FollowReq          = social.FollowReq
 	FollowResp         = social.FollowResp
-	UnfollowReq        = social.UnfollowReq
-	UnfollowResp       = social.UnfollowResp
 	IsFollowingReq     = social.IsFollowingReq
 	IsFollowingResp    = social.IsFollowingResp
-	FollowRelation     = social.FollowRelation
 	ListFollowersReq   = social.ListFollowersReq
 	ListFollowersResp  = social.ListFollowersResp
 	ListFollowingsReq  = social.ListFollowingsReq
 	ListFollowingsResp = social.ListFollowingsResp
+	UnfollowReq        = social.UnfollowReq
+	UnfollowResp       = social.UnfollowResp
 
 	Social interface {
 		Follow(ctx context.Context, in *FollowReq, opts ...grpc.CallOption) (*FollowResp, error)
