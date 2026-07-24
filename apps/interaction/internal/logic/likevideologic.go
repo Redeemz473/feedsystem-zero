@@ -117,6 +117,8 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 	}
 
 	// Redis 命中 liked=false 或 Redis/MySQL 都未点赞时，继续执行点赞。
+	fallbackLikesCount := nonNegative(realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video) + 1)
+
 	//创建点赞事件并封装
 	eventID, err := newEventID("like")
 	if err != nil {
@@ -206,15 +208,17 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 		return nil, status.Error(codes.Internal, "点赞失败")
 	}
 
-	// 5. 更新 Redis 实时状态和计数。若失败，核心 MySQL 状态已经成功，客户端重试会走幂等修复。
+	// 5. 更新 Redis 实时状态和计数。若失败，核心 MySQL 状态已经成功，仍返回本次操作后的合理计数。
+	likesCount := fallbackLikesCount
 	if err := applyRedisLikeState(l.ctx, l.svcCtx.RedisCli, videoID, userID); err != nil {
-		l.Errorf("apply redis like state failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
-		return nil, status.Error(codes.Internal, "点赞状态刷新失败，请重试")
+		l.Errorf("apply redis like state failed after mysql committed, video_id: %d, user_id: %d, fallback_likes_count: %d, error: %v", videoID, userID, fallbackLikesCount, err)
+	} else {
+		likesCount = realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video)
 	}
 
 	return &interaction.LikeVideoResp{
 		Msg:        "点赞成功",
 		Liked:      true,
-		LikesCount: realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video),
+		LikesCount: likesCount,
 	}, nil
 }

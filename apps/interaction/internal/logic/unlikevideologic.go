@@ -116,6 +116,8 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 	}
 
 	// Redis 命中 liked=true 或 MySQL 确认已点赞时，继续执行取消点赞。
+	fallbackLikesCount := nonNegative(realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video) - 1)
+
 	//创建并封装事件
 	eventID, err := newEventID("unlike")
 	if err != nil {
@@ -210,15 +212,17 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 		return nil, status.Error(codes.Internal, "取消点赞失败")
 	}
 
-	// 6. MySQL 已经成功后，再更新 Redis 实时状态和计数。
+	// 6. MySQL 已经成功后，再更新 Redis 实时状态和计数。若失败，核心 MySQL 状态已经成功，仍返回本次操作后的合理计数。
+	likesCount := fallbackLikesCount
 	if err := applyRedisUnlikeState(l.ctx, l.svcCtx.RedisCli, videoID, userID); err != nil {
-		l.Errorf("apply redis unlike state failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
-		return nil, status.Error(codes.Internal, "取消点赞状态刷新失败，请重试")
+		l.Errorf("apply redis unlike state failed after mysql committed, video_id: %d, user_id: %d, fallback_likes_count: %d, error: %v", videoID, userID, fallbackLikesCount, err)
+	} else {
+		likesCount = realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video)
 	}
 
 	return &interaction.UnlikeVideoResp{
 		Msg:        "取消点赞成功",
 		Liked:      false,
-		LikesCount: realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video),
+		LikesCount: likesCount,
 	}, nil
 }

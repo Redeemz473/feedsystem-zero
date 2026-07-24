@@ -2,11 +2,22 @@ package logic
 
 import (
 	"context"
+	"errors"
+	"time"
 
+	"feedsystem-zero/apps/account/accountclient"
+	"feedsystem-zero/apps/social/internal/model"
 	"feedsystem-zero/apps/social/internal/svc"
 	"feedsystem-zero/apps/social/social"
+	"feedsystem-zero/common/eventx"
+	"feedsystem-zero/common/rediskey"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/zeromicro/go-zero/core/logx"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type FollowLogic struct {
@@ -23,36 +34,129 @@ func NewFollowLogic(ctx context.Context, svcCtx *svc.ServiceContext) *FollowLogi
 	}
 }
 
-// Follow 建议按下面顺序实现：
-//
-//  1. 参数校验：
-//     - follower_id/following_id 不能为 0；
-//     - 两者相等时返回 codes.InvalidArgument，用户不能关注自己；
-//     - follower_id 必须由 gateway 从 JWT 解析，不能使用前端传来的身份。
-//  2. 调 AccountRpc.GetProfile(following_id) 校验目标用户存在。
-//     NotFound 原样转换为“目标用户不存在”，其它 RPC 错误记录日志后返回。
-//  3. 预生成 event_id、occurred_at 和 aggregate_id（格式 followerID:followingID）。
-//  4. 开启 MySQL 事务，并对唯一关系行 SELECT ... FOR UPDATE：
-//     - 已存在且 status=Active：这是重复关注，直接幂等成功，不写第二条 Outbox；
-//     - 已存在且 status=Deleted：更新为 Active、deleted_at=NULL、updated_at=now；
-//     - 不存在：插入一条 Active 关系。
-//     两个并发首次关注都查不到时，依赖 uk_follower_following 兜底；
-//     后到事务若遇到 1062，应在事务外回读，确认已经 Active 后按幂等成功返回。
-//  5. 只有关系真正从“未关注”变为“已关注”时，才在同一事务插入 OutboxEvent：
-//     - topic=eventx.TopicFollowEvents
-//     - event_type=eventx.EventTypeFollowCreated
-//     - aggregate_type=eventx.AggregateFollow
-//     - payload 不能只写 BuildFollowPayload 的结果，还要包一层 eventx.Envelope；
-//     - producer 使用 "social-rpc"。
-//  6. 事务提交后再更新 Redis：
-//     - SocialFollowingStateKey(followerID, followingID) 写 "1" 并设置 TTL；
-//     - 删除 followerID 和 followingID 的 SocialFollowStatsKey；
-//     - Redis 失败只记录日志，不能把已经提交成功的关注事务返回成失败。
-//  7. 返回 FollowResp{Msg:"关注成功", Followed:true}。
+// Follow 执行关注写操作。Redis 只作为“目标状态已达成”的幂等快速路径，
+// MySQL 事务仍然是关注关系的最终事实来源。
 func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
-	// TODO: 根据上面的步骤实现核心业务逻辑。
-	return &social.FollowResp{
-		Msg:      "not implemented",
-		Followed: false,
-	}, nil
+	followerID := in.GetFollowerId()
+	if followerID == 0 {
+		return nil, status.Error(codes.Unauthenticated, "用户未登录")
+	}
+
+	followingID := in.GetFollowingId()
+	if followingID == 0 {
+		return nil, status.Error(codes.InvalidArgument, "目标用户不能为空")
+	}
+	if followerID == followingID {
+		return nil, status.Error(codes.InvalidArgument, "用户不能关注自己")
+	}
+
+	if _, err := l.svcCtx.AccountRpc.GetProfile(l.ctx, &accountclient.GetProfileReq{UserId: followingID}); err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil, status.Error(codes.NotFound, "目标用户不存在")
+		}
+		l.Errorf("get following profile failed, following_id: %d, error: %v", followingID, err)
+		return nil, status.Error(codes.Internal, "校验目标用户失败")
+	}
+
+	followingStateKey := rediskey.SocialFollowingStateKey(followerID, followingID)
+	followingState, err := l.svcCtx.RedisCli.Get(l.ctx, followingStateKey).Result()
+	switch {
+	case err == nil:
+		if followingState == "1" {
+			return &social.FollowResp{Msg: "关注成功", Followed: true}, nil
+		}
+		if followingState != "0" {
+			l.Errorf("unexpected follow state cache value, key: %s, value: %s", followingStateKey, followingState)
+		}
+	case errors.Is(err, redis.Nil):
+		// 缓存未命中，查MySQL.
+	default:
+		l.Errorf("get follow state from redis failed, key: %s, error: %v", followingStateKey, err)
+	}
+
+	now := time.Now()
+	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+		var follow model.Follow
+		//加锁查询关注关系
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("follower_id = ? AND following_id = ?", followerID, followingID).
+			Take(&follow).Error
+
+		//如果查到了这条关系
+		if err == nil {
+			//已关注
+			if follow.Status == model.FollowStatusActive && follow.DeletedAt == nil {
+				return nil
+			}
+
+			//未关注，则更新状态为已关注
+			if err := tx.Model(&model.Follow{}).
+				Where("id = ?", follow.ID).
+				Updates(map[string]any{
+					"status":     model.FollowStatusActive,
+					"deleted_at": nil,
+					"updated_at": now,
+				}).Error; err != nil {
+				return err
+			}
+		} else if errors.Is(err, gorm.ErrRecordNotFound) { //没查到
+			result := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{
+					{Name: "follower_id"},
+					{Name: "following_id"},
+				},
+				DoNothing: true,
+			}).Create(&model.Follow{
+				FollowerID:  followerID,
+				FollowingID: followingID,
+				Status:      model.FollowStatusActive,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			})
+			if result.Error != nil {
+				return result.Error
+			}
+			//并发冲突后重新回读
+			if result.RowsAffected == 0 {
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("follower_id = ? AND following_id = ?", followerID, followingID).
+					Take(&follow).Error; err != nil {
+					return err
+				}
+				if follow.Status == model.FollowStatusActive && follow.DeletedAt == nil {
+					return nil
+				}
+				if err := tx.Model(&model.Follow{}).
+					Where("id = ?", follow.ID).
+					Updates(map[string]any{
+						"status":     model.FollowStatusActive,
+						"deleted_at": nil,
+						"updated_at": now,
+					}).Error; err != nil {
+					return err
+				}
+			}
+		} else {
+			return err
+		}
+
+		eventID, err := newSocialEventID("follow")
+		if err != nil {
+			return err
+		}
+		outboxEvent, err := buildFollowOutboxEvent(eventID, followerID, followingID, eventx.FollowActionFollow, now)
+		if err != nil {
+			return err
+		}
+		return tx.Create(outboxEvent).Error
+	}); err != nil {
+		l.Errorf("follow transaction failed, follower_id: %d, following_id: %d, error: %v", followerID, followingID, err)
+		return nil, status.Error(codes.Internal, "关注失败")
+	}
+
+	if err := applyFollowCacheAfterCommit(l.ctx, l.svcCtx, followerID, followingID, true); err != nil {
+		l.Errorf("apply follow cache after commit failed, follower_id: %d, following_id: %d, error: %v", followerID, followingID, err)
+	}
+
+	return &social.FollowResp{Msg: "关注成功", Followed: true}, nil
 }
