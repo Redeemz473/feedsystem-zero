@@ -19,6 +19,12 @@ const (
 	SocialFollowingStateTTL = 10 * time.Minute
 	// SocialFollowStatsTTL 是粉丝数/关注数缓存的有效期。
 	SocialFollowStatsTTL = 5 * time.Minute
+	// SocialListFirstPageCacheTTL 是粉丝/关注列表首页基础数据缓存的有效期。
+	// 写缓存时建议在此基础上增加少量随机抖动，避免大量热点 key 同时失效。
+	SocialListFirstPageCacheTTL = time.Minute
+	// SocialListCacheBuildLockTTL 是列表首页缓存构建锁的有效期。
+	// 锁只用于削峰防击穿，业务正确性仍由 MySQL 保证。
+	SocialListCacheBuildLockTTL = 5 * time.Second
 )
 
 // 账号模块
@@ -168,22 +174,22 @@ func CommentEventFailStreamKey() string {
 	return fmt.Sprintf("%s:comment:events:fail", prefix)
 }
 
-// CommentListCacheKey 评论列表分页缓存，value=JSON。
-// version 来自 CommentListVersionKey，写评论/删评论时只递增版本号，旧分页缓存靠 TTL 自动淘汰。
-// cursor 通常是 "created_at:{cursorCreatedAt}:comment_id:{cursorCommentID}"，首页 cursor 两项均为 0。
-// 格式: fsz:comment:list:{videoID}:{version}:{cursor}:{limit}
-func CommentListCacheKey(videoID uint64, version int64, cursor string, limit int64) string {
-	return fmt.Sprintf("%s:comment:list:%d:%d:%s:%d", prefix, videoID, version, cursor, limit)
+// CommentFirstPageCacheKey 评论首页固定窗口缓存，value=JSON。
+// version 来自 CommentListVersionKey；缓存固定保存前 N 条基础评论，
+// 不包含访问者权限、请求 pageSize 对应的游标和 has_more。
+// 格式: fsz:comment:first:{videoID}:{version}
+func CommentFirstPageCacheKey(videoID uint64, version int64) string {
+	return fmt.Sprintf("%s:comment:first:%d:%d", prefix, videoID, version)
 }
 
-// CommentListCacheBuildLockKey 评论列表缓存构建锁，防止热点 key 失效时大量请求同时回源 MySQL。
-// 格式: fsz:comment:list:lock:{cacheKey}
-func CommentListCacheBuildLockKey(cacheKey string) string {
-	return fmt.Sprintf("%s:comment:list:lock:%s", prefix, cacheKey)
+// CommentFirstPageCacheBuildLockKey 评论首页缓存构建锁。
+// 格式: fsz:comment:first:lock:{cacheKey}
+func CommentFirstPageCacheBuildLockKey(cacheKey string) string {
+	return fmt.Sprintf("%s:comment:first:lock:%s", prefix, cacheKey)
 }
 
 // CommentListVersionKey 评论列表版本号。
-// 写评论/删评论时递增版本，列表缓存可把版本放进 cursor key 或响应里。
+// 写评论/删评论成功后递增；首页缓存 key 和缓存值都携带该版本。
 // 格式: fsz:comment:list:version:{videoID}
 func CommentListVersionKey(videoID uint64) string {
 	return fmt.Sprintf("%s:comment:list:version:%d", prefix, videoID)
@@ -198,10 +204,62 @@ func SocialFollowingStateKey(followerID, followingID uint64) string {
 }
 
 // SocialFollowStatsKey 用户粉丝数与关注数缓存，HASH。
-// fields: followers_count/followings_count
+// fields: followers_count/followings_count/version
 // 格式: fsz:social:stats:{userID}
 func SocialFollowStatsKey(userID uint64) string {
 	return fmt.Sprintf("%s:social:stats:%d", prefix, userID)
+}
+
+// SocialFollowStatsVersionKey 用户关注统计版本号。
+// 真实关注关系发生变化后递增；统计缓存必须携带相同版本才能命中，
+// 防止并发回源查询把关注/取关之前的旧计数重新写回缓存。
+// 格式: fsz:social:stats:{userID}:version
+func SocialFollowStatsVersionKey(userID uint64) string {
+	return fmt.Sprintf("%s:social:stats:%d:version", prefix, userID)
+}
+
+// SocialFollowersListVersionKey 用户粉丝列表版本号。
+// 关注/取关事务提交后，对被关注者 followingID 对应的版本执行 INCR。
+// 固定首页缓存 key 带上版本号，旧版本缓存不主动扫描删除，等待 TTL 自动淘汰。
+// 格式: fsz:social:user:{userID}:followers:list:version
+func SocialFollowersListVersionKey(userID uint64) string {
+	return fmt.Sprintf("%s:social:user:%d:followers:list:version", prefix, userID)
+}
+
+// SocialFollowersFirstPageCacheKey 用户粉丝列表固定首页窗口缓存，value=JSON。
+// 同一版本只保存一份最多 50 条的基础关系，不区分访问者和请求 page_size。
+// viewer_is_following、响应游标和请求级 has_more 必须在读取后动态计算。
+// 格式: fsz:social:user:{userID}:followers:first:{version}
+func SocialFollowersFirstPageCacheKey(userID uint64, version int64) string {
+	return fmt.Sprintf("%s:social:user:%d:followers:first:%d", prefix, userID, version)
+}
+
+// SocialFollowersFirstPageCacheBuildLockKey 用户粉丝列表固定首页缓存构建锁。
+// 格式: fsz:social:followers:first:lock:{cacheKey}
+func SocialFollowersFirstPageCacheBuildLockKey(cacheKey string) string {
+	return fmt.Sprintf("%s:social:followers:first:lock:%s", prefix, cacheKey)
+}
+
+// SocialFollowingsListVersionKey 用户关注列表版本号。
+// 关注/取关事务提交后，对发起者 followerID 对应的版本执行 INCR。
+// 固定首页缓存 key 带上版本号，旧版本缓存不主动扫描删除，等待 TTL 自动淘汰。
+// 格式: fsz:social:user:{userID}:followings:list:version
+func SocialFollowingsListVersionKey(userID uint64) string {
+	return fmt.Sprintf("%s:social:user:%d:followings:list:version", prefix, userID)
+}
+
+// SocialFollowingsFirstPageCacheKey 用户关注列表固定首页窗口缓存，value=JSON。
+// 同一版本只保存一份最多 50 条的基础关系，不区分访问者和请求 page_size。
+// viewer_is_following、响应游标和请求级 has_more 必须在读取后动态计算。
+// 格式: fsz:social:user:{userID}:followings:first:{version}
+func SocialFollowingsFirstPageCacheKey(userID uint64, version int64) string {
+	return fmt.Sprintf("%s:social:user:%d:followings:first:%d", prefix, userID, version)
+}
+
+// SocialFollowingsFirstPageCacheBuildLockKey 用户关注列表固定首页缓存构建锁。
+// 格式: fsz:social:followings:first:lock:{cacheKey}
+func SocialFollowingsFirstPageCacheBuildLockKey(cacheKey string) string {
+	return fmt.Sprintf("%s:social:followings:first:lock:%s", prefix, cacheKey)
 }
 
 // ========================================
@@ -257,7 +315,7 @@ func JobLockKey(name string) string {
 }
 
 // ========================================
-// 分片上传（预留，后面会用到）
+// 分片上传
 // ChunkUploadKey 分片上传会话状态，建议用 SET 保存已上传分片索引。
 // 格式: fsz:chunk:upload:{uploadID}
 func ChunkUploadKey(uploadID string) string {

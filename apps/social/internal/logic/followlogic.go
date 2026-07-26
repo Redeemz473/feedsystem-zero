@@ -10,9 +10,7 @@ import (
 	"feedsystem-zero/apps/social/internal/svc"
 	"feedsystem-zero/apps/social/social"
 	"feedsystem-zero/common/eventx"
-	"feedsystem-zero/common/rediskey"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -34,8 +32,8 @@ func NewFollowLogic(ctx context.Context, svcCtx *svc.ServiceContext) *FollowLogi
 	}
 }
 
-// Follow 执行关注写操作。Redis 只作为“目标状态已达成”的幂等快速路径，
-// MySQL 事务仍然是关注关系的最终事实来源。
+// Follow 执行关注写操作。写请求始终以 MySQL 为事实来源；
+// Redis 只在事务提交后更新，不能因为缓存显示“已关注”就跳过数据库事务。
 func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 	followerID := in.GetFollowerId()
 	if followerID == 0 {
@@ -58,23 +56,8 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 		return nil, status.Error(codes.Internal, "校验目标用户失败")
 	}
 
-	followingStateKey := rediskey.SocialFollowingStateKey(followerID, followingID)
-	followingState, err := l.svcCtx.RedisCli.Get(l.ctx, followingStateKey).Result()
-	switch {
-	case err == nil:
-		if followingState == "1" {
-			return &social.FollowResp{Msg: "关注成功", Followed: true}, nil
-		}
-		if followingState != "0" {
-			l.Errorf("unexpected follow state cache value, key: %s, value: %s", followingStateKey, followingState)
-		}
-	case errors.Is(err, redis.Nil):
-		// 缓存未命中，查MySQL.
-	default:
-		l.Errorf("get follow state from redis failed, key: %s, error: %v", followingStateKey, err)
-	}
-
 	now := time.Now()
+	stateChanged := false
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
 		var follow model.Follow
 		//加锁查询关注关系
@@ -99,6 +82,7 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 				}).Error; err != nil {
 				return err
 			}
+			stateChanged = true
 		} else if errors.Is(err, gorm.ErrRecordNotFound) { //没查到
 			result := tx.Clauses(clause.OnConflict{
 				Columns: []clause.Column{
@@ -115,6 +99,9 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 			})
 			if result.Error != nil {
 				return result.Error
+			}
+			if result.RowsAffected > 0 {
+				stateChanged = true
 			}
 			//并发冲突后重新回读
 			if result.RowsAffected == 0 {
@@ -135,9 +122,14 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 					}).Error; err != nil {
 					return err
 				}
+				stateChanged = true
 			}
 		} else {
 			return err
+		}
+
+		if !stateChanged {
+			return nil
 		}
 
 		eventID, err := newSocialEventID("follow")
@@ -154,7 +146,7 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 		return nil, status.Error(codes.Internal, "关注失败")
 	}
 
-	if err := applyFollowCacheAfterCommit(l.ctx, l.svcCtx, followerID, followingID, true); err != nil {
+	if err := applyFollowCacheAfterCommit(l.ctx, l.svcCtx, followerID, followingID, true, stateChanged); err != nil {
 		l.Errorf("apply follow cache after commit failed, follower_id: %d, following_id: %d, error: %v", followerID, followingID, err)
 	}
 

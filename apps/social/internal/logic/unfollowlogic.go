@@ -10,9 +10,7 @@ import (
 	"feedsystem-zero/apps/social/internal/svc"
 	"feedsystem-zero/apps/social/social"
 	"feedsystem-zero/common/eventx"
-	"feedsystem-zero/common/rediskey"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -34,7 +32,8 @@ func NewUnfollowLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Unfollow
 	}
 }
 
-// follower_id 同样只能来自 gateway 解析后的 JWT。
+// Unfollow 执行取消关注。follower_id 只能来自 gateway 解析后的 JWT；
+// 写请求始终检查 MySQL 当前状态，不能用可能过期的 Redis 状态提前返回。
 func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, error) {
 	followerID := in.GetFollowerId()
 	if followerID == 0 {
@@ -57,23 +56,8 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 		return nil, status.Error(codes.Internal, "校验目标用户失败")
 	}
 
-	followingStateKey := rediskey.SocialFollowingStateKey(followerID, followingID)
-	followingState, err := l.svcCtx.RedisCli.Get(l.ctx, followingStateKey).Result()
-	switch {
-	case err == nil:
-		if followingState == "0" {
-			return &social.UnfollowResp{Msg: "取消关注成功", Unfollowed: true}, nil
-		}
-		if followingState != "1" {
-			l.Errorf("unexpected follow state cache value, key: %s, value: %s", followingStateKey, followingState)
-		}
-	case errors.Is(err, redis.Nil):
-		// 缓存未命中，查MySQL.
-	default:
-		l.Errorf("get follow state from redis failed, key: %s, error: %v", followingStateKey, err)
-	}
-
 	now := time.Now()
+	stateChanged := false
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
 		var follow model.Follow
 		//加锁查询关注关系
@@ -98,11 +82,16 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 				}).Error; err != nil {
 				return err
 			}
+			stateChanged = true
 		} else if errors.Is(err, gorm.ErrRecordNotFound) {
 			// 没有关注关系，目标状态已经是未关注，幂等成功。
 			return nil
 		} else {
 			return err
+		}
+
+		if !stateChanged {
+			return nil
 		}
 
 		eventID, err := newSocialEventID("unfollow")
@@ -119,7 +108,7 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 		return nil, status.Error(codes.Internal, "取消关注失败")
 	}
 
-	if err := applyFollowCacheAfterCommit(l.ctx, l.svcCtx, followerID, followingID, false); err != nil {
+	if err := applyFollowCacheAfterCommit(l.ctx, l.svcCtx, followerID, followingID, false, stateChanged); err != nil {
 		l.Errorf("apply unfollow cache after commit failed, follower_id: %d, following_id: %d, error: %v", followerID, followingID, err)
 	}
 

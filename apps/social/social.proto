@@ -9,8 +9,8 @@ option go_package = "./social";
 // follower_id = 主动关注者，following_id = 被关注者。
 
 message FollowReq {
-  uint64 follower_id = 1;   // 主动关注者，必须由 gateway 从 JWT 解析填入
-  uint64 following_id = 2;  // 被关注者
+  uint64 follower_id = 1; // 主动关注者，必须由 gateway 从 JWT 解析填入
+  uint64 following_id = 2; // 被关注者
 }
 
 message FollowResp {
@@ -41,8 +41,8 @@ message IsFollowingResp {
 // 分页游标按 updated_at DESC, id DESC 排序。
 // 软删除关系重新关注时 updated_at 会更新，因此能够重新出现在列表前面。
 message ListFollowersReq {
-  uint64 user_id = 1;        // 被关注者，查询其粉丝列表
-  uint64 viewer_id = 2;      // 当前查看者，0 表示未登录
+  uint64 user_id = 1; // 被关注者，查询其粉丝列表
+  uint64 viewer_id = 2; // 当前查看者，0 表示未登录
   int64 cursor_updated_at = 3;
   uint64 cursor_follow_id = 4;
   int64 page_size = 5;
@@ -64,8 +64,8 @@ message ListFollowersResp {
 }
 
 message ListFollowingsReq {
-  uint64 user_id = 1;        // 主动关注者，查询其关注列表
-  uint64 viewer_id = 2;      // 当前查看者，0 表示未登录
+  uint64 user_id = 1; // 主动关注者，查询其关注列表
+  uint64 viewer_id = 2; // 当前查看者，0 表示未登录
   int64 cursor_updated_at = 3;
   uint64 cursor_follow_id = 4;
   int64 page_size = 5;
@@ -104,11 +104,18 @@ message GetFollowStatsResp {
 
 // 社交关系服务
 service Social {
+  //关注
   rpc Follow(FollowReq) returns (FollowResp);
+  //取关
   rpc Unfollow(UnfollowReq) returns (UnfollowResp);
+  //判断是否关注
   rpc IsFollowing(IsFollowingReq) returns (IsFollowingResp);
+  //展示粉丝
   rpc ListFollowers(ListFollowersReq) returns (ListFollowersResp);
+  //展示关注
   rpc ListFollowings(ListFollowingsReq) returns (ListFollowingsResp);
+  //批量获取关注信息
   rpc BatchIsFollowing(BatchIsFollowingReq) returns (BatchIsFollowingResp);
+  //获取关注数量
   rpc GetFollowStats(GetFollowStatsReq) returns (GetFollowStatsResp);
 }
