@@ -27,6 +27,19 @@ const (
 	SocialListCacheBuildLockTTL = 5 * time.Second
 )
 
+const (
+	// FeedTimelineMaxLen 是单个用户关注流 Timeline ZSet 的最大保留条数。
+	// 超过该长度会通过 ZREMRANGEBYRANK 从旧到新裁剪，防止单 key 无限膨胀。
+	FeedTimelineMaxLen = 1000
+	// FeedTimelineTTL 是单个用户关注流 Timeline ZSet 的有效期。
+	// 活跃用户每次写入会自动续期，长期不活跃用户 TTL 到期后自动淘汰。
+	FeedTimelineTTL = 7 * 24 * time.Hour
+	// FeedTimelineBackfillLimit 是新关注一位作者时，回填该作者最近视频的最大条数。
+	FeedTimelineBackfillLimit = 200
+	// FeedTimelineBuildLockTTL 是 Timeline 首次冷启动构建锁的有效期。
+	FeedTimelineBuildLockTTL = 10 * time.Second
+)
+
 // 账号模块
 // TokenKey 当前有效 access token，value 是 JWT 字符串。
 // 当前采用单设备/单会话模型：同一用户新登录会覆盖旧 token。
@@ -264,16 +277,34 @@ func SocialFollowingsFirstPageCacheBuildLockKey(cacheKey string) string {
 
 // ========================================
 // Feed 模块
-// FeedGlobalTimelineKey 全局最新视频时间线，ZSet，score=发布时间，member=videoID
+// FeedGlobalTimelineKey 全局最新视频时间线，ZSet，score=发布时间毫秒，member=videoID。
+// 用于推荐流/未登录首页；写入方为视频发布事件消费者，读取方为 feed-rpc。
 // 格式: fsz:feed:global_timeline
 func FeedGlobalTimelineKey() string {
 	return fmt.Sprintf("%s:feed:global_timeline", prefix)
 }
 
-// FeedInboxKey 用户收件箱时间线（关注流），ZSet，score=发布时间，member=videoID
-// 格式: fsz:feed:inbox:{userID}
-func FeedInboxKey(userID uint64) string {
-	return fmt.Sprintf("%s:feed:inbox:%d", prefix, userID)
+// FeedTimelineKey 单用户关注流 Timeline，ZSet，score=视频发布时间毫秒，member=videoID。
+// 写入方为 feed_fanout job（视频发布扇出 / 新关注回填），读取方为 feed-rpc。
+// 单 key 最多保留 FeedTimelineMaxLen 条，超出走 ZREMRANGEBYRANK 裁剪。
+// 格式: fsz:feed:timeline:user:{userID}
+func FeedTimelineKey(userID uint64) string {
+	return fmt.Sprintf("%s:feed:timeline:user:%d", prefix, userID)
+}
+
+// FeedTimelineBuildLockKey 用户 Timeline 首次冷启动构建锁。
+// 用户从未有过 Timeline（首次登录或长时间不活跃 TTL 到期）时，避免多实例并发回源 MySQL 拼装。
+// 格式: fsz:feed:timeline:user:{userID}:lock
+func FeedTimelineBuildLockKey(userID uint64) string {
+	return fmt.Sprintf("%s:feed:timeline:user:%d:lock", prefix, userID)
+}
+
+// FeedBigVMarkKey 大 V 作者标记，SET，member=authorID。
+// 关注数超过阈值的作者标记为大 V，发布视频时不走 push 扇出，读接口按需 pull 合并。
+// 起步阶段可以先不使用；预留常量方便后续切换到推拉结合模式。
+// 格式: fsz:feed:bigv:authors
+func FeedBigVMarkKey() string {
+	return fmt.Sprintf("%s:feed:bigv:authors", prefix)
 }
 
 // ========================================

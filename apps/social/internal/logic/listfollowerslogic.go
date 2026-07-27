@@ -73,7 +73,9 @@ func (l *ListFollowersLogic) ListFollowers(in *social.ListFollowersReq) (*social
 	viewerID := in.GetViewerId()
 	cacheKey := ""
 	version := int64(0)
+	//当前请求是首页请求
 	useFixedWindow := false
+	//当前请求是否可以写入redis缓存
 	cacheWriteAllowed := false
 	var lockKey, lockToken string
 

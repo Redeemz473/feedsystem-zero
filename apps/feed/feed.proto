@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package feed;
+
+option go_package = "./feed";
+
+// Feed 服务只对外提供“信息流”读接口。
+// 写路径（视频发布扇出、关注/取关回填 Timeline）由 feed_fanout job
+// 消费 Kafka 完成，不在本 proto 中暴露。
+//
+// 关注流 Timeline: fsz:feed:timeline:user:{userID}  (ZSet，score=published_at ms)
+// 全局时间线:      fsz:feed:global_timeline          (ZSet，score=published_at ms)
+
+// FeedVideoItem 是 Feed 列表项的精简视图。
+// 完整的视频详情（作者、标签等）由调用方按需回填，Feed 层只负责“出什么、按什么顺序出”。
+message FeedVideoItem {
+  uint64 video_id = 1;
+  uint64 author_id = 2;
+  int64 published_at = 3; // Unix milliseconds，与 Timeline 的 score 一致
+}
+
+// 关注流：读取 viewer 关注的所有作者的最新视频，按发布时间倒序分页。
+// 首次请求 cursor_published_at 传 0，表示从最新开始。
+// 后续请求使用上次返回的 next_cursor_published_at / next_cursor_video_id。
+message GetFollowingFeedReq {
+  uint64 viewer_id = 1;             // 必须由 gateway 从 JWT 解析填入
+  int64 cursor_published_at = 2;    // 游标：上一页最后一条视频的发布时间毫秒
+  uint64 cursor_video_id = 3;       // 游标：上一页最后一条视频 ID（时间相同时兜底排序）
+  int64 page_size = 4;
+}
+
+message GetFollowingFeedResp {
+  repeated FeedVideoItem items = 1;
+  int64 next_cursor_published_at = 2;
+  uint64 next_cursor_video_id = 3;
+  bool has_more = 4;
+}
+
+// 推荐流：面向未登录 / 冷启动 / 无关注对象的用户，返回全局最新（后续可切热度榜）视频。
+// viewer_id 允许为 0，表示未登录访问。
+message GetRecommendFeedReq {
+  uint64 viewer_id = 1;             // 0 表示未登录
+  int64 cursor_published_at = 2;
+  uint64 cursor_video_id = 3;
+  int64 page_size = 4;
+}
+
+message GetRecommendFeedResp {
+  repeated FeedVideoItem items = 1;
+  int64 next_cursor_published_at = 2;
+  uint64 next_cursor_video_id = 3;
+  bool has_more = 4;
+}
+
+// Feed 服务
+service Feed {
+  // 关注流：viewer 关注的所有作者的最新视频，按发布时间倒序
+  rpc GetFollowingFeed(GetFollowingFeedReq) returns (GetFollowingFeedResp);
+  // 推荐流：全局最新/热门视频，未登录也可访问
+  rpc GetRecommendFeed(GetRecommendFeedReq) returns (GetRecommendFeedResp);
+}

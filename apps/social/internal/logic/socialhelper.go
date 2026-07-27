@@ -157,10 +157,13 @@ func batchLoadFollowingStates(ctx context.Context, svcCtx *svc.ServiceContext, v
 	}
 
 	if _, err := pipe.Exec(redisCtx); err != nil && !errors.Is(err, redis.Nil) {
-		return batchLoadFollowingStatesFromDB(ctx, svcCtx, viewerID, targetUserIDs, result, false)
+		return batchLoadFollowingStatesFromDB(ctx, svcCtx, viewerID, targetUserIDs, result, false, nil)
 	}
 
 	missIDs := make([]uint64, 0)
+	// invalidIDs 用于记录 Redis 中值格式异常的 key。
+	// 这些 key 走 DB 兜底后必须用 Set 覆盖，SetNX 无法修复异常值。
+	invalidIDs := make(map[uint64]struct{})
 	for targetUserID, cmd := range cmdMap {
 		value, err := cmd.Result()
 		if err == nil {
@@ -171,6 +174,7 @@ func batchLoadFollowingStates(ctx context.Context, svcCtx *svc.ServiceContext, v
 				result[targetUserID] = false
 			default:
 				missIDs = append(missIDs, targetUserID)
+				invalidIDs[targetUserID] = struct{}{}
 			}
 			continue
 		}
@@ -187,10 +191,10 @@ func batchLoadFollowingStates(ctx context.Context, svcCtx *svc.ServiceContext, v
 		return result, nil
 	}
 
-	return batchLoadFollowingStatesFromDB(ctx, svcCtx, viewerID, missIDs, result, true)
+	return batchLoadFollowingStatesFromDB(ctx, svcCtx, viewerID, missIDs, result, true, invalidIDs)
 }
 
-func batchLoadFollowingStatesFromDB(ctx context.Context, svcCtx *svc.ServiceContext, viewerID uint64, targetUserIDs []uint64, result map[uint64]bool, backfillCache bool) (map[uint64]bool, error) {
+func batchLoadFollowingStatesFromDB(ctx context.Context, svcCtx *svc.ServiceContext, viewerID uint64, targetUserIDs []uint64, result map[uint64]bool, backfillCache bool, invalidIDs map[uint64]struct{}) (map[uint64]bool, error) {
 	var followingIDs []uint64
 	//  对 misses 只执行一次 MySQL 查询：
 	//  SELECT following_id FROM follows
@@ -219,7 +223,12 @@ func batchLoadFollowingStatesFromDB(ctx context.Context, svcCtx *svc.ServiceCont
 			if _, ok := followingSet[targetUserID]; ok {
 				value = "1"
 			}
-			pipe.SetNX(redisCtx, rediskey.SocialFollowingStateKey(viewerID, targetUserID), value, rediskey.SocialFollowingStateTTL)
+			// 值格式异常的 key 用 Set 强制覆盖，其他 miss 用 SetNX，避免覆盖并发写入的最新状态。
+			if _, ok := invalidIDs[targetUserID]; ok {
+				pipe.Set(redisCtx, rediskey.SocialFollowingStateKey(viewerID, targetUserID), value, rediskey.SocialFollowingStateTTL)
+			} else {
+				pipe.SetNX(redisCtx, rediskey.SocialFollowingStateKey(viewerID, targetUserID), value, rediskey.SocialFollowingStateTTL)
+			}
 		}
 		_, _ = pipe.Exec(redisCtx)
 	}
@@ -306,10 +315,13 @@ func applyFollowCacheAfterCommit(
 	redisCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), socialRedisOpTimeout)
 	defer cancel()
 
-	pipe := svcCtx.RedisCli.TxPipeline()
+	// 使用普通 Pipeline 而非 TxPipeline：几条命令彼此独立，单条失败不应影响其他命令。
+	pipe := svcCtx.RedisCli.Pipeline()
 	pipe.Set(redisCtx, rediskey.SocialFollowingStateKey(followerID, followingID), value, rediskey.SocialFollowingStateTTL)
-	pipe.Del(redisCtx, rediskey.SocialFollowStatsKey(followerID), rediskey.SocialFollowStatsKey(followingID))
 	if stateChanged {
+		// 只有真正的状态变化才需要让统计/列表缓存失效，
+		// 幂等重试路径直接复用现有缓存，避免不必要的击穿。
+		pipe.Del(redisCtx, rediskey.SocialFollowStatsKey(followerID), rediskey.SocialFollowStatsKey(followingID))
 		pipe.Incr(redisCtx, rediskey.SocialFollowStatsVersionKey(followerID))
 		pipe.Incr(redisCtx, rediskey.SocialFollowStatsVersionKey(followingID))
 		pipe.Incr(redisCtx, rediskey.SocialFollowersListVersionKey(followingID))
@@ -365,6 +377,18 @@ func followersDBLoadKey(userID uint64, cursorUpdatedAt int64, cursorFollowID uin
 	)
 }
 
+// followingsDBLoadKey 与 followersDBLoadKey 保持独立命名空间，
+// 避免 ListFollowers/ListFollowings 在同一 userID 下互相复用 SingleFlight 结果。
+func followingsDBLoadKey(userID uint64, cursorUpdatedAt int64, cursorFollowID uint64, pageSize int) string {
+	return fmt.Sprintf(
+		"followings:user:%d:cursor:updated_at:%d:follow_id:%d:size:%d",
+		userID,
+		cursorUpdatedAt,
+		cursorFollowID,
+		pageSize,
+	)
+}
+
 // Do 在单个 Social 进程内合并相同的关注列表数据库查询。
 func (g *localFollowListLoadGroup) Do(
 	ctx context.Context,
@@ -390,7 +414,7 @@ func (g *localFollowListLoadGroup) Do(
 	g.mu.Unlock()
 
 	call.follows, call.hasMore, call.err = fn()
-	close(call.done)
+	close(call.done) //通知所有等待这个查询结果的请求
 
 	g.mu.Lock()
 	delete(g.calls, key)
@@ -429,6 +453,39 @@ func (l *ListFollowersLogic) getFollowersListVersion(userID uint64) (int64, bool
 		return 0, false
 	}
 	l.Errorf("get followers list version failed, user_id: %d, error: %v", userID, err)
+	return 0, false
+}
+
+// getFollowingsListVersion 获取用户关注列表版本号。
+func (l *ListFollowingsLogic) getFollowingsListVersion(userID uint64) (int64, bool) {
+	redisCtx, cancel := context.WithTimeout(l.ctx, socialRedisOpTimeout)
+	defer cancel()
+
+	key := rediskey.SocialFollowingsListVersionKey(userID)
+	version, err := l.svcCtx.RedisCli.Get(redisCtx, key).Int64()
+	if err == nil {
+		return version, true
+	}
+	if errors.Is(err, redis.Nil) {
+		initVersion := newFollowersListVersion()
+		// 没有版本号时通过 SetNX 竞争初始化。
+		ok, err := l.svcCtx.RedisCli.SetNX(redisCtx, key, initVersion, 0).Result()
+		if err != nil {
+			l.Errorf("init followings list version failed, user_id: %d, error: %v", userID, err)
+			return 0, false
+		}
+		if ok {
+			return initVersion, true
+		}
+		// 没抢到初始化权时读取获胜请求设置的版本。
+		version, err = l.svcCtx.RedisCli.Get(redisCtx, key).Int64()
+		if err == nil {
+			return version, true
+		}
+		l.Errorf("get followings list version after init race failed, user_id: %d, error: %v", userID, err)
+		return 0, false
+	}
+	l.Errorf("get followings list version failed, user_id: %d, error: %v", userID, err)
 	return 0, false
 }
 
@@ -482,6 +539,52 @@ func (l *ListFollowersLogic) loadFollowersFirstPageCache(
 	return &cached, true
 }
 
+// loadFollowingsFirstPageCache 读取用户关注列表固定首页窗口缓存。
+func (l *ListFollowingsLogic) loadFollowingsFirstPageCache(
+	cacheKey string,
+	expectedVersion int64,
+	userID uint64,
+) (*followListFirstPageCache, bool) {
+	redisCtx, cancel := context.WithTimeout(l.ctx, socialRedisOpTimeout)
+	defer cancel()
+
+	data, err := l.svcCtx.RedisCli.Get(redisCtx, cacheKey).Bytes()
+	if err != nil {
+		if !errors.Is(err, redis.Nil) {
+			l.Errorf("get followings list cache failed, key: %s, error: %v", cacheKey, err)
+		}
+		return nil, false
+	}
+
+	var cached followListFirstPageCache
+	if err := json.Unmarshal(data, &cached); err != nil {
+		l.Errorf("unmarshal followings list cache failed, key: %s, error: %v", cacheKey, err)
+		return nil, false
+	}
+	//判断版本号是否相符
+	if cached.Version != expectedVersion {
+		return nil, false
+	}
+	if len(cached.Relations) > socialFirstPageWindowSize {
+		l.Errorf("unexpected followings first page cache size, key: %s, size: %d", cacheKey, len(cached.Relations))
+		return nil, false
+	}
+	if cached.HasMoreAfterWindow && len(cached.Relations) != socialFirstPageWindowSize {
+		l.Errorf("invalid followings first page cache window, key: %s, size: %d", cacheKey, len(cached.Relations))
+		return nil, false
+	}
+	for _, relation := range cached.Relations {
+		if relation.RelationID == 0 ||
+			relation.FollowingID == 0 ||
+			relation.FollowerID != userID {
+			l.Errorf("invalid followings first page cache item, key: %s", cacheKey)
+			return nil, false
+		}
+	}
+
+	return &cached, true
+}
+
 // saveFollowersFirstPageCache 原子校验粉丝列表版本并写入固定首页窗口。
 // 查询期间若发生关注或取关，版本会变化，旧数据库快照不会写入 Redis。
 func (l *ListFollowersLogic) saveFollowersFirstPageCache(
@@ -526,6 +629,52 @@ func (l *ListFollowersLogic) saveFollowersFirstPageCache(
 	}
 }
 
+// saveFollowingsFirstPageCache 原子校验关注列表版本并写入固定首页窗口。
+// 查询期间若发生关注或取关，版本会变化，旧数据库快照不会写入 Redis。
+func (l *ListFollowingsLogic) saveFollowingsFirstPageCache(
+	cacheKey string,
+	version int64,
+	userID uint64,
+	follows []model.Follow,
+	hasMoreAfterWindow bool,
+) {
+	if len(follows) > socialFirstPageWindowSize {
+		follows = follows[:socialFirstPageWindowSize]
+	}
+
+	cached := followListFirstPageCache{
+		Version:            version,
+		Relations:          followRowsToCacheItems(follows),
+		HasMoreAfterWindow: hasMoreAfterWindow,
+	}
+	data, err := json.Marshal(cached)
+	if err != nil {
+		l.Errorf("marshal followings first page cache failed, user_id: %d, error: %v", userID, err)
+		return
+	}
+
+	redisCtx, cancel := context.WithTimeout(l.ctx, socialRedisOpTimeout)
+	defer cancel()
+	ttl := socialListFirstPageCacheTTL(userID)
+	written, err := l.svcCtx.RedisCli.Eval(
+		redisCtx,
+		saveFollowListFirstPageCacheScript,
+		// followings 首页缓存必须用 followings 的版本号做原子校验，
+		// 否则 followers 版本没变时会把过期的 followings 快照写回缓存。
+		[]string{rediskey.SocialFollowingsListVersionKey(userID), cacheKey},
+		strconv.FormatInt(version, 10),
+		data,
+		ttl.Milliseconds(),
+	).Int64()
+	if err != nil {
+		l.Errorf("set followings first page cache failed, user_id: %d, error: %v", userID, err)
+		return
+	}
+	if written == 0 {
+		l.Infof("skip stale followings first page cache, user_id: %d, version: %d", userID, version)
+	}
+}
+
 // tryLockFollowersFirstPageCache 区分锁竞争失败和 Redis 操作异常。
 func (l *ListFollowersLogic) tryLockFollowersFirstPageCache(cacheKey string) (string, string, bool, error) {
 	lockToken, err := randomSocialHex(16)
@@ -545,6 +694,30 @@ func (l *ListFollowersLogic) tryLockFollowersFirstPageCache(cacheKey string) (st
 	).Result()
 	if err != nil {
 		l.Errorf("lock followers first page cache failed, key: %s, error: %v", cacheKey, err)
+		return "", "", false, err
+	}
+	return lockKey, lockToken, locked, nil
+}
+
+// tryLockFollowingsFirstPageCache 区分锁竞争失败和 Redis 操作异常。
+func (l *ListFollowingsLogic) tryLockFollowingsFirstPageCache(cacheKey string) (string, string, bool, error) {
+	lockToken, err := randomSocialHex(16)
+	if err != nil {
+		l.Errorf("generate followings cache lock token failed, key: %s, error: %v", cacheKey, err)
+		return "", "", false, err
+	}
+
+	lockKey := rediskey.SocialFollowingsFirstPageCacheBuildLockKey(cacheKey)
+	redisCtx, cancel := context.WithTimeout(l.ctx, socialRedisOpTimeout)
+	defer cancel()
+	locked, err := l.svcCtx.RedisCli.SetNX(
+		redisCtx,
+		lockKey,
+		lockToken,
+		rediskey.SocialListCacheBuildLockTTL,
+	).Result()
+	if err != nil {
+		l.Errorf("lock followings first page cache failed, key: %s, error: %v", cacheKey, err)
 		return "", "", false, err
 	}
 	return lockKey, lockToken, locked, nil
@@ -571,6 +744,27 @@ func (l *ListFollowersLogic) waitAndReloadFollowersFirstPageCache(
 	return nil, false
 }
 
+// waitAndReloadFollowingsFirstPageCache 对正在构建的缓存进行有限等待。
+func (l *ListFollowingsLogic) waitAndReloadFollowingsFirstPageCache(
+	cacheKey string,
+	version int64,
+	userID uint64,
+) (*followListFirstPageCache, bool) {
+	for i := 0; i < socialListCacheRetryAttempts; i++ {
+		timer := time.NewTimer(socialListCacheRetryDelay)
+		select {
+		case <-l.ctx.Done():
+			timer.Stop()
+			return nil, false
+		case <-timer.C:
+			if cached, hit := l.loadFollowingsFirstPageCache(cacheKey, version, userID); hit {
+				return cached, true
+			}
+		}
+	}
+	return nil, false
+}
+
 func (l *ListFollowersLogic) releaseFollowersFirstPageCacheLock(lockKey string, lockToken string) {
 	if lockKey == "" || lockToken == "" {
 		return
@@ -580,6 +774,18 @@ func (l *ListFollowersLogic) releaseFollowersFirstPageCacheLock(lockKey string, 
 	defer cancel()
 	if err := releaseSocialCacheLock(releaseCtx, l.svcCtx.RedisCli, lockKey, lockToken); err != nil {
 		l.Errorf("release followers first page cache lock failed, key: %s, error: %v", lockKey, err)
+	}
+}
+
+func (l *ListFollowingsLogic) releaseFollowingsFirstPageCacheLock(lockKey string, lockToken string) {
+	if lockKey == "" || lockToken == "" {
+		return
+	}
+
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(l.ctx), socialRedisOpTimeout)
+	defer cancel()
+	if err := releaseSocialCacheLock(releaseCtx, l.svcCtx.RedisCli, lockKey, lockToken); err != nil {
+		l.Errorf("release followings first page cache lock failed, key: %s, error: %v", lockKey, err)
 	}
 }
 

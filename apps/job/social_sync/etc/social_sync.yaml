@@ -1,0 +1,32 @@
+Name: social-sync.job
+
+Mysql:
+  DataSource: root:123456@tcp(127.0.0.1:3308)/feedsystem_zero?charset=utf8mb4&parseTime=true&loc=Local
+
+BizRedis:
+  Addr: 127.0.0.1:6379
+  Password: ""
+  DB: 0
+
+Kafka:
+  Brokers:
+    - 127.0.0.1:9094
+  GroupID: follow-sync-job
+  Topics:
+    - social.follow.events
+  MinBytes: 1
+  MaxBytes: 10485760
+  MaxWaitMs: 1000
+  CommitInterval: 0
+  BatchSize: 100
+  FlushMs: 1000
+
+Sync:
+  BatchSize: 100
+  FlushMs: 1000
+  FlushBatchSize: 500
+  WorkerCount: 4
+  MaxEventRetry: 3
+  RetryBackoffMs: 200
+  MaxRetryBackoffMs: 2000
+  RedisOpTimeoutMs: 500
