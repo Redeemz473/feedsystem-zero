@@ -84,7 +84,10 @@ func toHTTPVideoInfo(v *videoclient.VideoInfo) types.VideoInfo {
 	}
 }
 
-const gatewayBatchStatsChunkSize = 50
+const (
+	gatewayBatchStatsChunkSize  = 50
+	gatewayBatchVideosChunkSize = 100
+)
 
 func enrichHTTPVideoInteractions(ctx context.Context, interactionRpc interactionclient.Interaction, viewerID uint64, videos []types.VideoInfo) ([]types.VideoInfo, error) {
 	if len(videos) == 0 {
@@ -186,18 +189,21 @@ func loadHTTPVideosByIDs(
 ) (map[uint64]types.VideoInfo, error) {
 	uniqueIDs := uniqueUint64(videoIDs)
 	videos := make([]types.VideoInfo, 0, len(uniqueIDs))
-	for _, videoID := range uniqueIDs {
-		rpcResp, err := videoRpc.GetVideo(ctx, &videoclient.GetVideoReq{
-			VideoId:  videoID,
-			ViewerId: viewerID,
+	for start := 0; start < len(uniqueIDs); start += gatewayBatchVideosChunkSize {
+		end := start + gatewayBatchVideosChunkSize
+		if end > len(uniqueIDs) {
+			end = len(uniqueIDs)
+		}
+
+		rpcResp, err := videoRpc.BatchGetVideos(ctx, &videoclient.BatchGetVideosReq{
+			VideoIds: uniqueIDs[start:end],
 		})
 		if err != nil {
-			if status.Code(err) == codes.NotFound {
-				continue
-			}
 			return nil, err
 		}
-		videos = append(videos, toHTTPVideoInfo(rpcResp.GetVideo()))
+		for _, videoInfo := range rpcResp.GetVideos() {
+			videos = append(videos, toHTTPVideoInfo(videoInfo))
+		}
 	}
 
 	if enrichedVideos, err := enrichHTTPVideoInteractions(ctx, interactionRpc, viewerID, videos); err == nil {

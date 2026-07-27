@@ -2,7 +2,6 @@ package logic
 
 import (
 	"context"
-	"errors"
 
 	"feedsystem-zero/apps/video/internal/model"
 	"feedsystem-zero/apps/video/internal/svc"
@@ -11,7 +10,7 @@ import (
 	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"gorm.io/gorm"
+	"google.golang.org/protobuf/proto"
 )
 
 type GetVideoLogic struct {
@@ -36,23 +35,16 @@ func (l *GetVideoLogic) GetVideo(in *videopb.GetVideoReq) (*videopb.GetVideoResp
 		return nil, status.Error(codes.InvalidArgument, "视频ID不能为空")
 	}
 
-	var videoInfo model.Video
-	err := l.svcCtx.GormDB.WithContext(l.ctx).
-		Where("id = ? AND status = ? AND deleted_at IS NULL", videoID, model.VideoStatusNormal).
-		First(&videoInfo).Error
+	batchResp, err := NewBatchGetVideosLogic(l.ctx, l.svcCtx).BatchGetVideos(&videopb.BatchGetVideosReq{
+		VideoIds: []uint64{videoID},
+	})
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, status.Error(codes.NotFound, "视频不存在")
-		}
-		l.Errorf("get video failed, video_id: %d, error: %v", videoID, err)
-		return nil, status.Error(codes.Internal, "视频查询失败")
+		return nil, err
 	}
-
-	tagsMap, err := loadTagsByVideoIDs(l.ctx, l.svcCtx.GormDB, []uint64{videoID})
-	if err != nil {
-		l.Errorf("load video tags failed, video_id: %d, error: %v", videoID, err)
-		return nil, status.Error(codes.Internal, "获取视频标签失败")
+	if len(batchResp.GetVideos()) == 0 {
+		return nil, status.Error(codes.NotFound, "视频不存在")
 	}
+	videoInfo := batchResp.GetVideos()[0]
 
 	isLiked := false
 	if viewerID != 0 {
@@ -68,7 +60,10 @@ func (l *GetVideoLogic) GetVideo(in *videopb.GetVideoReq) (*videopb.GetVideoResp
 		isLiked = count > 0
 	}
 
-	return &videopb.GetVideoResp{
-		Video: toVideoInfo(&videoInfo, tagsMap[videoID], isLiked),
-	}, nil
+	result, ok := proto.Clone(videoInfo).(*videopb.VideoInfo)
+	if !ok {
+		return nil, status.Error(codes.Internal, "视频数据异常")
+	}
+	result.IsLiked = isLiked
+	return &videopb.GetVideoResp{Video: result}, nil
 }

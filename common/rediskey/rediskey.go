@@ -14,6 +14,18 @@ const prefix = "fsz"
 const VerificationCodeTTL = 5 * time.Minute
 
 const (
+	// AccountPublicProfileCacheTTL 是公开用户资料缓存的基础有效期。
+	// 写入时会按 userID 增加少量抖动，降低热点资料同时过期造成的缓存雪崩。
+	AccountPublicProfileCacheTTL = 15 * time.Minute
+	// AccountPublicProfileMissingTTL 是不存在用户的短期负缓存有效期，用于防止无效 ID 穿透 MySQL。
+	AccountPublicProfileMissingTTL = time.Minute
+	// VideoEntityCacheTTL 是正常视频实体缓存的基础有效期，写入时会增加少量抖动。
+	VideoEntityCacheTTL = 10 * time.Minute
+	// VideoEntityMissingTTL 是不存在、已删除或已下架视频的短期负缓存有效期。
+	VideoEntityMissingTTL = 30 * time.Second
+)
+
+const (
 	// SocialFollowingStateTTL 是单条关注状态缓存的有效期。
 	// value 使用 "1"/"0"，必须同时缓存未关注状态，避免不存在关系反复穿透 MySQL。
 	SocialFollowingStateTTL = 10 * time.Minute
@@ -41,6 +53,20 @@ const (
 )
 
 // 账号模块
+// AccountPublicProfileVersionKey 公开用户资料缓存版本号。
+// 用户资料更新成功后递增版本；旧版本缓存无需扫描删除，等待 TTL 自动淘汰。
+// 格式: fsz:account:profile:{userID}:version
+func AccountPublicProfileVersionKey(userID uint64) string {
+	return fmt.Sprintf("%s:account:profile:%d:version", prefix, userID)
+}
+
+// AccountPublicProfileKey 公开用户资料缓存，value 是 JSON。
+// 缓存内容只能包含 user_id、username、avatar_url、bio，禁止存放邮箱等敏感字段。
+// 格式: fsz:account:profile:{userID}:v:{version}
+func AccountPublicProfileKey(userID uint64, version int64) string {
+	return fmt.Sprintf("%s:account:profile:%d:v:%d", prefix, userID, version)
+}
+
 // TokenKey 当前有效 access token，value 是 JWT 字符串。
 // 当前采用单设备/单会话模型：同一用户新登录会覆盖旧 token。
 // 格式: fsz:token:{userID}
@@ -62,6 +88,13 @@ func VerificationCodeKey(email string) string {
 // 格式: fsz:video:entity:{videoID}
 func VideoEntityKey(videoID uint64) string {
 	return fmt.Sprintf("%s:video:entity:%d", prefix, videoID)
+}
+
+// VideoEntityVersionKey 视频实体缓存版本号。
+// 发布或删除状态成功提交后递增；缓存值只有携带相同版本才允许命中或回填。
+// 格式: fsz:video:entity:{videoID}:version
+func VideoEntityVersionKey(videoID uint64) string {
+	return fmt.Sprintf("%s:video:entity:%d:version", prefix, videoID)
 }
 
 // VideoDetailKey 视频详情缓存（含作者信息和统计数据）
@@ -277,14 +310,43 @@ func SocialFollowingsFirstPageCacheBuildLockKey(cacheKey string) string {
 
 // ========================================
 // Feed 模块
-// FeedGlobalTimelineKey 全局最新视频时间线，ZSet，score=发布时间毫秒，member=videoID。
+// FeedGlobalTimelineKey 全局最新视频时间线，ZSet。
+// 所有元素 score=0，member=固定宽度的 publishedAt:videoID，按字典序倒序读取。
 // 用于推荐流/未登录首页；写入方为视频发布事件消费者，读取方为 feed-rpc。
 // 格式: fsz:feed:global_timeline
 func FeedGlobalTimelineKey() string {
 	return fmt.Sprintf("%s:feed:global_timeline", prefix)
 }
 
-// FeedTimelineKey 单用户关注流 Timeline，ZSet，score=视频发布时间毫秒，member=videoID。
+// FeedGlobalTimelineVersionKey 全局 Timeline 版本号。
+// 每次发布、删除或完整重建都会递增，防止冷启动快照覆盖并发事件。
+func FeedGlobalTimelineVersionKey() string {
+	return fmt.Sprintf("%s:feed:global_timeline:version", prefix)
+}
+
+// FeedGlobalTimelineReadyKey 表示全局 Timeline 已完成一次完整构建。
+func FeedGlobalTimelineReadyKey() string {
+	return fmt.Sprintf("%s:feed:global_timeline:ready", prefix)
+}
+
+// FeedGlobalTimelineBuildLockKey 全局 Timeline 冷启动构建锁。
+func FeedGlobalTimelineBuildLockKey() string {
+	return fmt.Sprintf("%s:feed:global_timeline:build:lock", prefix)
+}
+
+// FeedGlobalTimelineTempKey 全局 Timeline 原子重建时使用的临时 ZSet。
+func FeedGlobalTimelineTempKey(token string) string {
+	return fmt.Sprintf("%s:feed:global_timeline:tmp:%s", prefix, token)
+}
+
+// FeedVideoTimelineMemberKey 保存 videoID 对应的复合 Timeline member。
+// 删除事件优先从 MySQL created_at 重建 member；该映射用于数据被意外物理删除时兜底清理。
+func FeedVideoTimelineMemberKey(videoID uint64) string {
+	return fmt.Sprintf("%s:feed:video:%d:member", prefix, videoID)
+}
+
+// FeedTimelineKey 单用户关注流 Timeline，ZSet。
+// 所有元素 score=0，member=固定宽度的 publishedAt:videoID，按字典序倒序读取。
 // 写入方为 feed_fanout job（视频发布扇出 / 新关注回填），读取方为 feed-rpc。
 // 单 key 最多保留 FeedTimelineMaxLen 条，超出走 ZREMRANGEBYRANK 裁剪。
 // 格式: fsz:feed:timeline:user:{userID}
@@ -292,11 +354,28 @@ func FeedTimelineKey(userID uint64) string {
 	return fmt.Sprintf("%s:feed:timeline:user:%d", prefix, userID)
 }
 
+// FeedTimelineVersionKey 用户 Timeline 版本号。
+// 发布、删除、关注、取关等任何可能改变该用户 Timeline 的事件都会递增。
+func FeedTimelineVersionKey(userID uint64) string {
+	return fmt.Sprintf("%s:feed:timeline:user:%d:version", prefix, userID)
+}
+
+// FeedTimelineReadyKey 表示用户 Timeline 已完成一次完整冷启动构建。
+// 空 Timeline 也必须保留该标记，否则每次读取都会反复回源 MySQL。
+func FeedTimelineReadyKey(userID uint64) string {
+	return fmt.Sprintf("%s:feed:timeline:user:%d:ready", prefix, userID)
+}
+
 // FeedTimelineBuildLockKey 用户 Timeline 首次冷启动构建锁。
 // 用户从未有过 Timeline（首次登录或长时间不活跃 TTL 到期）时，避免多实例并发回源 MySQL 拼装。
 // 格式: fsz:feed:timeline:user:{userID}:lock
 func FeedTimelineBuildLockKey(userID uint64) string {
 	return fmt.Sprintf("%s:feed:timeline:user:%d:lock", prefix, userID)
+}
+
+// FeedTimelineTempKey 用户 Timeline 原子重建时使用的临时 ZSet。
+func FeedTimelineTempKey(userID uint64, token string) string {
+	return fmt.Sprintf("%s:feed:timeline:user:%d:tmp:%s", prefix, userID, token)
 }
 
 // FeedBigVMarkKey 大 V 作者标记，SET，member=authorID。

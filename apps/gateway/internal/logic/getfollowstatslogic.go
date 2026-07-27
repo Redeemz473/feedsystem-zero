@@ -8,8 +8,11 @@ import (
 
 	"feedsystem-zero/apps/gateway/internal/svc"
 	"feedsystem-zero/apps/gateway/internal/types"
+	"feedsystem-zero/apps/social/socialclient"
 
 	"github.com/zeromicro/go-zero/core/logx"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type GetFollowStatsLogic struct {
@@ -27,11 +30,18 @@ func NewGetFollowStatsLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Ge
 }
 
 func (l *GetFollowStatsLogic) GetFollowStats(req *types.GetFollowStatsReq) (resp *types.GetFollowStatsResp, err error) {
-	// TODO:
-	// 1. 校验 req.Userid 非 0。
-	// 2. 调 SocialRpc.GetFollowStats(user_id=req.Userid)。
-	// 3. 映射 followers_count/followings_count 返回。
-	// 这个接口是公开读接口，不要求登录，也不需要把 viewerID 传给 social-rpc。
+	if req == nil || req.Userid == 0 {
+		return nil, status.Error(codes.InvalidArgument, "用户ID不能为空")
+	}
 
-	return
+	rpcResp, err := l.svcCtx.SocialRpc.GetFollowStats(l.ctx, &socialclient.GetFollowStatsReq{
+		UserId: req.Userid,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &types.GetFollowStatsResp{
+		Followerscount:  rpcResp.GetFollowersCount(),
+		Followingscount: rpcResp.GetFollowingsCount(),
+	}, nil
 }

@@ -24,7 +24,7 @@ func NewBatchIsFollowingLogic(ctx context.Context, svcCtx *svc.ServiceContext) *
 }
 
 func (l *BatchIsFollowingLogic) BatchIsFollowing(in *social.BatchIsFollowingReq) (*social.BatchIsFollowingResp, error) {
-	// 1. target_user_ids 最多允许 100 个；过滤 0、去重，并保留请求顺序。
+	// target_user_ids 最多允许 100 个；过滤 0、去重，并保留请求顺序。
 	originalTargetUserIDs := in.GetTargetUserIds()
 	targetUserIDs, err := normalizeUserIDs(originalTargetUserIDs, 100)
 	if err != nil {
@@ -32,7 +32,7 @@ func (l *BatchIsFollowingLogic) BatchIsFollowing(in *social.BatchIsFollowingReq)
 	}
 	states := make([]*social.FollowingState, 0, len(targetUserIDs))
 
-	// 2. viewer_id=0 时不访问 Redis/MySQL，直接按请求顺序返回全部 false。
+	// viewer_id=0 时不访问 Redis/MySQL，直接按请求顺序返回全部 false。
 	viewerID := in.GetViewerId()
 	if viewerID == 0 {
 		for _, userID := range targetUserIDs {

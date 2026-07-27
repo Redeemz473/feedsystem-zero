@@ -234,4 +234,33 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
 		rest.WithPrefix("/social"),
 	)
+
+	server.AddRoutes(
+		rest.WithMiddlewares(
+			[]rest.Middleware{serverCtx.OptionalTokenAuth},
+			[]rest.Route{
+				{
+					Method:  http.MethodGet,
+					Path:    "/recommend",
+					Handler: GetRecommendFeedHandler(serverCtx),
+				},
+			}...,
+		),
+		rest.WithPrefix("/feed"),
+	)
+
+	server.AddRoutes(
+		rest.WithMiddlewares(
+			[]rest.Middleware{serverCtx.TokenAuth},
+			[]rest.Route{
+				{
+					Method:  http.MethodGet,
+					Path:    "/following",
+					Handler: GetFollowingFeedHandler(serverCtx),
+				},
+			}...,
+		),
+		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
+		rest.WithPrefix("/feed"),
+	)
 }

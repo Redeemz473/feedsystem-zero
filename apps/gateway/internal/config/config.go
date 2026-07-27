@@ -15,6 +15,7 @@ type Config struct {
 	VideoRpc       zrpc.RpcClientConf
 	InteractionRpc zrpc.RpcClientConf
 	SocialRpc      zrpc.RpcClientConf
+	FeedRpc        zrpc.RpcClientConf
 	BizRedis       RedisConf
 	Mysql          MysqlConf
 	Upload         UploadConf

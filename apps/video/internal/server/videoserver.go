@@ -35,6 +35,12 @@ func (s *VideoServer) GetVideo(ctx context.Context, in *video.GetVideoReq) (*vid
 	return l.GetVideo(in)
 }
 
+// 批量获取视频实体
+func (s *VideoServer) BatchGetVideos(ctx context.Context, in *video.BatchGetVideosReq) (*video.BatchGetVideosResp, error) {
+	l := logic.NewBatchGetVideosLogic(ctx, s.svcCtx)
+	return l.BatchGetVideos(in)
+}
+
 // 获取作者发布的视频列表
 func (s *VideoServer) ListUserVideos(ctx context.Context, in *video.ListUserVideosReq) (*video.ListUserVideosResp, error) {
 	l := logic.NewListUserVideosLogic(ctx, s.svcCtx)

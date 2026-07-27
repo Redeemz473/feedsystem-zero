@@ -1,0 +1,25 @@
+Name: feed.rpc
+ListenOn: 0.0.0.0:9005
+Etcd:
+  Hosts:
+  - 127.0.0.1:23790
+  Key: feed.rpc
+
+Mysql:
+  DataSource: root:123456@tcp(127.0.0.1:3308)/feedsystem_zero?charset=utf8mb4&parseTime=true&loc=Local
+
+BizRedis:
+  Addr: 127.0.0.1:6380
+  Password: "123456"
+  DB: 0
+
+Timeline:
+  DefaultPageSize: 20
+  MaxPageSize: 50
+  GlobalTimelineMaxLen: 10000
+  UserTimelineMaxLen: 2000
+  UserTimelineTTLSeconds: 2592000
+  BuildLockTTLSeconds: 15
+  BuildWaitMs: 1500
+  RedisOpTimeoutMs: 1000
+  DBQueryTimeoutMs: 3000

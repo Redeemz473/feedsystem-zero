@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Video_PublishVideo_FullMethodName   = "/video.Video/PublishVideo"
 	Video_GetVideo_FullMethodName       = "/video.Video/GetVideo"
+	Video_BatchGetVideos_FullMethodName = "/video.Video/BatchGetVideos"
 	Video_ListUserVideos_FullMethodName = "/video.Video/ListUserVideos"
 	Video_DeleteVideo_FullMethodName    = "/video.Video/DeleteVideo"
 )
@@ -35,6 +36,8 @@ type VideoClient interface {
 	PublishVideo(ctx context.Context, in *PublishVideoReq, opts ...grpc.CallOption) (*PublishVideoResp, error)
 	// 获取视频详情
 	GetVideo(ctx context.Context, in *GetVideoReq, opts ...grpc.CallOption) (*GetVideoResp, error)
+	// 批量获取视频实体
+	BatchGetVideos(ctx context.Context, in *BatchGetVideosReq, opts ...grpc.CallOption) (*BatchGetVideosResp, error)
 	// 获取作者发布的视频列表
 	ListUserVideos(ctx context.Context, in *ListUserVideosReq, opts ...grpc.CallOption) (*ListUserVideosResp, error)
 	// 删除视频
@@ -63,6 +66,16 @@ func (c *videoClient) GetVideo(ctx context.Context, in *GetVideoReq, opts ...grp
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetVideoResp)
 	err := c.cc.Invoke(ctx, Video_GetVideo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *videoClient) BatchGetVideos(ctx context.Context, in *BatchGetVideosReq, opts ...grpc.CallOption) (*BatchGetVideosResp, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchGetVideosResp)
+	err := c.cc.Invoke(ctx, Video_BatchGetVideos_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -99,6 +112,8 @@ type VideoServer interface {
 	PublishVideo(context.Context, *PublishVideoReq) (*PublishVideoResp, error)
 	// 获取视频详情
 	GetVideo(context.Context, *GetVideoReq) (*GetVideoResp, error)
+	// 批量获取视频实体
+	BatchGetVideos(context.Context, *BatchGetVideosReq) (*BatchGetVideosResp, error)
 	// 获取作者发布的视频列表
 	ListUserVideos(context.Context, *ListUserVideosReq) (*ListUserVideosResp, error)
 	// 删除视频
@@ -118,6 +133,9 @@ func (UnimplementedVideoServer) PublishVideo(context.Context, *PublishVideoReq) 
 }
 func (UnimplementedVideoServer) GetVideo(context.Context, *GetVideoReq) (*GetVideoResp, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetVideo not implemented")
+}
+func (UnimplementedVideoServer) BatchGetVideos(context.Context, *BatchGetVideosReq) (*BatchGetVideosResp, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchGetVideos not implemented")
 }
 func (UnimplementedVideoServer) ListUserVideos(context.Context, *ListUserVideosReq) (*ListUserVideosResp, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListUserVideos not implemented")
@@ -182,6 +200,24 @@ func _Video_GetVideo_Handler(srv interface{}, ctx context.Context, dec func(inte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Video_BatchGetVideos_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchGetVideosReq)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VideoServer).BatchGetVideos(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Video_BatchGetVideos_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VideoServer).BatchGetVideos(ctx, req.(*BatchGetVideosReq))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Video_ListUserVideos_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListUserVideosReq)
 	if err := dec(in); err != nil {
@@ -232,6 +268,10 @@ var Video_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetVideo",
 			Handler:    _Video_GetVideo_Handler,
+		},
+		{
+			MethodName: "BatchGetVideos",
+			Handler:    _Video_BatchGetVideos_Handler,
 		},
 		{
 			MethodName: "ListUserVideos",

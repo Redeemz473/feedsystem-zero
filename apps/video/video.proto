@@ -55,6 +55,17 @@ message GetVideoResp {
   VideoInfo video = 1;
 }
 
+// 批量查询视频实体，供 Feed/Gateway 等聚合层补齐视频卡片，避免逐个 GetVideo 造成 N+1 RPC。
+// video_ids 单次最多 100 个；服务端去重并保持输入顺序，不存在、已删除或已下架的视频直接跳过。
+// 互动统计和 is_liked 由 InteractionRpc.BatchGetVideoStats 负责实时覆盖。
+message BatchGetVideosReq {
+  repeated uint64 video_ids = 1;
+}
+
+message BatchGetVideosResp {
+  repeated VideoInfo videos = 1;
+}
+
 // 查询作者发布的视频列表。
 // 首次请求 cursor_created_at/cursor_video_id 传 0。
 // 后续请求使用上次返回的 next_cursor_created_at/next_cursor_video_id。
@@ -90,6 +101,8 @@ service Video {
   rpc PublishVideo(PublishVideoReq) returns (PublishVideoResp);
   // 获取视频详情
   rpc GetVideo(GetVideoReq) returns (GetVideoResp);
+  // 批量获取视频实体
+  rpc BatchGetVideos(BatchGetVideosReq) returns (BatchGetVideosResp);
   // 获取作者发布的视频列表
   rpc ListUserVideos(ListUserVideosReq) returns (ListUserVideosResp);
   // 删除视频

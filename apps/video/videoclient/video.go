@@ -14,6 +14,8 @@ import (
 )
 
 type (
+	BatchGetVideosReq  = video.BatchGetVideosReq
+	BatchGetVideosResp = video.BatchGetVideosResp
 	DeleteVideoReq     = video.DeleteVideoReq
 	DeleteVideoResp    = video.DeleteVideoResp
 	GetVideoReq        = video.GetVideoReq
@@ -29,6 +31,8 @@ type (
 		PublishVideo(ctx context.Context, in *PublishVideoReq, opts ...grpc.CallOption) (*PublishVideoResp, error)
 		// 获取视频详情
 		GetVideo(ctx context.Context, in *GetVideoReq, opts ...grpc.CallOption) (*GetVideoResp, error)
+		// 批量获取视频实体
+		BatchGetVideos(ctx context.Context, in *BatchGetVideosReq, opts ...grpc.CallOption) (*BatchGetVideosResp, error)
 		// 获取作者发布的视频列表
 		ListUserVideos(ctx context.Context, in *ListUserVideosReq, opts ...grpc.CallOption) (*ListUserVideosResp, error)
 		// 删除视频
@@ -56,6 +60,12 @@ func (m *defaultVideo) PublishVideo(ctx context.Context, in *PublishVideoReq, op
 func (m *defaultVideo) GetVideo(ctx context.Context, in *GetVideoReq, opts ...grpc.CallOption) (*GetVideoResp, error) {
 	client := video.NewVideoClient(m.cli.Conn())
 	return client.GetVideo(ctx, in, opts...)
+}
+
+// 批量获取视频实体
+func (m *defaultVideo) BatchGetVideos(ctx context.Context, in *BatchGetVideosReq, opts ...grpc.CallOption) (*BatchGetVideosResp, error) {
+	client := video.NewVideoClient(m.cli.Conn())
+	return client.BatchGetVideos(ctx, in, opts...)
 }
 
 // 获取作者发布的视频列表

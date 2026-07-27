@@ -7,12 +7,11 @@
 package video
 
 import (
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
-
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -182,6 +181,8 @@ func (x *VideoInfo) GetTags() []string {
 
 // PublishVideo 只发布视频元数据。
 // 视频文件和封面文件由 gateway 上传后生成 play_url/cover_url。
+// request_id 建议由 gateway 或前端生成，用于视频发布幂等：同一 (author_id, request_id)
+// 只会真正创建一次视频，重试会直接回读已存在的视频。
 type PublishVideoReq struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	AuthorId       uint64                 `protobuf:"varint,1,opt,name=author_id,json=authorId,proto3" json:"author_id,omitempty"`
@@ -432,6 +433,97 @@ func (x *GetVideoResp) GetVideo() *VideoInfo {
 	return nil
 }
 
+// 批量查询视频实体，供 Feed/Gateway 等聚合层补齐视频卡片，避免逐个 GetVideo 造成 N+1 RPC。
+// video_ids 单次最多 100 个；服务端去重并保持输入顺序，不存在、已删除或已下架的视频直接跳过。
+// 互动统计和 is_liked 由 InteractionRpc.BatchGetVideoStats 负责实时覆盖。
+type BatchGetVideosReq struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	VideoIds      []uint64               `protobuf:"varint,1,rep,packed,name=video_ids,json=videoIds,proto3" json:"video_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchGetVideosReq) Reset() {
+	*x = BatchGetVideosReq{}
+	mi := &file_video_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchGetVideosReq) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchGetVideosReq) ProtoMessage() {}
+
+func (x *BatchGetVideosReq) ProtoReflect() protoreflect.Message {
+	mi := &file_video_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchGetVideosReq.ProtoReflect.Descriptor instead.
+func (*BatchGetVideosReq) Descriptor() ([]byte, []int) {
+	return file_video_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *BatchGetVideosReq) GetVideoIds() []uint64 {
+	if x != nil {
+		return x.VideoIds
+	}
+	return nil
+}
+
+type BatchGetVideosResp struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Videos        []*VideoInfo           `protobuf:"bytes,1,rep,name=videos,proto3" json:"videos,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BatchGetVideosResp) Reset() {
+	*x = BatchGetVideosResp{}
+	mi := &file_video_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BatchGetVideosResp) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BatchGetVideosResp) ProtoMessage() {}
+
+func (x *BatchGetVideosResp) ProtoReflect() protoreflect.Message {
+	mi := &file_video_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BatchGetVideosResp.ProtoReflect.Descriptor instead.
+func (*BatchGetVideosResp) Descriptor() ([]byte, []int) {
+	return file_video_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *BatchGetVideosResp) GetVideos() []*VideoInfo {
+	if x != nil {
+		return x.Videos
+	}
+	return nil
+}
+
 // 查询作者发布的视频列表。
 // 首次请求 cursor_created_at/cursor_video_id 传 0。
 // 后续请求使用上次返回的 next_cursor_created_at/next_cursor_video_id。
@@ -439,8 +531,8 @@ type ListUserVideosReq struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	AuthorId        uint64                 `protobuf:"varint,1,opt,name=author_id,json=authorId,proto3" json:"author_id,omitempty"`
 	ViewerId        uint64                 `protobuf:"varint,2,opt,name=viewer_id,json=viewerId,proto3" json:"viewer_id,omitempty"`
-	CursorCreatedAt int64                  `protobuf:"varint,3,opt,name=cursor_created_at,json=cursorCreatedAt,proto3" json:"cursor_created_at,omitempty"` // Unix milliseconds
-	CursorVideoId   uint64                 `protobuf:"varint,4,opt,name=cursor_video_id,json=cursorVideoId,proto3" json:"cursor_video_id,omitempty"`
+	CursorCreatedAt int64                  `protobuf:"varint,3,opt,name=cursor_created_at,json=cursorCreatedAt,proto3" json:"cursor_created_at,omitempty"` // 游标：上一页最后一条视频的创建时间戳（毫秒级Unix）
+	CursorVideoId   uint64                 `protobuf:"varint,4,opt,name=cursor_video_id,json=cursorVideoId,proto3" json:"cursor_video_id,omitempty"`       //游标：上一页最后一条视频ID（时间相同时用ID兜底排序）
 	PageSize        int64                  `protobuf:"varint,5,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
@@ -448,7 +540,7 @@ type ListUserVideosReq struct {
 
 func (x *ListUserVideosReq) Reset() {
 	*x = ListUserVideosReq{}
-	mi := &file_video_proto_msgTypes[5]
+	mi := &file_video_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -460,7 +552,7 @@ func (x *ListUserVideosReq) String() string {
 func (*ListUserVideosReq) ProtoMessage() {}
 
 func (x *ListUserVideosReq) ProtoReflect() protoreflect.Message {
-	mi := &file_video_proto_msgTypes[5]
+	mi := &file_video_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -473,7 +565,7 @@ func (x *ListUserVideosReq) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListUserVideosReq.ProtoReflect.Descriptor instead.
 func (*ListUserVideosReq) Descriptor() ([]byte, []int) {
-	return file_video_proto_rawDescGZIP(), []int{5}
+	return file_video_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ListUserVideosReq) GetAuthorId() uint64 {
@@ -514,8 +606,8 @@ func (x *ListUserVideosReq) GetPageSize() int64 {
 type ListUserVideosResp struct {
 	state               protoimpl.MessageState `protogen:"open.v1"`
 	Videos              []*VideoInfo           `protobuf:"bytes,1,rep,name=videos,proto3" json:"videos,omitempty"`
-	NextCursorCreatedAt int64                  `protobuf:"varint,2,opt,name=next_cursor_created_at,json=nextCursorCreatedAt,proto3" json:"next_cursor_created_at,omitempty"` // Unix milliseconds
-	NextCursorVideoId   uint64                 `protobuf:"varint,3,opt,name=next_cursor_video_id,json=nextCursorVideoId,proto3" json:"next_cursor_video_id,omitempty"`
+	NextCursorCreatedAt int64                  `protobuf:"varint,2,opt,name=next_cursor_created_at,json=nextCursorCreatedAt,proto3" json:"next_cursor_created_at,omitempty"` // 下一页需要携带的创建时间游标
+	NextCursorVideoId   uint64                 `protobuf:"varint,3,opt,name=next_cursor_video_id,json=nextCursorVideoId,proto3" json:"next_cursor_video_id,omitempty"`       // 下一页需要携带的视频ID游标
 	HasMore             bool                   `protobuf:"varint,4,opt,name=has_more,json=hasMore,proto3" json:"has_more,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
@@ -523,7 +615,7 @@ type ListUserVideosResp struct {
 
 func (x *ListUserVideosResp) Reset() {
 	*x = ListUserVideosResp{}
-	mi := &file_video_proto_msgTypes[6]
+	mi := &file_video_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -535,7 +627,7 @@ func (x *ListUserVideosResp) String() string {
 func (*ListUserVideosResp) ProtoMessage() {}
 
 func (x *ListUserVideosResp) ProtoReflect() protoreflect.Message {
-	mi := &file_video_proto_msgTypes[6]
+	mi := &file_video_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -548,7 +640,7 @@ func (x *ListUserVideosResp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListUserVideosResp.ProtoReflect.Descriptor instead.
 func (*ListUserVideosResp) Descriptor() ([]byte, []int) {
-	return file_video_proto_rawDescGZIP(), []int{6}
+	return file_video_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ListUserVideosResp) GetVideos() []*VideoInfo {
@@ -591,7 +683,7 @@ type DeleteVideoReq struct {
 
 func (x *DeleteVideoReq) Reset() {
 	*x = DeleteVideoReq{}
-	mi := &file_video_proto_msgTypes[7]
+	mi := &file_video_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -603,7 +695,7 @@ func (x *DeleteVideoReq) String() string {
 func (*DeleteVideoReq) ProtoMessage() {}
 
 func (x *DeleteVideoReq) ProtoReflect() protoreflect.Message {
-	mi := &file_video_proto_msgTypes[7]
+	mi := &file_video_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -616,7 +708,7 @@ func (x *DeleteVideoReq) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteVideoReq.ProtoReflect.Descriptor instead.
 func (*DeleteVideoReq) Descriptor() ([]byte, []int) {
-	return file_video_proto_rawDescGZIP(), []int{7}
+	return file_video_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *DeleteVideoReq) GetVideoId() uint64 {
@@ -642,7 +734,7 @@ type DeleteVideoResp struct {
 
 func (x *DeleteVideoResp) Reset() {
 	*x = DeleteVideoResp{}
-	mi := &file_video_proto_msgTypes[8]
+	mi := &file_video_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -654,7 +746,7 @@ func (x *DeleteVideoResp) String() string {
 func (*DeleteVideoResp) ProtoMessage() {}
 
 func (x *DeleteVideoResp) ProtoReflect() protoreflect.Message {
-	mi := &file_video_proto_msgTypes[8]
+	mi := &file_video_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -667,7 +759,7 @@ func (x *DeleteVideoResp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteVideoResp.ProtoReflect.Descriptor instead.
 func (*DeleteVideoResp) Descriptor() ([]byte, []int) {
-	return file_video_proto_rawDescGZIP(), []int{8}
+	return file_video_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *DeleteVideoResp) GetMsg() string {
@@ -703,7 +795,7 @@ const file_video_proto_rawDesc = "" +
 	"\n" +
 	"updated_at\x18\r \x01(\x03R\tupdatedAt\x12\x19\n" +
 	"\bis_liked\x18\x0e \x01(\bR\aisLiked\x12\x12\n" +
-	"\x04tags\x18\x0f \x03(\tR\x04tags\"\xdb\x01\n" +
+	"\x04tags\x18\x0f \x03(\tR\x04tags\"\xfa\x01\n" +
 	"\x0fPublishVideoReq\x12\x1b\n" +
 	"\tauthor_id\x18\x01 \x01(\x04R\bauthorId\x12'\n" +
 	"\x0fauthor_username\x18\x02 \x01(\tR\x0eauthorUsername\x12\x14\n" +
@@ -711,7 +803,9 @@ const file_video_proto_rawDesc = "" +
 	"\vdescription\x18\x04 \x01(\tR\vdescription\x12\x19\n" +
 	"\bplay_url\x18\x05 \x01(\tR\aplayUrl\x12\x1b\n" +
 	"\tcover_url\x18\x06 \x01(\tR\bcoverUrl\x12\x12\n" +
-	"\x04tags\x18\a \x03(\tR\x04tags\"L\n" +
+	"\x04tags\x18\a \x03(\tR\x04tags\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\b \x01(\tR\trequestId\"L\n" +
 	"\x10PublishVideoResp\x12\x10\n" +
 	"\x03msg\x18\x01 \x01(\tR\x03msg\x12&\n" +
 	"\x05video\x18\x02 \x01(\v2\x10.video.VideoInfoR\x05video\"E\n" +
@@ -719,7 +813,11 @@ const file_video_proto_rawDesc = "" +
 	"\bvideo_id\x18\x01 \x01(\x04R\avideoId\x12\x1b\n" +
 	"\tviewer_id\x18\x02 \x01(\x04R\bviewerId\"6\n" +
 	"\fGetVideoResp\x12&\n" +
-	"\x05video\x18\x01 \x01(\v2\x10.video.VideoInfoR\x05video\"\xbe\x01\n" +
+	"\x05video\x18\x01 \x01(\v2\x10.video.VideoInfoR\x05video\"0\n" +
+	"\x11BatchGetVideosReq\x12\x1b\n" +
+	"\tvideo_ids\x18\x01 \x03(\x04R\bvideoIds\">\n" +
+	"\x12BatchGetVideosResp\x12(\n" +
+	"\x06videos\x18\x01 \x03(\v2\x10.video.VideoInfoR\x06videos\"\xbe\x01\n" +
 	"\x11ListUserVideosReq\x12\x1b\n" +
 	"\tauthor_id\x18\x01 \x01(\x04R\bauthorId\x12\x1b\n" +
 	"\tviewer_id\x18\x02 \x01(\x04R\bviewerId\x12*\n" +
@@ -736,10 +834,11 @@ const file_video_proto_rawDesc = "" +
 	"\voperator_id\x18\x02 \x01(\x04R\n" +
 	"operatorId\"#\n" +
 	"\x0fDeleteVideoResp\x12\x10\n" +
-	"\x03msg\x18\x01 \x01(\tR\x03msg2\x82\x02\n" +
+	"\x03msg\x18\x01 \x01(\tR\x03msg2\xc9\x02\n" +
 	"\x05Video\x12?\n" +
 	"\fPublishVideo\x12\x16.video.PublishVideoReq\x1a\x17.video.PublishVideoResp\x123\n" +
 	"\bGetVideo\x12\x12.video.GetVideoReq\x1a\x13.video.GetVideoResp\x12E\n" +
+	"\x0eBatchGetVideos\x12\x18.video.BatchGetVideosReq\x1a\x19.video.BatchGetVideosResp\x12E\n" +
 	"\x0eListUserVideos\x12\x18.video.ListUserVideosReq\x1a\x19.video.ListUserVideosResp\x12<\n" +
 	"\vDeleteVideo\x12\x15.video.DeleteVideoReq\x1a\x16.video.DeleteVideoRespB\tZ\a./videob\x06proto3"
 
@@ -755,35 +854,40 @@ func file_video_proto_rawDescGZIP() []byte {
 	return file_video_proto_rawDescData
 }
 
-var file_video_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_video_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_video_proto_goTypes = []any{
 	(*VideoInfo)(nil),          // 0: video.VideoInfo
 	(*PublishVideoReq)(nil),    // 1: video.PublishVideoReq
 	(*PublishVideoResp)(nil),   // 2: video.PublishVideoResp
 	(*GetVideoReq)(nil),        // 3: video.GetVideoReq
 	(*GetVideoResp)(nil),       // 4: video.GetVideoResp
-	(*ListUserVideosReq)(nil),  // 5: video.ListUserVideosReq
-	(*ListUserVideosResp)(nil), // 6: video.ListUserVideosResp
-	(*DeleteVideoReq)(nil),     // 7: video.DeleteVideoReq
-	(*DeleteVideoResp)(nil),    // 8: video.DeleteVideoResp
+	(*BatchGetVideosReq)(nil),  // 5: video.BatchGetVideosReq
+	(*BatchGetVideosResp)(nil), // 6: video.BatchGetVideosResp
+	(*ListUserVideosReq)(nil),  // 7: video.ListUserVideosReq
+	(*ListUserVideosResp)(nil), // 8: video.ListUserVideosResp
+	(*DeleteVideoReq)(nil),     // 9: video.DeleteVideoReq
+	(*DeleteVideoResp)(nil),    // 10: video.DeleteVideoResp
 }
 var file_video_proto_depIdxs = []int32{
-	0, // 0: video.PublishVideoResp.video:type_name -> video.VideoInfo
-	0, // 1: video.GetVideoResp.video:type_name -> video.VideoInfo
-	0, // 2: video.ListUserVideosResp.videos:type_name -> video.VideoInfo
-	1, // 3: video.Video.PublishVideo:input_type -> video.PublishVideoReq
-	3, // 4: video.Video.GetVideo:input_type -> video.GetVideoReq
-	5, // 5: video.Video.ListUserVideos:input_type -> video.ListUserVideosReq
-	7, // 6: video.Video.DeleteVideo:input_type -> video.DeleteVideoReq
-	2, // 7: video.Video.PublishVideo:output_type -> video.PublishVideoResp
-	4, // 8: video.Video.GetVideo:output_type -> video.GetVideoResp
-	6, // 9: video.Video.ListUserVideos:output_type -> video.ListUserVideosResp
-	8, // 10: video.Video.DeleteVideo:output_type -> video.DeleteVideoResp
-	7, // [7:11] is the sub-list for method output_type
-	3, // [3:7] is the sub-list for method input_type
-	3, // [3:3] is the sub-list for extension type_name
-	3, // [3:3] is the sub-list for extension extendee
-	0, // [0:3] is the sub-list for field type_name
+	0,  // 0: video.PublishVideoResp.video:type_name -> video.VideoInfo
+	0,  // 1: video.GetVideoResp.video:type_name -> video.VideoInfo
+	0,  // 2: video.BatchGetVideosResp.videos:type_name -> video.VideoInfo
+	0,  // 3: video.ListUserVideosResp.videos:type_name -> video.VideoInfo
+	1,  // 4: video.Video.PublishVideo:input_type -> video.PublishVideoReq
+	3,  // 5: video.Video.GetVideo:input_type -> video.GetVideoReq
+	5,  // 6: video.Video.BatchGetVideos:input_type -> video.BatchGetVideosReq
+	7,  // 7: video.Video.ListUserVideos:input_type -> video.ListUserVideosReq
+	9,  // 8: video.Video.DeleteVideo:input_type -> video.DeleteVideoReq
+	2,  // 9: video.Video.PublishVideo:output_type -> video.PublishVideoResp
+	4,  // 10: video.Video.GetVideo:output_type -> video.GetVideoResp
+	6,  // 11: video.Video.BatchGetVideos:output_type -> video.BatchGetVideosResp
+	8,  // 12: video.Video.ListUserVideos:output_type -> video.ListUserVideosResp
+	10, // 13: video.Video.DeleteVideo:output_type -> video.DeleteVideoResp
+	9,  // [9:14] is the sub-list for method output_type
+	4,  // [4:9] is the sub-list for method input_type
+	4,  // [4:4] is the sub-list for extension type_name
+	4,  // [4:4] is the sub-list for extension extendee
+	0,  // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_video_proto_init() }
@@ -797,7 +901,7 @@ func file_video_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_video_proto_rawDesc), len(file_video_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

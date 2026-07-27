@@ -8,8 +8,10 @@ import (
 
 	"feedsystem-zero/apps/video/internal/model"
 	videopb "feedsystem-zero/apps/video/video"
+	"feedsystem-zero/common/rediskey"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 )
 
@@ -145,4 +147,19 @@ func loadTagsByVideoIDs(ctx context.Context, db *gorm.DB, videoIDs []uint64) (ma
 	}
 
 	return tagsMap, nil
+}
+
+// invalidateVideoEntityCache 在 MySQL 状态提交后递增版本并清理实体、详情和统计快照。
+// TxPipeline 保证版本递增与删除在 Redis 内原子执行；并发回源只能写入匹配版本的实体缓存。
+func invalidateVideoEntityCache(ctx context.Context, redisCli *redis.Client, videoID uint64) error {
+	pipe := redisCli.TxPipeline()
+	pipe.Incr(ctx, rediskey.VideoEntityVersionKey(videoID))
+	pipe.Del(
+		ctx,
+		rediskey.VideoEntityKey(videoID),
+		rediskey.VideoDetailKey(videoID),
+		rediskey.VideoStatsCacheKey(videoID),
+	)
+	_, err := pipe.Exec(ctx)
+	return err
 }

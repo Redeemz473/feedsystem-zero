@@ -35,8 +35,8 @@ func NewListFollowingsLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Li
 // SocialFollowersListVersionKey(followingID) 和
 // SocialFollowingsListVersionKey(followerID)。
 func (l *ListFollowingsLogic) ListFollowings(in *social.ListFollowingsReq) (*social.ListFollowingsResp, error) {
-	//  1. 校验 user_id 非 0；统一 page_size，并校验 cursor_updated_at/cursor_follow_id 双游标组合。
-	//     AccountRpc 校验放到真正回源查 MySQL 前调用，命中首页缓存的路径可以省掉一次 RPC。
+	//  校验 user_id 非 0；统一 page_size，并校验 cursor_updated_at/cursor_follow_id 双游标组合。
+	//  AccountRpc 校验放到真正回源查 MySQL 前调用，命中首页缓存的路径可以省掉一次 RPC。
 	userID := in.GetUserId()
 	if userID == 0 {
 		return nil, status.Error(codes.InvalidArgument, "用户ID不能为空")
@@ -58,11 +58,11 @@ func (l *ListFollowingsLogic) ListFollowings(in *social.ListFollowingsReq) (*soc
 	useFixedWindow := false
 	cacheWriteAllowed := false
 	var lockKey, lockToken string
-	//  2. 仅首页读取 SocialFollowingsListVersionKey 和
-	//     SocialFollowingsFirstPageCacheKey。所有首页 page_size 共用一份
-	//     固定 50 条窗口，缓存只保存基础关系和 has_more_after_window，
-	//     不保存请求级 has_more、下一页游标和 viewer_is_following。
-	//     命中后按 page_size 切片，并动态计算响应游标和 has_more。
+	//  仅首页读取 SocialFollowingsListVersionKey 和
+	//  SocialFollowingsFirstPageCacheKey。所有首页 page_size 共用一份
+	//  固定 50 条窗口，缓存只保存基础关系和 has_more_after_window，
+	//  不保存请求级 has_more、下一页游标和 viewer_is_following。
+	//  命中后按 page_size 切片，并动态计算响应游标和 has_more。
 	if !hasCursor {
 		if currentVersion, ok := l.getFollowingsListVersion(userID); ok {
 			version = currentVersion
@@ -89,7 +89,7 @@ func (l *ListFollowingsLogic) ListFollowings(in *social.ListFollowingsReq) (*soc
 			}
 		}
 	}
-	//  3.非首页读取或首页读取未命中
+	// 非首页读取或首页读取未命中
 	// 如果抢到锁需要释放掉
 	if cacheWriteAllowed {
 		defer l.releaseFollowingsFirstPageCacheLock(lockKey, lockToken)

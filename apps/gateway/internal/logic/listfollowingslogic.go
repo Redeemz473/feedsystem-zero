@@ -8,8 +8,11 @@ import (
 
 	"feedsystem-zero/apps/gateway/internal/svc"
 	"feedsystem-zero/apps/gateway/internal/types"
+	"feedsystem-zero/apps/social/socialclient"
 
 	"github.com/zeromicro/go-zero/core/logx"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type ListFollowingsLogic struct {
@@ -27,14 +30,54 @@ func NewListFollowingsLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Li
 }
 
 func (l *ListFollowingsLogic) ListFollowings(req *types.ListFollowingsReq) (resp *types.ListFollowingsResp, err error) {
-	// TODO: 实现方式与 ListFollowers 对称。
-	//
-	// 1. 获取可选 viewerID，调用 SocialRpc.ListFollowings。
-	// 2. 本接口应收集 relation.following_id，而不是 follower_id。
-	// 3. 使用 AccountRpc.BatchGetProfiles 一次批量补齐公开用户资料。
-	// 4. 按 Social RPC 原始顺序组装 FollowRelationInfo，并保留
-	//    relation.viewer_is_following。
-	// 5. 原样透传 Social RPC 返回的双游标和 has_more。
+	if req == nil || req.Userid == 0 {
+		return nil, status.Error(codes.InvalidArgument, "用户ID不能为空")
+	}
 
-	return
+	rpcResp, err := l.svcCtx.SocialRpc.ListFollowings(l.ctx, &socialclient.ListFollowingsReq{
+		UserId:          req.Userid,
+		ViewerId:        optionalUserIDFromCtx(l.ctx),
+		CursorUpdatedAt: req.Cursorupdatedat,
+		CursorFollowId:  req.Cursorfollowid,
+		PageSize:        req.Pagesize,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	relations := rpcResp.GetFollowings()
+	userIDs := make([]uint64, 0, len(relations))
+	for _, relation := range relations {
+		if relation != nil {
+			userIDs = append(userIDs, relation.GetFollowingId())
+		}
+	}
+	profileMap, err := loadSocialUserInfoMap(l.ctx, l.svcCtx.AccountRpc, userIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	followings := make([]types.FollowRelationInfo, 0, len(relations))
+	for _, relation := range relations {
+		if relation == nil {
+			continue
+		}
+		profile, ok := profileMap[relation.GetFollowingId()]
+		if !ok {
+			continue
+		}
+		followings = append(followings, types.FollowRelationInfo{
+			Relationid:        relation.GetRelationId(),
+			User:              profile,
+			Followedat:        relation.GetFollowedAt(),
+			Viewerisfollowing: relation.GetViewerIsFollowing(),
+		})
+	}
+
+	return &types.ListFollowingsResp{
+		Followings:          followings,
+		Nextcursorupdatedat: rpcResp.GetNextCursorUpdatedAt(),
+		Nextcursorfollowid:  rpcResp.GetNextCursorFollowId(),
+		Hasmore:             rpcResp.GetHasMore(),
+	}, nil
 }

@@ -8,20 +8,23 @@ option go_package = "./feed";
 // 写路径（视频发布扇出、关注/取关回填 Timeline）由 feed_fanout job
 // 消费 Kafka 完成，不在本 proto 中暴露。
 //
-// 关注流 Timeline: fsz:feed:timeline:user:{userID}  (ZSet，score=published_at ms)
-// 全局时间线:      fsz:feed:global_timeline          (ZSet，score=published_at ms)
+// 关注流 Timeline: fsz:feed:timeline:user:{userID}
+// 全局时间线:      fsz:feed:global_timeline
+// 两者均使用 ZSet：score 固定为 0，member 为固定宽度的 published_at:video_id，
+// 通过字典序倒序实现稳定复合游标，避免同毫秒视频翻页重复或遗漏。
 
-// FeedVideoItem 是 Feed 列表项的精简视图。
-// 完整的视频详情（作者、标签等）由调用方按需回填，Feed 层只负责“出什么、按什么顺序出”。
+// FeedVideoItem 是 Feed 候选项，只描述“哪个视频、排在什么位置”。
+// 作者、标题、标签和互动统计由 gateway 分别通过 VideoRpc.BatchGetVideos 和
+// InteractionRpc.BatchGetVideoStats 批量补齐，避免 Feed 服务越过自身数据边界。
 message FeedVideoItem {
   uint64 video_id = 1;
-  uint64 author_id = 2;
-  int64 published_at = 3; // Unix milliseconds，与 Timeline 的 score 一致
+  int64 published_at = 2; // Unix milliseconds，来自 Timeline member
 }
 
 // 关注流：读取 viewer 关注的所有作者的最新视频，按发布时间倒序分页。
 // 首次请求 cursor_published_at 传 0，表示从最新开始。
 // 后续请求使用上次返回的 next_cursor_published_at / next_cursor_video_id。
+// 两个游标必须同时为 0 或同时大于 0；page_size 默认 20，最大 50。
 message GetFollowingFeedReq {
   uint64 viewer_id = 1;             // 必须由 gateway 从 JWT 解析填入
   int64 cursor_published_at = 2;    // 游标：上一页最后一条视频的发布时间毫秒
@@ -36,8 +39,10 @@ message GetFollowingFeedResp {
   bool has_more = 4;
 }
 
-// 推荐流：面向未登录 / 冷启动 / 无关注对象的用户，返回全局最新（后续可切热度榜）视频。
+// 推荐流：面向未登录、冷启动或无关注对象的用户，当前返回全局最新视频。
+// 后续若引入会动态变分的热度榜，应使用独立榜单快照/游标策略，不直接复用发布时间游标。
 // viewer_id 允许为 0，表示未登录访问。
+// 两个游标必须同时为 0 或同时大于 0；page_size 默认 20，最大 50。
 message GetRecommendFeedReq {
   uint64 viewer_id = 1;             // 0 表示未登录
   int64 cursor_published_at = 2;
@@ -56,6 +61,6 @@ message GetRecommendFeedResp {
 service Feed {
   // 关注流：viewer 关注的所有作者的最新视频，按发布时间倒序
   rpc GetFollowingFeed(GetFollowingFeedReq) returns (GetFollowingFeedResp);
-  // 推荐流：全局最新/热门视频，未登录也可访问
+  // 推荐流：当前返回全局最新视频，未登录也可访问
   rpc GetRecommendFeed(GetRecommendFeedReq) returns (GetRecommendFeedResp);
 }

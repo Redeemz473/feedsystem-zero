@@ -285,12 +285,18 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 				l.Errorf("load tags for idempotent published video failed, video_id: %d, error: %v", existedVideo.ID, tagsErr)
 			}
 		}
+		if err := invalidateVideoEntityCache(l.ctx, l.svcCtx.RedisCli, existedVideo.ID); err != nil {
+			l.Errorf("invalidate video entity cache after idempotent publish failed, video_id: %d, error: %v", existedVideo.ID, err)
+		}
 		return &videopb.PublishVideoResp{
 			Msg:   "发布成功",
 			Video: toVideoInfo(&existedVideo, respTags, false),
 		}, nil
 	}
 
+	if err := invalidateVideoEntityCache(l.ctx, l.svcCtx.RedisCli, publishedVideo.ID); err != nil {
+		l.Errorf("invalidate video entity cache after publish failed, video_id: %d, error: %v", publishedVideo.ID, err)
+	}
 	return &videopb.PublishVideoResp{
 		Msg:   "发布成功",
 		Video: toVideoInfo(&publishedVideo, tags, false),

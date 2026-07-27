@@ -8,8 +8,11 @@ import (
 
 	"feedsystem-zero/apps/gateway/internal/svc"
 	"feedsystem-zero/apps/gateway/internal/types"
+	"feedsystem-zero/apps/social/socialclient"
 
 	"github.com/zeromicro/go-zero/core/logx"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type ListFollowersLogic struct {
@@ -27,22 +30,54 @@ func NewListFollowersLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Lis
 }
 
 func (l *ListFollowersLogic) ListFollowers(req *types.ListFollowersReq) (resp *types.ListFollowersResp, err error) {
-	// TODO: Gateway 在这里负责“关系数据 + 用户公开资料”的批量聚合。
-	//
-	// 1. viewerID := optionalUserIDFromCtx(l.ctx)。
-	// 2. 调 SocialRpc.ListFollowers，透传 user_id、viewer_id、双游标和 page_size。
-	// 3. 按 RPC 返回顺序收集每条关系的 follower_id，调用
-	//    AccountRpc.BatchGetProfiles 一次性补齐用户名、头像和简介。
-	// 4. 把 profiles 转成 map[userID]PublicProfile，再按关系原顺序组装
-	//    []types.FollowRelationInfo：
-	//    - Relationid = relation.RelationId
-	//    - User = follower_id 对应的公开资料
-	//    - Followedat = relation.FollowedAt
-	//    - Viewerisfollowing = relation.ViewerIsFollowing
-	//    不要在循环中逐个 GetProfile，避免 N+1 RPC。
-	// 5. 某个账号不存在时跳过该展示项，但下一页游标仍使用 Social RPC 返回值，
-	//    不能根据跳过后的切片重新计算，否则会造成分页重复。
-	// 6. 原样返回 next_cursor_updated_at、next_cursor_follow_id 和 has_more。
+	if req == nil || req.Userid == 0 {
+		return nil, status.Error(codes.InvalidArgument, "用户ID不能为空")
+	}
 
-	return
+	rpcResp, err := l.svcCtx.SocialRpc.ListFollowers(l.ctx, &socialclient.ListFollowersReq{
+		UserId:          req.Userid,
+		ViewerId:        optionalUserIDFromCtx(l.ctx),
+		CursorUpdatedAt: req.Cursorupdatedat,
+		CursorFollowId:  req.Cursorfollowid,
+		PageSize:        req.Pagesize,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	relations := rpcResp.GetFollowers()
+	userIDs := make([]uint64, 0, len(relations))
+	for _, relation := range relations {
+		if relation != nil {
+			userIDs = append(userIDs, relation.GetFollowerId())
+		}
+	}
+	profileMap, err := loadSocialUserInfoMap(l.ctx, l.svcCtx.AccountRpc, userIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	followers := make([]types.FollowRelationInfo, 0, len(relations))
+	for _, relation := range relations {
+		if relation == nil {
+			continue
+		}
+		profile, ok := profileMap[relation.GetFollowerId()]
+		if !ok {
+			continue
+		}
+		followers = append(followers, types.FollowRelationInfo{
+			Relationid:        relation.GetRelationId(),
+			User:              profile,
+			Followedat:        relation.GetFollowedAt(),
+			Viewerisfollowing: relation.GetViewerIsFollowing(),
+		})
+	}
+
+	return &types.ListFollowersResp{
+		Followers:           followers,
+		Nextcursorupdatedat: rpcResp.GetNextCursorUpdatedAt(),
+		Nextcursorfollowid:  rpcResp.GetNextCursorFollowId(),
+		Hasmore:             rpcResp.GetHasMore(),
+	}, nil
 }

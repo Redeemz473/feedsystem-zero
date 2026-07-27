@@ -8,8 +8,11 @@ import (
 
 	"feedsystem-zero/apps/gateway/internal/svc"
 	"feedsystem-zero/apps/gateway/internal/types"
+	"feedsystem-zero/apps/social/socialclient"
 
 	"github.com/zeromicro/go-zero/core/logx"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type FollowLogic struct {
@@ -27,14 +30,27 @@ func NewFollowLogic(ctx context.Context, svcCtx *svc.ServiceContext) *FollowLogi
 }
 
 func (l *FollowLogic) Follow(req *types.FollowReq) (resp *types.FollowResp, err error) {
-	// TODO: Gateway 这里只做身份可信转换和 RPC 转发，不直接操作 follows 表。
-	//
-	// 1. 调 userIDFromCtx(l.ctx) 取得 JWT 中的当前用户 ID。
-	// 2. 校验 req.Targetuserid 非 0；自己关注自己也可以在这里提前返回参数错误，
-	//    但 social-rpc 仍必须保留同样校验，防止内部调用绕过 gateway。
-	// 3. 调 SocialRpc.Follow：
-	//    follower_id=当前登录用户，following_id=req.Targetuserid。
-	// 4. 将 RPC 的 msg/followed 映射成 types.FollowResp 返回。
+	userID, err := userIDFromCtx(l.ctx)
+	if err != nil {
+		return nil, err
+	}
+	if req == nil || req.Targetuserid == 0 {
+		return nil, status.Error(codes.InvalidArgument, "目标用户不能为空")
+	}
+	if userID == req.Targetuserid {
+		return nil, status.Error(codes.InvalidArgument, "用户不能关注自己")
+	}
 
-	return
+	rpcResp, err := l.svcCtx.SocialRpc.Follow(l.ctx, &socialclient.FollowReq{
+		FollowerId:  userID,
+		FollowingId: req.Targetuserid,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &types.FollowResp{
+		Msg:      rpcResp.GetMsg(),
+		Followed: rpcResp.GetFollowed(),
+	}, nil
 }

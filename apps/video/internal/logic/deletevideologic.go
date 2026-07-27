@@ -169,6 +169,10 @@ func (l *DeleteVideoLogic) DeleteVideo(in *videopb.DeleteVideoReq) (*videopb.Del
 		return nil, status.Error(codes.Internal, "删除失败")
 	}
 
+	if err := invalidateVideoEntityCache(l.ctx, l.svcCtx.RedisCli, videoID); err != nil {
+		// MySQL 和 outbox 已经提交，缓存失败不能把删除操作伪装成失败；短 TTL 和下游删除事件会继续收敛。
+		l.Errorf("invalidate video entity cache after delete failed, video_id: %d, error: %v", videoID, err)
+	}
 	return &videopb.DeleteVideoResp{
 		Msg: "删除成功",
 	}, nil

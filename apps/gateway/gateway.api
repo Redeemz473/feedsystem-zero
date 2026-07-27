@@ -332,6 +332,30 @@ type (
 		Followerscount  int64 `json:"followers_count"`
 		Followingscount int64 `json:"followings_count"`
 	}
+	// 推荐流，允许游客访问。
+	GetRecommendFeedReq {
+		Cursorpublishedat int64  `form:"cursor_published_at,optional"`
+		Cursorvideoid     uint64 `form:"cursor_video_id,optional"`
+		Pagesize          int64  `form:"page_size,optional"`
+	}
+	GetRecommendFeedResp {
+		Videos                []VideoInfo `json:"videos"`
+		Nextcursorpublishedat int64       `json:"next_cursor_published_at"`
+		Nextcursorvideoid     uint64      `json:"next_cursor_video_id"`
+		Hasmore               bool        `json:"has_more"`
+	}
+	// 当前登录用户的关注流。
+	GetFollowingFeedReq {
+		Cursorpublishedat int64  `form:"cursor_published_at,optional"`
+		Cursorvideoid     uint64 `form:"cursor_video_id,optional"`
+		Pagesize          int64  `form:"page_size,optional"`
+	}
+	GetFollowingFeedResp {
+		Videos                []VideoInfo `json:"videos"`
+		Nextcursorpublishedat int64       `json:"next_cursor_published_at"`
+		Nextcursorvideoid     uint64      `json:"next_cursor_video_id"`
+		Hasmore               bool        `json:"has_more"`
+	}
 )
 
 @server (
@@ -476,4 +500,23 @@ service gateway {
 
 	@handler Unfollow
 	delete /users/:id/follow (UnfollowReq) returns (UnfollowResp)
+}
+
+@server (
+	prefix:     /feed
+	middleware: OptionalTokenAuth
+)
+service gateway {
+	@handler GetRecommendFeed
+	get /recommend (GetRecommendFeedReq) returns (GetRecommendFeedResp)
+}
+
+@server (
+	prefix:     /feed
+	jwt:        Auth
+	middleware: TokenAuth
+)
+service gateway {
+	@handler GetFollowingFeed
+	get /following (GetFollowingFeedReq) returns (GetFollowingFeedResp)
 }

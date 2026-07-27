@@ -71,6 +71,19 @@ type GetFollowStatsResp struct {
 	Followingscount int64 `json:"followings_count"`
 }
 
+type GetFollowingFeedReq struct {
+	Cursorpublishedat int64  `form:"cursor_published_at,optional"`
+	Cursorvideoid     uint64 `form:"cursor_video_id,optional"`
+	Pagesize          int64  `form:"page_size,optional"`
+}
+
+type GetFollowingFeedResp struct {
+	Videos                []VideoInfo `json:"videos"`
+	Nextcursorpublishedat int64       `json:"next_cursor_published_at"`
+	Nextcursorvideoid     uint64      `json:"next_cursor_video_id"`
+	Hasmore               bool        `json:"has_more"`
+}
+
 type GetProfileReq struct {
 }
 
@@ -80,6 +93,19 @@ type GetProfileResp struct {
 	Email     string `json:"email"`
 	Avatarurl string `json:"avatar_url"`
 	Bio       string `json:"bio"`
+}
+
+type GetRecommendFeedReq struct {
+	Cursorpublishedat int64  `form:"cursor_published_at,optional"`
+	Cursorvideoid     uint64 `form:"cursor_video_id,optional"`
+	Pagesize          int64  `form:"page_size,optional"`
+}
+
+type GetRecommendFeedResp struct {
+	Videos                []VideoInfo `json:"videos"`
+	Nextcursorpublishedat int64       `json:"next_cursor_published_at"`
+	Nextcursorvideoid     uint64      `json:"next_cursor_video_id"`
+	Hasmore               bool        `json:"has_more"`
 }
 
 type GetVideoReq struct {
