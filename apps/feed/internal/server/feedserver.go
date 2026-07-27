@@ -34,3 +34,9 @@ func (s *FeedServer) GetRecommendFeed(ctx context.Context, in *feed.GetRecommend
 	l := logic.NewGetRecommendFeedLogic(ctx, s.svcCtx)
 	return l.GetRecommendFeed(in)
 }
+
+// 热榜：按固定分钟快照读取最近时间窗口内的热门视频
+func (s *FeedServer) GetHotFeed(ctx context.Context, in *feed.GetHotFeedReq) (*feed.GetHotFeedResp, error) {
+	l := logic.NewGetHotFeedLogic(ctx, s.svcCtx)
+	return l.GetHotFeed(in)
+}

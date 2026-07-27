@@ -21,6 +21,15 @@ message FeedVideoItem {
   int64 published_at = 2; // Unix milliseconds，来自 Timeline member
 }
 
+// HotFeedVideoItem 是热榜候选项。
+// Feed RPC 只返回排序所需的 video_id、热度分和榜内排名；
+// 视频详情及当前访问者的点赞状态仍由 gateway 批量聚合。
+message HotFeedVideoItem {
+  uint64 video_id = 1;
+  double hot_score = 2;
+  int64 rank = 3; // 从 1 开始的榜内排名
+}
+
 // 关注流：读取 viewer 关注的所有作者的最新视频，按发布时间倒序分页。
 // 首次请求 cursor_published_at 传 0，表示从最新开始。
 // 后续请求使用上次返回的 next_cursor_published_at / next_cursor_video_id。
@@ -57,10 +66,31 @@ message GetRecommendFeedResp {
   bool has_more = 4;
 }
 
+// 热榜使用“分钟级快照 + offset”分页，不复用发布时间游标。
+// 首次请求 snapshot_at=0，由服务端选择当前分钟并返回实际快照时间；
+// 后续翻页必须携带同一个 snapshot_at，确保一次浏览期间榜单分页稳定。
+// snapshot_at 使用 Unix 秒，并由服务端规范化到分钟边界。
+// offset 首次为 0；page_size 默认 20，最大 50。
+message GetHotFeedReq {
+  uint64 viewer_id = 1;  // 0 表示未登录；预留给 gateway 聚合访问者状态
+  int64 snapshot_at = 2;
+  int64 offset = 3;
+  int64 page_size = 4;
+}
+
+message GetHotFeedResp {
+  repeated HotFeedVideoItem items = 1;
+  int64 snapshot_at = 2;
+  int64 next_offset = 3;
+  bool has_more = 4;
+}
+
 // Feed 服务
 service Feed {
   // 关注流：viewer 关注的所有作者的最新视频，按发布时间倒序
   rpc GetFollowingFeed(GetFollowingFeedReq) returns (GetFollowingFeedResp);
   // 推荐流：当前返回全局最新视频，未登录也可访问
   rpc GetRecommendFeed(GetRecommendFeedReq) returns (GetRecommendFeedResp);
+  // 热榜：按固定分钟快照读取最近时间窗口内的热门视频
+  rpc GetHotFeed(GetHotFeedReq) returns (GetHotFeedResp);
 }

@@ -17,14 +17,19 @@ type (
 	FeedVideoItem        = feed.FeedVideoItem
 	GetFollowingFeedReq  = feed.GetFollowingFeedReq
 	GetFollowingFeedResp = feed.GetFollowingFeedResp
+	GetHotFeedReq        = feed.GetHotFeedReq
+	GetHotFeedResp       = feed.GetHotFeedResp
 	GetRecommendFeedReq  = feed.GetRecommendFeedReq
 	GetRecommendFeedResp = feed.GetRecommendFeedResp
+	HotFeedVideoItem     = feed.HotFeedVideoItem
 
 	Feed interface {
 		// 关注流：viewer 关注的所有作者的最新视频，按发布时间倒序
 		GetFollowingFeed(ctx context.Context, in *GetFollowingFeedReq, opts ...grpc.CallOption) (*GetFollowingFeedResp, error)
 		// 推荐流：当前返回全局最新视频，未登录也可访问
 		GetRecommendFeed(ctx context.Context, in *GetRecommendFeedReq, opts ...grpc.CallOption) (*GetRecommendFeedResp, error)
+		// 热榜：按固定分钟快照读取最近时间窗口内的热门视频
+		GetHotFeed(ctx context.Context, in *GetHotFeedReq, opts ...grpc.CallOption) (*GetHotFeedResp, error)
 	}
 
 	defaultFeed struct {
@@ -48,4 +53,10 @@ func (m *defaultFeed) GetFollowingFeed(ctx context.Context, in *GetFollowingFeed
 func (m *defaultFeed) GetRecommendFeed(ctx context.Context, in *GetRecommendFeedReq, opts ...grpc.CallOption) (*GetRecommendFeedResp, error) {
 	client := feed.NewFeedClient(m.cli.Conn())
 	return client.GetRecommendFeed(ctx, in, opts...)
+}
+
+// 热榜：按固定分钟快照读取最近时间窗口内的热门视频
+func (m *defaultFeed) GetHotFeed(ctx context.Context, in *GetHotFeedReq, opts ...grpc.CallOption) (*GetHotFeedResp, error) {
+	client := feed.NewFeedClient(m.cli.Conn())
+	return client.GetHotFeed(ctx, in, opts...)
 }

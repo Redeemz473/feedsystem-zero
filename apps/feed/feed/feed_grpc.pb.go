@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             v7.35.1
-// source: feed.proto
+// source: apps/feed/feed.proto
 
 package feed
 
@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Feed_GetFollowingFeed_FullMethodName = "/feed.Feed/GetFollowingFeed"
 	Feed_GetRecommendFeed_FullMethodName = "/feed.Feed/GetRecommendFeed"
+	Feed_GetHotFeed_FullMethodName       = "/feed.Feed/GetHotFeed"
 )
 
 // FeedClient is the client API for Feed service.
@@ -33,6 +34,8 @@ type FeedClient interface {
 	GetFollowingFeed(ctx context.Context, in *GetFollowingFeedReq, opts ...grpc.CallOption) (*GetFollowingFeedResp, error)
 	// 推荐流：当前返回全局最新视频，未登录也可访问
 	GetRecommendFeed(ctx context.Context, in *GetRecommendFeedReq, opts ...grpc.CallOption) (*GetRecommendFeedResp, error)
+	// 热榜：按固定分钟快照读取最近时间窗口内的热门视频
+	GetHotFeed(ctx context.Context, in *GetHotFeedReq, opts ...grpc.CallOption) (*GetHotFeedResp, error)
 }
 
 type feedClient struct {
@@ -63,6 +66,16 @@ func (c *feedClient) GetRecommendFeed(ctx context.Context, in *GetRecommendFeedR
 	return out, nil
 }
 
+func (c *feedClient) GetHotFeed(ctx context.Context, in *GetHotFeedReq, opts ...grpc.CallOption) (*GetHotFeedResp, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetHotFeedResp)
+	err := c.cc.Invoke(ctx, Feed_GetHotFeed_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // FeedServer is the server API for Feed service.
 // All implementations must embed UnimplementedFeedServer
 // for forward compatibility.
@@ -73,6 +86,8 @@ type FeedServer interface {
 	GetFollowingFeed(context.Context, *GetFollowingFeedReq) (*GetFollowingFeedResp, error)
 	// 推荐流：当前返回全局最新视频，未登录也可访问
 	GetRecommendFeed(context.Context, *GetRecommendFeedReq) (*GetRecommendFeedResp, error)
+	// 热榜：按固定分钟快照读取最近时间窗口内的热门视频
+	GetHotFeed(context.Context, *GetHotFeedReq) (*GetHotFeedResp, error)
 	mustEmbedUnimplementedFeedServer()
 }
 
@@ -88,6 +103,9 @@ func (UnimplementedFeedServer) GetFollowingFeed(context.Context, *GetFollowingFe
 }
 func (UnimplementedFeedServer) GetRecommendFeed(context.Context, *GetRecommendFeedReq) (*GetRecommendFeedResp, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRecommendFeed not implemented")
+}
+func (UnimplementedFeedServer) GetHotFeed(context.Context, *GetHotFeedReq) (*GetHotFeedResp, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetHotFeed not implemented")
 }
 func (UnimplementedFeedServer) mustEmbedUnimplementedFeedServer() {}
 func (UnimplementedFeedServer) testEmbeddedByValue()              {}
@@ -146,6 +164,24 @@ func _Feed_GetRecommendFeed_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Feed_GetHotFeed_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetHotFeedReq)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FeedServer).GetHotFeed(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Feed_GetHotFeed_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FeedServer).GetHotFeed(ctx, req.(*GetHotFeedReq))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Feed_ServiceDesc is the grpc.ServiceDesc for Feed service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -161,7 +197,11 @@ var Feed_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "GetRecommendFeed",
 			Handler:    _Feed_GetRecommendFeed_Handler,
 		},
+		{
+			MethodName: "GetHotFeed",
+			Handler:    _Feed_GetHotFeed_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "feed.proto",
+	Metadata: "apps/feed/feed.proto",
 }

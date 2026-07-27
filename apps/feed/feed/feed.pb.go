@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v7.35.1
-// source: feed.proto
+// source: apps/feed/feed.proto
 
 package feed
 
@@ -34,7 +34,7 @@ type FeedVideoItem struct {
 
 func (x *FeedVideoItem) Reset() {
 	*x = FeedVideoItem{}
-	mi := &file_feed_proto_msgTypes[0]
+	mi := &file_apps_feed_feed_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -46,7 +46,7 @@ func (x *FeedVideoItem) String() string {
 func (*FeedVideoItem) ProtoMessage() {}
 
 func (x *FeedVideoItem) ProtoReflect() protoreflect.Message {
-	mi := &file_feed_proto_msgTypes[0]
+	mi := &file_apps_feed_feed_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -59,7 +59,7 @@ func (x *FeedVideoItem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FeedVideoItem.ProtoReflect.Descriptor instead.
 func (*FeedVideoItem) Descriptor() ([]byte, []int) {
-	return file_feed_proto_rawDescGZIP(), []int{0}
+	return file_apps_feed_feed_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *FeedVideoItem) GetVideoId() uint64 {
@@ -72,6 +72,69 @@ func (x *FeedVideoItem) GetVideoId() uint64 {
 func (x *FeedVideoItem) GetPublishedAt() int64 {
 	if x != nil {
 		return x.PublishedAt
+	}
+	return 0
+}
+
+// HotFeedVideoItem 是热榜候选项。
+// Feed RPC 只返回排序所需的 video_id、热度分和榜内排名；
+// 视频详情及当前访问者的点赞状态仍由 gateway 批量聚合。
+type HotFeedVideoItem struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	VideoId       uint64                 `protobuf:"varint,1,opt,name=video_id,json=videoId,proto3" json:"video_id,omitempty"`
+	HotScore      float64                `protobuf:"fixed64,2,opt,name=hot_score,json=hotScore,proto3" json:"hot_score,omitempty"`
+	Rank          int64                  `protobuf:"varint,3,opt,name=rank,proto3" json:"rank,omitempty"` // 从 1 开始的榜内排名
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HotFeedVideoItem) Reset() {
+	*x = HotFeedVideoItem{}
+	mi := &file_apps_feed_feed_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HotFeedVideoItem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HotFeedVideoItem) ProtoMessage() {}
+
+func (x *HotFeedVideoItem) ProtoReflect() protoreflect.Message {
+	mi := &file_apps_feed_feed_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HotFeedVideoItem.ProtoReflect.Descriptor instead.
+func (*HotFeedVideoItem) Descriptor() ([]byte, []int) {
+	return file_apps_feed_feed_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *HotFeedVideoItem) GetVideoId() uint64 {
+	if x != nil {
+		return x.VideoId
+	}
+	return 0
+}
+
+func (x *HotFeedVideoItem) GetHotScore() float64 {
+	if x != nil {
+		return x.HotScore
+	}
+	return 0
+}
+
+func (x *HotFeedVideoItem) GetRank() int64 {
+	if x != nil {
+		return x.Rank
 	}
 	return 0
 }
@@ -92,7 +155,7 @@ type GetFollowingFeedReq struct {
 
 func (x *GetFollowingFeedReq) Reset() {
 	*x = GetFollowingFeedReq{}
-	mi := &file_feed_proto_msgTypes[1]
+	mi := &file_apps_feed_feed_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -104,7 +167,7 @@ func (x *GetFollowingFeedReq) String() string {
 func (*GetFollowingFeedReq) ProtoMessage() {}
 
 func (x *GetFollowingFeedReq) ProtoReflect() protoreflect.Message {
-	mi := &file_feed_proto_msgTypes[1]
+	mi := &file_apps_feed_feed_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -117,7 +180,7 @@ func (x *GetFollowingFeedReq) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetFollowingFeedReq.ProtoReflect.Descriptor instead.
 func (*GetFollowingFeedReq) Descriptor() ([]byte, []int) {
-	return file_feed_proto_rawDescGZIP(), []int{1}
+	return file_apps_feed_feed_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *GetFollowingFeedReq) GetViewerId() uint64 {
@@ -160,7 +223,7 @@ type GetFollowingFeedResp struct {
 
 func (x *GetFollowingFeedResp) Reset() {
 	*x = GetFollowingFeedResp{}
-	mi := &file_feed_proto_msgTypes[2]
+	mi := &file_apps_feed_feed_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -172,7 +235,7 @@ func (x *GetFollowingFeedResp) String() string {
 func (*GetFollowingFeedResp) ProtoMessage() {}
 
 func (x *GetFollowingFeedResp) ProtoReflect() protoreflect.Message {
-	mi := &file_feed_proto_msgTypes[2]
+	mi := &file_apps_feed_feed_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -185,7 +248,7 @@ func (x *GetFollowingFeedResp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetFollowingFeedResp.ProtoReflect.Descriptor instead.
 func (*GetFollowingFeedResp) Descriptor() ([]byte, []int) {
-	return file_feed_proto_rawDescGZIP(), []int{2}
+	return file_apps_feed_feed_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *GetFollowingFeedResp) GetItems() []*FeedVideoItem {
@@ -232,7 +295,7 @@ type GetRecommendFeedReq struct {
 
 func (x *GetRecommendFeedReq) Reset() {
 	*x = GetRecommendFeedReq{}
-	mi := &file_feed_proto_msgTypes[3]
+	mi := &file_apps_feed_feed_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -244,7 +307,7 @@ func (x *GetRecommendFeedReq) String() string {
 func (*GetRecommendFeedReq) ProtoMessage() {}
 
 func (x *GetRecommendFeedReq) ProtoReflect() protoreflect.Message {
-	mi := &file_feed_proto_msgTypes[3]
+	mi := &file_apps_feed_feed_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -257,7 +320,7 @@ func (x *GetRecommendFeedReq) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRecommendFeedReq.ProtoReflect.Descriptor instead.
 func (*GetRecommendFeedReq) Descriptor() ([]byte, []int) {
-	return file_feed_proto_rawDescGZIP(), []int{3}
+	return file_apps_feed_feed_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *GetRecommendFeedReq) GetViewerId() uint64 {
@@ -300,7 +363,7 @@ type GetRecommendFeedResp struct {
 
 func (x *GetRecommendFeedResp) Reset() {
 	*x = GetRecommendFeedResp{}
-	mi := &file_feed_proto_msgTypes[4]
+	mi := &file_apps_feed_feed_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -312,7 +375,7 @@ func (x *GetRecommendFeedResp) String() string {
 func (*GetRecommendFeedResp) ProtoMessage() {}
 
 func (x *GetRecommendFeedResp) ProtoReflect() protoreflect.Message {
-	mi := &file_feed_proto_msgTypes[4]
+	mi := &file_apps_feed_feed_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -325,7 +388,7 @@ func (x *GetRecommendFeedResp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRecommendFeedResp.ProtoReflect.Descriptor instead.
 func (*GetRecommendFeedResp) Descriptor() ([]byte, []int) {
-	return file_feed_proto_rawDescGZIP(), []int{4}
+	return file_apps_feed_feed_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *GetRecommendFeedResp) GetItems() []*FeedVideoItem {
@@ -356,15 +419,159 @@ func (x *GetRecommendFeedResp) GetHasMore() bool {
 	return false
 }
 
-var File_feed_proto protoreflect.FileDescriptor
+// 热榜使用“分钟级快照 + offset”分页，不复用发布时间游标。
+// 首次请求 snapshot_at=0，由服务端选择当前分钟并返回实际快照时间；
+// 后续翻页必须携带同一个 snapshot_at，确保一次浏览期间榜单分页稳定。
+// snapshot_at 使用 Unix 秒，并由服务端规范化到分钟边界。
+// offset 首次为 0；page_size 默认 20，最大 50。
+type GetHotFeedReq struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ViewerId      uint64                 `protobuf:"varint,1,opt,name=viewer_id,json=viewerId,proto3" json:"viewer_id,omitempty"` // 0 表示未登录；预留给 gateway 聚合访问者状态
+	SnapshotAt    int64                  `protobuf:"varint,2,opt,name=snapshot_at,json=snapshotAt,proto3" json:"snapshot_at,omitempty"`
+	Offset        int64                  `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
+	PageSize      int64                  `protobuf:"varint,4,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
 
-const file_feed_proto_rawDesc = "" +
+func (x *GetHotFeedReq) Reset() {
+	*x = GetHotFeedReq{}
+	mi := &file_apps_feed_feed_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetHotFeedReq) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetHotFeedReq) ProtoMessage() {}
+
+func (x *GetHotFeedReq) ProtoReflect() protoreflect.Message {
+	mi := &file_apps_feed_feed_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetHotFeedReq.ProtoReflect.Descriptor instead.
+func (*GetHotFeedReq) Descriptor() ([]byte, []int) {
+	return file_apps_feed_feed_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *GetHotFeedReq) GetViewerId() uint64 {
+	if x != nil {
+		return x.ViewerId
+	}
+	return 0
+}
+
+func (x *GetHotFeedReq) GetSnapshotAt() int64 {
+	if x != nil {
+		return x.SnapshotAt
+	}
+	return 0
+}
+
+func (x *GetHotFeedReq) GetOffset() int64 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+func (x *GetHotFeedReq) GetPageSize() int64 {
+	if x != nil {
+		return x.PageSize
+	}
+	return 0
+}
+
+type GetHotFeedResp struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Items         []*HotFeedVideoItem    `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	SnapshotAt    int64                  `protobuf:"varint,2,opt,name=snapshot_at,json=snapshotAt,proto3" json:"snapshot_at,omitempty"`
+	NextOffset    int64                  `protobuf:"varint,3,opt,name=next_offset,json=nextOffset,proto3" json:"next_offset,omitempty"`
+	HasMore       bool                   `protobuf:"varint,4,opt,name=has_more,json=hasMore,proto3" json:"has_more,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetHotFeedResp) Reset() {
+	*x = GetHotFeedResp{}
+	mi := &file_apps_feed_feed_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetHotFeedResp) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetHotFeedResp) ProtoMessage() {}
+
+func (x *GetHotFeedResp) ProtoReflect() protoreflect.Message {
+	mi := &file_apps_feed_feed_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetHotFeedResp.ProtoReflect.Descriptor instead.
+func (*GetHotFeedResp) Descriptor() ([]byte, []int) {
+	return file_apps_feed_feed_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *GetHotFeedResp) GetItems() []*HotFeedVideoItem {
+	if x != nil {
+		return x.Items
+	}
+	return nil
+}
+
+func (x *GetHotFeedResp) GetSnapshotAt() int64 {
+	if x != nil {
+		return x.SnapshotAt
+	}
+	return 0
+}
+
+func (x *GetHotFeedResp) GetNextOffset() int64 {
+	if x != nil {
+		return x.NextOffset
+	}
+	return 0
+}
+
+func (x *GetHotFeedResp) GetHasMore() bool {
+	if x != nil {
+		return x.HasMore
+	}
+	return false
+}
+
+var File_apps_feed_feed_proto protoreflect.FileDescriptor
+
+const file_apps_feed_feed_proto_rawDesc = "" +
 	"\n" +
-	"\n" +
-	"feed.proto\x12\x04feed\"M\n" +
+	"\x14apps/feed/feed.proto\x12\x04feed\"M\n" +
 	"\rFeedVideoItem\x12\x19\n" +
 	"\bvideo_id\x18\x01 \x01(\x04R\avideoId\x12!\n" +
-	"\fpublished_at\x18\x02 \x01(\x03R\vpublishedAt\"\xa7\x01\n" +
+	"\fpublished_at\x18\x02 \x01(\x03R\vpublishedAt\"^\n" +
+	"\x10HotFeedVideoItem\x12\x19\n" +
+	"\bvideo_id\x18\x01 \x01(\x04R\avideoId\x12\x1b\n" +
+	"\thot_score\x18\x02 \x01(\x01R\bhotScore\x12\x12\n" +
+	"\x04rank\x18\x03 \x01(\x03R\x04rank\"\xa7\x01\n" +
 	"\x13GetFollowingFeedReq\x12\x1b\n" +
 	"\tviewer_id\x18\x01 \x01(\x04R\bviewerId\x12.\n" +
 	"\x13cursor_published_at\x18\x02 \x01(\x03R\x11cursorPublishedAt\x12&\n" +
@@ -384,65 +591,86 @@ const file_feed_proto_rawDesc = "" +
 	"\x05items\x18\x01 \x03(\v2\x13.feed.FeedVideoItemR\x05items\x127\n" +
 	"\x18next_cursor_published_at\x18\x02 \x01(\x03R\x15nextCursorPublishedAt\x12/\n" +
 	"\x14next_cursor_video_id\x18\x03 \x01(\x04R\x11nextCursorVideoId\x12\x19\n" +
-	"\bhas_more\x18\x04 \x01(\bR\ahasMore2\x9c\x01\n" +
+	"\bhas_more\x18\x04 \x01(\bR\ahasMore\"\x82\x01\n" +
+	"\rGetHotFeedReq\x12\x1b\n" +
+	"\tviewer_id\x18\x01 \x01(\x04R\bviewerId\x12\x1f\n" +
+	"\vsnapshot_at\x18\x02 \x01(\x03R\n" +
+	"snapshotAt\x12\x16\n" +
+	"\x06offset\x18\x03 \x01(\x03R\x06offset\x12\x1b\n" +
+	"\tpage_size\x18\x04 \x01(\x03R\bpageSize\"\x9b\x01\n" +
+	"\x0eGetHotFeedResp\x12,\n" +
+	"\x05items\x18\x01 \x03(\v2\x16.feed.HotFeedVideoItemR\x05items\x12\x1f\n" +
+	"\vsnapshot_at\x18\x02 \x01(\x03R\n" +
+	"snapshotAt\x12\x1f\n" +
+	"\vnext_offset\x18\x03 \x01(\x03R\n" +
+	"nextOffset\x12\x19\n" +
+	"\bhas_more\x18\x04 \x01(\bR\ahasMore2\xd5\x01\n" +
 	"\x04Feed\x12I\n" +
 	"\x10GetFollowingFeed\x12\x19.feed.GetFollowingFeedReq\x1a\x1a.feed.GetFollowingFeedResp\x12I\n" +
-	"\x10GetRecommendFeed\x12\x19.feed.GetRecommendFeedReq\x1a\x1a.feed.GetRecommendFeedRespB\bZ\x06./feedb\x06proto3"
+	"\x10GetRecommendFeed\x12\x19.feed.GetRecommendFeedReq\x1a\x1a.feed.GetRecommendFeedResp\x127\n" +
+	"\n" +
+	"GetHotFeed\x12\x13.feed.GetHotFeedReq\x1a\x14.feed.GetHotFeedRespB\bZ\x06./feedb\x06proto3"
 
 var (
-	file_feed_proto_rawDescOnce sync.Once
-	file_feed_proto_rawDescData []byte
+	file_apps_feed_feed_proto_rawDescOnce sync.Once
+	file_apps_feed_feed_proto_rawDescData []byte
 )
 
-func file_feed_proto_rawDescGZIP() []byte {
-	file_feed_proto_rawDescOnce.Do(func() {
-		file_feed_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_feed_proto_rawDesc), len(file_feed_proto_rawDesc)))
+func file_apps_feed_feed_proto_rawDescGZIP() []byte {
+	file_apps_feed_feed_proto_rawDescOnce.Do(func() {
+		file_apps_feed_feed_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_apps_feed_feed_proto_rawDesc), len(file_apps_feed_feed_proto_rawDesc)))
 	})
-	return file_feed_proto_rawDescData
+	return file_apps_feed_feed_proto_rawDescData
 }
 
-var file_feed_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
-var file_feed_proto_goTypes = []any{
+var file_apps_feed_feed_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_apps_feed_feed_proto_goTypes = []any{
 	(*FeedVideoItem)(nil),        // 0: feed.FeedVideoItem
-	(*GetFollowingFeedReq)(nil),  // 1: feed.GetFollowingFeedReq
-	(*GetFollowingFeedResp)(nil), // 2: feed.GetFollowingFeedResp
-	(*GetRecommendFeedReq)(nil),  // 3: feed.GetRecommendFeedReq
-	(*GetRecommendFeedResp)(nil), // 4: feed.GetRecommendFeedResp
+	(*HotFeedVideoItem)(nil),     // 1: feed.HotFeedVideoItem
+	(*GetFollowingFeedReq)(nil),  // 2: feed.GetFollowingFeedReq
+	(*GetFollowingFeedResp)(nil), // 3: feed.GetFollowingFeedResp
+	(*GetRecommendFeedReq)(nil),  // 4: feed.GetRecommendFeedReq
+	(*GetRecommendFeedResp)(nil), // 5: feed.GetRecommendFeedResp
+	(*GetHotFeedReq)(nil),        // 6: feed.GetHotFeedReq
+	(*GetHotFeedResp)(nil),       // 7: feed.GetHotFeedResp
 }
-var file_feed_proto_depIdxs = []int32{
+var file_apps_feed_feed_proto_depIdxs = []int32{
 	0, // 0: feed.GetFollowingFeedResp.items:type_name -> feed.FeedVideoItem
 	0, // 1: feed.GetRecommendFeedResp.items:type_name -> feed.FeedVideoItem
-	1, // 2: feed.Feed.GetFollowingFeed:input_type -> feed.GetFollowingFeedReq
-	3, // 3: feed.Feed.GetRecommendFeed:input_type -> feed.GetRecommendFeedReq
-	2, // 4: feed.Feed.GetFollowingFeed:output_type -> feed.GetFollowingFeedResp
-	4, // 5: feed.Feed.GetRecommendFeed:output_type -> feed.GetRecommendFeedResp
-	4, // [4:6] is the sub-list for method output_type
-	2, // [2:4] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	1, // 2: feed.GetHotFeedResp.items:type_name -> feed.HotFeedVideoItem
+	2, // 3: feed.Feed.GetFollowingFeed:input_type -> feed.GetFollowingFeedReq
+	4, // 4: feed.Feed.GetRecommendFeed:input_type -> feed.GetRecommendFeedReq
+	6, // 5: feed.Feed.GetHotFeed:input_type -> feed.GetHotFeedReq
+	3, // 6: feed.Feed.GetFollowingFeed:output_type -> feed.GetFollowingFeedResp
+	5, // 7: feed.Feed.GetRecommendFeed:output_type -> feed.GetRecommendFeedResp
+	7, // 8: feed.Feed.GetHotFeed:output_type -> feed.GetHotFeedResp
+	6, // [6:9] is the sub-list for method output_type
+	3, // [3:6] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
-func init() { file_feed_proto_init() }
-func file_feed_proto_init() {
-	if File_feed_proto != nil {
+func init() { file_apps_feed_feed_proto_init() }
+func file_apps_feed_feed_proto_init() {
+	if File_apps_feed_feed_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_feed_proto_rawDesc), len(file_feed_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_apps_feed_feed_proto_rawDesc), len(file_apps_feed_feed_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_feed_proto_goTypes,
-		DependencyIndexes: file_feed_proto_depIdxs,
-		MessageInfos:      file_feed_proto_msgTypes,
+		GoTypes:           file_apps_feed_feed_proto_goTypes,
+		DependencyIndexes: file_apps_feed_feed_proto_depIdxs,
+		MessageInfos:      file_apps_feed_feed_proto_msgTypes,
 	}.Build()
-	File_feed_proto = out.File
-	file_feed_proto_goTypes = nil
-	file_feed_proto_depIdxs = nil
+	File_apps_feed_feed_proto = out.File
+	file_apps_feed_feed_proto_goTypes = nil
+	file_apps_feed_feed_proto_depIdxs = nil
 }
