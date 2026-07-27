@@ -105,8 +105,14 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 	}
 
 	// 4. 对真正的新评论做短 TTL 限流。
+	//    锁 token 化：SetNX 用随机 token 而非固定 "1"，释放时通过 Lua CAS 只删自己写入的那把锁。
+	//    这样即便本次请求处理耗时超过 TTL、TTL 自动过期后被下一个请求 A 拿到，本次 defer 也不会误删 A 的锁。
 	rateLimitKey := rediskey.CommentRateLimitKey(userID, videoID)
-	locked, err := l.svcCtx.RedisCli.SetNX(l.ctx, rateLimitKey, "1", commentRateLimitTTL).Result()
+	rateLimitToken, err := randomHex(16)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "生成评论限流锁失败")
+	}
+	locked, err := l.svcCtx.RedisCli.SetNX(l.ctx, rateLimitKey, rateLimitToken, commentRateLimitTTL).Result()
 	if err != nil {
 		l.Errorf("set comment rate limit failed, user_id: %d, video_id: %d, error: %v", userID, videoID, err)
 		return nil, status.Error(codes.Internal, "评论限流校验失败")
@@ -121,7 +127,8 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 		}
 		redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
 		defer cancel()
-		if err := l.svcCtx.RedisCli.Del(redisCtx, rateLimitKey).Err(); err != nil {
+		// 使用与 like/unlike 相同的 CAS 释放逻辑，避免误删他人锁。
+		if err := releaseRedisLock(redisCtx, l.svcCtx.RedisCli, rateLimitKey, rateLimitToken); err != nil {
 			l.Errorf("release comment rate limit failed, key: %s, error: %v", rateLimitKey, err)
 		}
 	}()
