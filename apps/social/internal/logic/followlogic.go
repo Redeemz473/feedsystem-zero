@@ -154,7 +154,26 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 		if err != nil {
 			return err
 		}
-		return tx.Create(outboxEvent).Error
+		if err := tx.Create(outboxEvent).Error; err != nil {
+			return err
+		}
+
+		notificationEventID, err := newSocialEventID("notifyFollow")
+		if err != nil {
+			return err
+		}
+		notificationOutbox, err := buildFollowNotificationOutbox(
+			notificationEventID,
+			eventID,
+			followerID,
+			followingID,
+			eventx.FollowActionFollow,
+			now,
+		)
+		if err != nil {
+			return err
+		}
+		return tx.Create(notificationOutbox).Error
 	}); err != nil {
 		l.Errorf("follow transaction failed, follower_id: %d, following_id: %d, error: %v", followerID, followingID, err)
 		return nil, status.Error(codes.Internal, "关注失败")

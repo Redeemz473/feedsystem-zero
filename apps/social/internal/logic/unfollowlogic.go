@@ -115,7 +115,26 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 		if err != nil {
 			return err
 		}
-		return tx.Create(outboxEvent).Error
+		if err := tx.Create(outboxEvent).Error; err != nil {
+			return err
+		}
+
+		notificationEventID, err := newSocialEventID("notifyUnfollow")
+		if err != nil {
+			return err
+		}
+		notificationOutbox, err := buildFollowNotificationOutbox(
+			notificationEventID,
+			eventID,
+			followerID,
+			followingID,
+			eventx.FollowActionUnfollow,
+			now,
+		)
+		if err != nil {
+			return err
+		}
+		return tx.Create(notificationOutbox).Error
 	}); err != nil {
 		l.Errorf("unfollow transaction failed, follower_id: %d, following_id: %d, error: %v", followerID, followingID, err)
 		return nil, status.Error(codes.Internal, "取消关注失败")

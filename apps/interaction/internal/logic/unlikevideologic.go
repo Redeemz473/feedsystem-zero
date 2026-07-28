@@ -152,7 +152,29 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 		return nil, status.Error(codes.Internal, "序列化 outbox 事件失败")
 	}
 
-	// 5. MySQL 事务：先软删除点赞关系，再写 interaction_events 和 outbox_events。
+	var notificationOutbox *model.OutboxEvent
+	if video.AuthorID != userID {
+		notificationEventID, err := newEventID("notifyUnlike")
+		if err != nil {
+			return nil, status.Error(codes.Internal, "生成通知事件ID失败")
+		}
+		notificationOutbox, err = buildInteractionNotificationOutbox(
+			notificationEventID,
+			eventID,
+			video.AuthorID,
+			userID,
+			videoID,
+			0,
+			eventx.NotificationTypeVideoLike,
+			eventx.NotificationActionDelete,
+			now,
+		)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "构造取消点赞通知事件失败")
+		}
+	}
+
+	// 5. MySQL 事务：软删除点赞关系，并写 interaction、领域 outbox 和通知 outbox。
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&model.Like{}).
 			Where(
@@ -186,7 +208,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 			return err
 		}
 
-		return tx.Create(&model.OutboxEvent{
+		if err := tx.Create(&model.OutboxEvent{
 			EventID:       eventID,
 			Topic:         eventx.TopicInteractionLikeEvents,
 			EventType:     eventx.EventTypeLikeDeleted,
@@ -196,7 +218,13 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 			Status:        model.OutboxStatusPending,
 			CreatedAt:     now,
 			UpdatedAt:     now,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+		if notificationOutbox != nil {
+			return tx.Create(notificationOutbox).Error
+		}
+		return nil
 	}); err != nil {
 		if errors.Is(err, errNoActiveRecord) {
 			if err := fillUnlikedState(l.ctx, l.svcCtx.RedisCli, videoID, userID); err != nil {

@@ -294,6 +294,53 @@ func buildFollowOutboxEvent(eventID string, followerID uint64, followingID uint6
 	}, nil
 }
 
+// buildFollowNotificationOutbox 为关注关系创建或撤回通知。
+// aggregate_id 使用稳定业务键，保证同一对用户的 follow/unfollow 在 Kafka 内有序。
+func buildFollowNotificationOutbox(
+	notificationEventID string,
+	sourceEventID string,
+	followerID uint64,
+	followingID uint64,
+	action string,
+	occurredAt time.Time,
+) (*model.OutboxEvent, error) {
+	notificationAction := eventx.NotificationActionCreate
+	eventType := eventx.EventTypeNotificationCreate
+	switch action {
+	case eventx.FollowActionFollow:
+	case eventx.FollowActionUnfollow:
+		notificationAction = eventx.NotificationActionDelete
+		eventType = eventx.EventTypeNotificationDelete
+	default:
+		return nil, status.Error(codes.InvalidArgument, "不支持的关注通知动作")
+	}
+
+	notificationEvent := eventx.NotificationEvent{
+		EventID:          notificationEventID,
+		SourceEventID:    sourceEventID,
+		ReceiverID:       followingID,
+		ActorID:          followerID,
+		NotificationType: eventx.NotificationTypeFollow,
+		Action:           notificationAction,
+		OccurredAt:       occurredAt.UnixMilli(),
+	}
+	envelope, aggregateID, err := eventx.BuildNotificationEnvelope(notificationEvent, "social-rpc")
+	if err != nil {
+		return nil, status.Error(codes.Internal, "序列化关注通知事件失败")
+	}
+	return &model.OutboxEvent{
+		EventID:       notificationEventID,
+		Topic:         eventx.TopicNotificationEvents,
+		EventType:     eventType,
+		AggregateType: eventx.AggregateNotification,
+		AggregateID:   aggregateID,
+		Payload:       string(envelope),
+		Status:        model.OutboxStatusPending,
+		CreatedAt:     occurredAt,
+		UpdatedAt:     occurredAt,
+	}, nil
+}
+
 // applyFollowCacheAfterCommit 只能在 MySQL 事务提交成功后调用。
 // 无论是否发生状态变化，都用 MySQL 已确认的最终状态覆盖单条关系缓存。
 // 只有 stateChanged=true 时才递增统计与列表版本，避免幂等重试反复制造缓存失效。

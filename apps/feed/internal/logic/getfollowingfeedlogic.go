@@ -5,8 +5,11 @@ import (
 
 	"feedsystem-zero/apps/feed/feed"
 	"feedsystem-zero/apps/feed/internal/svc"
+	"feedsystem-zero/common/rediskey"
 
 	"github.com/zeromicro/go-zero/core/logx"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type GetFollowingFeedLogic struct {
@@ -25,17 +28,66 @@ func NewGetFollowingFeedLogic(ctx context.Context, svcCtx *svc.ServiceContext) *
 
 // 关注流：viewer 关注的所有作者的最新视频，按发布时间倒序
 func (l *GetFollowingFeedLogic) GetFollowingFeed(in *feed.GetFollowingFeedReq) (*feed.GetFollowingFeedResp, error) {
-	// 你只需要在这里完成以下编排，底层 Redis/MySQL/并发构建能力已经在 feedhelper.go：
-	//  1. 校验 viewer_id>0。该值必须由 gateway 从 JWT 解析后填入，不能信任前端用户ID；
-	//  2. 调用 validateFeedCursor 校验两个游标必须同时为空或同时有效；
-	//  3. 调用 normalizeFeedPageSize 得到默认20、最大50的 pageSize；
-	//  4. 调用 ensureFollowingTimeline。首次访问或 Timeline 过期时，它会通过分布式锁
-	//     从 MySQL 的 follows+videos 构建完整快照，并用版本号处理与 Kafka fanout 的并发；
-	//  5. 调用 loadTimelinePage，key 使用 rediskey.FeedTimelineKey(viewerID)；
-	//  6. 读取成功后调用 refreshFollowingTimelineTTL，为活跃用户延长 Timeline、Ready和Version；
-	//  7. 把 page.Items、page.HasMore 和最后一项的复合游标写入响应；空列表正常返回，
-	//     是否降级到推荐流应由 gateway 决定，Feed RPC 不要偷偷混入推荐视频；
-	//  8. 底层错误要记录 viewer_id 与游标，对外返回稳定的 gRPC 状态码。
+	viewerID := in.GetViewerId()
+	if viewerID == 0 {
+		return nil, status.Error(codes.Unauthenticated, "用户未登录")
+	}
 
-	return &feed.GetFollowingFeedResp{}, nil
+	cursorPublishedAt := in.GetCursorPublishedAt()
+	cursorVideoID := in.GetCursorVideoId()
+	if err := validateFeedCursor(cursorPublishedAt, cursorVideoID); err != nil {
+		return nil, err
+	}
+	pageSize := normalizeFeedPageSize(l.svcCtx, in.GetPageSize())
+
+	// 用户首次访问或 Timeline 过期时，通过本地 SingleFlight 和 Redis 分布式锁
+	// 从 MySQL 的 follows + videos 构建快照，并用版本号避免覆盖并发写入。
+	if err := ensureFollowingTimeline(l.ctx, l.svcCtx, viewerID); err != nil {
+		l.Errorf(
+			"ensure following timeline failed, viewer_id:%d cursor_published_at:%d cursor_video_id:%d error:%v",
+			viewerID,
+			cursorPublishedAt,
+			cursorVideoID,
+			err,
+		)
+		return nil, err
+	}
+
+	page, err := loadTimelinePage(
+		l.ctx,
+		l.svcCtx,
+		rediskey.FeedTimelineKey(viewerID),
+		cursorPublishedAt,
+		cursorVideoID,
+		pageSize,
+	)
+	if err != nil {
+		l.Errorf(
+			"load following feed failed, viewer_id:%d cursor_published_at:%d cursor_video_id:%d page_size:%d error:%v",
+			viewerID,
+			cursorPublishedAt,
+			cursorVideoID,
+			pageSize,
+			err,
+		)
+		if status.Code(err) == codes.InvalidArgument {
+			return nil, err
+		}
+		return nil, status.Error(codes.Unavailable, "关注流暂时不可用，请稍后重试")
+	}
+
+	// TTL续期
+	refreshFollowingTimelineTTL(l.ctx, l.svcCtx, viewerID)
+
+	resp := &feed.GetFollowingFeedResp{
+		Items:   page.Items,
+		HasMore: page.HasMore,
+	}
+	if len(page.Items) > 0 {
+		lastItem := page.Items[len(page.Items)-1]
+		resp.NextCursorPublishedAt = lastItem.GetPublishedAt()
+		resp.NextCursorVideoId = lastItem.GetVideoId()
+	}
+
+	return resp, nil
 }

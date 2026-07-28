@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package notification;
+
+option go_package = "./notification";
+
+enum NotificationType {
+  NOTIFICATION_TYPE_UNSPECIFIED = 0;
+  NOTIFICATION_TYPE_VIDEO_LIKE = 1;
+  NOTIFICATION_TYPE_VIDEO_COMMENT = 2;
+  NOTIFICATION_TYPE_FOLLOW = 3;
+}
+
+enum NotificationStatus {
+  NOTIFICATION_STATUS_UNSPECIFIED = 0;
+  NOTIFICATION_STATUS_UNREAD = 1;
+  NOTIFICATION_STATUS_READ = 2;
+}
+
+// NotificationInfo 只返回通知关系数据。
+// actor 用户资料、视频标题等展示信息由 gateway 批量聚合，避免 Notification RPC 产生 N+1 调用。
+message NotificationInfo {
+  uint64 notification_id = 1;
+  uint64 actor_id = 2;
+  NotificationType notification_type = 3;
+  uint64 video_id = 4;
+  uint64 comment_id = 5;
+  NotificationStatus status = 6;
+  int64 occurred_at = 7; // Unix milliseconds
+  int64 read_at = 8;     // Unix milliseconds，未读时为 0
+}
+
+// receiver_id 必须由 gateway 从 JWT 解析后填入，不能信任前端传入的用户 ID。
+// 使用 occurred_at + notification_id 复合游标，保证同毫秒通知稳定翻页。
+message ListNotificationsReq {
+  uint64 receiver_id = 1;
+  int64 cursor_occurred_at = 2;
+  uint64 cursor_notification_id = 3;
+  int64 page_size = 4;
+}
+
+message ListNotificationsResp {
+  repeated NotificationInfo notifications = 1;
+  int64 next_cursor_occurred_at = 2;
+  uint64 next_cursor_notification_id = 3;
+  bool has_more = 4;
+}
+
+message GetUnreadCountReq {
+  uint64 receiver_id = 1;
+}
+
+message GetUnreadCountResp {
+  int64 unread_count = 1;
+}
+
+message MarkNotificationReadReq {
+  uint64 receiver_id = 1;
+  uint64 notification_id = 2;
+}
+
+message MarkNotificationReadResp {
+  bool changed = 1;
+}
+
+message MarkAllNotificationsReadReq {
+  uint64 receiver_id = 1;
+}
+
+message MarkAllNotificationsReadResp {
+  int64 changed_count = 1;
+}
+
+service Notification {
+  rpc ListNotifications(ListNotificationsReq) returns (ListNotificationsResp);
+  rpc GetUnreadCount(GetUnreadCountReq) returns (GetUnreadCountResp);
+  rpc MarkNotificationRead(MarkNotificationReadReq) returns (MarkNotificationReadResp);
+  rpc MarkAllNotificationsRead(MarkAllNotificationsReadReq) returns (MarkAllNotificationsReadResp);
+}

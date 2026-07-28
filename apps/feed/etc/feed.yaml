@@ -23,3 +23,16 @@ Timeline:
   BuildWaitMs: 1500
   RedisOpTimeoutMs: 1000
   DBQueryTimeoutMs: 3000
+
+HotRank:
+  # 聚合最近 60 个 UTC 分钟窗口，越早的窗口按 30 分钟半衰期衰减。
+  WindowMinutes: 60
+  MaxRankSize: 1000
+  DecayHalfLifeMinutes: 30
+  # 快照最多保留、回看 30 分钟；配合 job 的 2 小时窗口保留时间使用。
+  SnapshotTTLSeconds: 1800
+  MaxSnapshotAgeSeconds: 1800
+  BuildLockTTLSeconds: 10
+  BuildWaitMs: 1200
+  RedisOpTimeoutMs: 1000
+  FutureToleranceSeconds: 300

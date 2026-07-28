@@ -73,6 +73,30 @@ func (l *DeleteCommentLogic) DeleteComment(in *interaction.DeleteCommentReq) (*i
 	}
 
 	now := time.Now()
+	var notificationOutbox *model.OutboxEvent
+	// 删除动作的 actor 必须使用原评论作者，而不是当前执行删除的人。
+	// 视频作者代删他人评论时，才能准确撤回原评论通知的 business_key。
+	if video.AuthorID != comment.UserID {
+		notificationEventID, err := newEventID("notifyDeleteComment")
+		if err != nil {
+			return nil, status.Error(codes.Internal, "生成通知事件ID失败")
+		}
+		notificationOutbox, err = buildInteractionNotificationOutbox(
+			notificationEventID,
+			eventID,
+			video.AuthorID,
+			comment.UserID,
+			comment.VideoID,
+			comment.ID,
+			eventx.NotificationTypeVideoComment,
+			eventx.NotificationActionDelete,
+			now,
+		)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "构造删除评论通知事件失败")
+		}
+	}
+
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&model.Comment{}).
 			Where("id = ? AND status = ? AND deleted_at IS NULL", comment.ID, model.CommentStatusNormal).
@@ -135,7 +159,7 @@ func (l *DeleteCommentLogic) DeleteComment(in *interaction.DeleteCommentReq) (*i
 			return err
 		}
 
-		return tx.Create(&model.OutboxEvent{
+		if err := tx.Create(&model.OutboxEvent{
 			EventID:       eventID,
 			Topic:         eventx.TopicInteractionCommentEvents,
 			EventType:     eventx.EventTypeCommentDeleted,
@@ -145,7 +169,13 @@ func (l *DeleteCommentLogic) DeleteComment(in *interaction.DeleteCommentReq) (*i
 			Status:        model.OutboxStatusPending,
 			CreatedAt:     now,
 			UpdatedAt:     now,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+		if notificationOutbox != nil {
+			return tx.Create(notificationOutbox).Error
+		}
+		return nil
 	}); err != nil {
 		if errors.Is(err, errNoActiveRecord) {
 			return &interaction.DeleteCommentResp{

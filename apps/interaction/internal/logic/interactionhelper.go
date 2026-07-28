@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"feedsystem-zero/apps/interaction/internal/model"
+	"feedsystem-zero/common/eventx"
 	"feedsystem-zero/common/rediskey"
 
 	"github.com/redis/go-redis/v9"
@@ -20,8 +21,8 @@ const (
 	likeActionLockTTL       = 3 * time.Second
 	likeStateTTL            = 7 * 24 * time.Hour
 	commentIdempotencyTTL   = 24 * time.Hour
-	likePopularityWeight    = 3
-	commentPopularityWeight = 5
+	likePopularityWeight    = eventx.LikePopularityWeight
+	commentPopularityWeight = eventx.CommentPopularityWeight
 )
 
 func randomHex(n int) (string, error) {
@@ -38,6 +39,53 @@ func newEventID(prefix string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%s_%d_%s", prefix, time.Now().UnixNano(), token), nil
+}
+
+// buildInteractionNotificationOutbox 构造专用通知事件。
+// sourceEventID 指向同一事务里的点赞/评论领域事件，notificationEventID 则作为
+// notification-job 的独立消费幂等 ID，二者不能复用。
+func buildInteractionNotificationOutbox(
+	notificationEventID string,
+	sourceEventID string,
+	receiverID uint64,
+	actorID uint64,
+	videoID uint64,
+	commentID uint64,
+	notificationType string,
+	action string,
+	occurredAt time.Time,
+) (*model.OutboxEvent, error) {
+	notificationEvent := eventx.NotificationEvent{
+		EventID:          notificationEventID,
+		SourceEventID:    sourceEventID,
+		ReceiverID:       receiverID,
+		ActorID:          actorID,
+		VideoID:          videoID,
+		CommentID:        commentID,
+		NotificationType: notificationType,
+		Action:           action,
+		OccurredAt:       occurredAt.UnixMilli(),
+	}
+	envelope, aggregateID, err := eventx.BuildNotificationEnvelope(notificationEvent, "interaction-rpc")
+	if err != nil {
+		return nil, err
+	}
+
+	eventType := eventx.EventTypeNotificationCreate
+	if action == eventx.NotificationActionDelete {
+		eventType = eventx.EventTypeNotificationDelete
+	}
+	return &model.OutboxEvent{
+		EventID:       notificationEventID,
+		Topic:         eventx.TopicNotificationEvents,
+		EventType:     eventType,
+		AggregateType: eventx.AggregateNotification,
+		AggregateID:   aggregateID,
+		Payload:       string(envelope),
+		Status:        model.OutboxStatusPending,
+		CreatedAt:     occurredAt,
+		UpdatedAt:     occurredAt,
+	}, nil
 }
 
 func releaseRedisLock(ctx context.Context, redisCli *redis.Client, lockKey string, lockToken string) error {

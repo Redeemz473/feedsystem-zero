@@ -14,6 +14,7 @@ const (
 
 	EventTypeVideoStatDelta     = "video.stat.delta"
 	EventTypeNotificationCreate = "notification.create"
+	EventTypeNotificationDelete = "notification.delete"
 
 	EventTypeFollowCreated = "follow.created"
 	EventTypeFollowDeleted = "follow.deleted"
@@ -36,6 +37,22 @@ const (
 
 	FollowActionFollow   = "follow"
 	FollowActionUnfollow = "unfollow"
+
+	NotificationActionCreate = "create"
+	NotificationActionDelete = "delete"
+)
+
+const (
+	NotificationTypeVideoLike    = "video_like"
+	NotificationTypeVideoComment = "video_comment"
+	NotificationTypeFollow       = "follow"
+)
+
+// 热度权重是 interaction 在线统计与 hotrank-job 的共同业务口径。
+// 修改权重时必须保持两条链路一致，避免实时统计和时间窗口榜单产生偏差。
+const (
+	LikePopularityWeight    int64 = 3
+	CommentPopularityWeight int64 = 5
 )
 
 type Envelope struct {
@@ -91,14 +108,15 @@ type FeedVideoEvent struct {
 }
 
 type NotificationEvent struct {
-	EventID        string `json:"event_id"`
-	ReceiverID     uint64 `json:"receiver_id"`
-	ActorID        uint64 `json:"actor_id"`
-	VideoID        uint64 `json:"video_id,omitempty"`
-	CommentID      uint64 `json:"comment_id,omitempty"`
-	NotificationTy string `json:"notification_type"`
-	OccurredAt     int64  `json:"occurred_at"`
-	SourceEventID  string `json:"source_event_id,omitempty"`
+	EventID          string `json:"event_id"`
+	SourceEventID    string `json:"source_event_id"`
+	ReceiverID       uint64 `json:"receiver_id"`
+	ActorID          uint64 `json:"actor_id"`
+	VideoID          uint64 `json:"video_id,omitempty"`
+	CommentID        uint64 `json:"comment_id,omitempty"`
+	NotificationType string `json:"notification_type"`
+	Action           string `json:"action"`
+	OccurredAt       int64  `json:"occurred_at"`
 }
 
 // FollowEvent 单向关注关系事件（关注/取关）。

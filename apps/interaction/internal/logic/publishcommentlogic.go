@@ -137,8 +137,15 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 	if err != nil {
 		return nil, status.Error(codes.Internal, "生成事件ID失败")
 	}
+	notificationEventID := ""
+	if video.AuthorID != userID {
+		notificationEventID, err = newEventID("notifyComment")
+		if err != nil {
+			return nil, status.Error(codes.Internal, "生成通知事件ID失败")
+		}
+	}
 
-	// 5. MySQL 事务：评论、互动事件、outbox 事件必须一起提交。
+	// 5. MySQL 事务：评论、互动事件、领域 outbox 与通知 outbox 必须一起提交。
 	now := time.Now()
 	comment := model.Comment{
 		VideoID:   videoID,
@@ -197,7 +204,7 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 			return err
 		}
 
-		return tx.Create(&model.OutboxEvent{
+		if err := tx.Create(&model.OutboxEvent{
 			EventID:       eventID,
 			Topic:         eventx.TopicInteractionCommentEvents,
 			EventType:     eventx.EventTypeCommentCreated,
@@ -207,7 +214,28 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 			Status:        model.OutboxStatusPending,
 			CreatedAt:     now,
 			UpdatedAt:     now,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+
+		if notificationEventID != "" {
+			notificationOutbox, err := buildInteractionNotificationOutbox(
+				notificationEventID,
+				eventID,
+				video.AuthorID,
+				userID,
+				videoID,
+				comment.ID,
+				eventx.NotificationTypeVideoComment,
+				eventx.NotificationActionCreate,
+				now,
+			)
+			if err != nil {
+				return err
+			}
+			return tx.Create(notificationOutbox).Error
+		}
+		return nil
 	}); err != nil {
 		if isDuplicateCommentRequest(err) {
 			if resp, ok, loadErr := l.loadIdempotentCommentResp(userID, requestID); loadErr == nil && ok {

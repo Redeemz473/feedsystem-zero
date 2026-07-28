@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -36,6 +37,22 @@ const (
 	timelineTempWriteBatchSize       = 500
 	timelineReadBatchSize      int64 = 64
 	buildWaitPollInterval            = 50 * time.Millisecond
+)
+
+const (
+	defaultHotRankWindowMinutes        int64 = 60
+	maxHotRankWindowMinutes            int64 = 1440
+	defaultHotRankMaxSize              int64 = 1000
+	maxHotRankMaxSize                  int64 = 10000
+	defaultHotRankDecayHalfLifeMinutes int64 = 30
+	defaultHotRankSnapshotTTL                = 30 * time.Minute
+	defaultHotRankMaxSnapshotAge             = 30 * time.Minute
+	defaultHotRankBuildLockTTL               = 10 * time.Second
+	defaultHotRankBuildWait                  = 1200 * time.Millisecond
+	defaultHotRankRedisTimeout               = time.Second
+	defaultHotRankFutureTolerance            = 5 * time.Minute
+	hotRankReadBatchSize               int64 = 64
+	hotRankMinuteLayout                      = "200601021504"
 )
 
 const replaceTimelineIfVersionMatchScript = `
@@ -73,10 +90,42 @@ end
 return 0
 `
 
+// promoteHotRankSnapshotScript 只有在构建者仍持有分布式锁时，才允许用临时
+// ZSet 替换正式快照。ready 保存实际成员数，因此空榜也能被识别为已成功构建。
+const promoteHotRankSnapshotScript = `
+if redis.call("GET", KEYS[3]) ~= ARGV[1] then
+    redis.call("DEL", KEYS[4])
+    return 0
+end
+
+redis.call("DEL", KEYS[1])
+local size = 0
+if redis.call("EXISTS", KEYS[4]) == 1 then
+    redis.call("RENAME", KEYS[4], KEYS[1])
+    size = redis.call("ZCARD", KEYS[1])
+end
+
+local ttl = tonumber(ARGV[2])
+if not ttl or ttl <= 0 then
+    return redis.error_reply("invalid hot rank snapshot ttl")
+end
+if size > 0 then
+    redis.call("EXPIRE", KEYS[1], ttl)
+end
+redis.call("SET", KEYS[2], tostring(size), "EX", ttl)
+return 1
+`
+
 var timelineBuildGroup = syncx.NewSingleFlight()
+var hotRankSnapshotBuildGroup = syncx.NewSingleFlight()
 
 type timelinePage struct {
 	Items   []*feed.FeedVideoItem
+	HasMore bool
+}
+
+type hotRankPage struct {
+	Items   []*feed.HotFeedVideoItem
 	HasMore bool
 }
 
@@ -195,9 +244,8 @@ func loadTimelinePage(
 	return timelinePage{Items: items, HasMore: hasMore}, nil
 }
 
-// ensureGlobalTimeline 只等待 Job 完成全局 Timeline 的 bootstrap，不再抢锁自建。
-// 全局 Timeline 的单点建设由 apps/job/feed_timeline 负责，避免 rpc 与 job 争抢同一把
-// 构建锁导致互相等待失败。
+// ensureGlobalTimeline 等待 Job 完成全局 Timeline 的 bootstrap，不再抢锁自建。
+// 全局 Timeline 的单点建设由 apps/job/feed_timeline 负责，避免 rpc 与 job 争抢同一把构建锁导致互相等待失败。
 func ensureGlobalTimeline(ctx context.Context, svcCtx *svc.ServiceContext) error {
 	return ensureTimeline(
 		ctx,
@@ -545,4 +593,498 @@ func feedDBTimeout(svcCtx *svc.ServiceContext) time.Duration {
 		return defaultFeedDBTimeout
 	}
 	return time.Duration(milliseconds) * time.Millisecond
+}
+
+type hotFeedQuery struct {
+	SnapshotAt int64
+	Offset     int64
+	PageSize   int64
+}
+
+// normalizeHotFeedQuery 一次性规范热榜的快照和分页参数，避免 Logic 漏掉
+// “非首页必须携带 snapshot_at”这条稳定分页约束。
+func normalizeHotFeedQuery(
+	svcCtx *svc.ServiceContext,
+	requestedSnapshotAt int64,
+	offset int64,
+	pageSize int64,
+) (hotFeedQuery, error) {
+	return normalizeHotFeedQueryAt(svcCtx, requestedSnapshotAt, offset, pageSize, time.Now())
+}
+
+func normalizeHotFeedQueryAt(
+	svcCtx *svc.ServiceContext,
+	requestedSnapshotAt int64,
+	offset int64,
+	pageSize int64,
+	now time.Time,
+) (hotFeedQuery, error) {
+	if offset < 0 {
+		return hotFeedQuery{}, status.Error(codes.InvalidArgument, "热榜offset不能为负数")
+	}
+	if offset > hotRankMaxSize(svcCtx) {
+		return hotFeedQuery{}, status.Error(codes.InvalidArgument, "热榜offset超出可查询范围")
+	}
+	if offset > 0 && requestedSnapshotAt == 0 {
+		return hotFeedQuery{}, status.Error(codes.InvalidArgument, "热榜翻页必须携带首次响应的snapshot_at")
+	}
+
+	snapshotAt, err := normalizeHotFeedSnapshotAt(svcCtx, requestedSnapshotAt, now)
+	if err != nil {
+		return hotFeedQuery{}, err
+	}
+	return hotFeedQuery{
+		SnapshotAt: snapshotAt,
+		Offset:     offset,
+		PageSize:   normalizeFeedPageSize(svcCtx, pageSize),
+	}, nil
+}
+
+func normalizeHotFeedSnapshotAt(
+	svcCtx *svc.ServiceContext,
+	requestedSnapshotAt int64,
+	now time.Time,
+) (int64, error) {
+	now = now.UTC()
+	currentMinute := now.Truncate(time.Minute)
+	if requestedSnapshotAt == 0 {
+		return currentMinute.Unix(), nil
+	}
+	if requestedSnapshotAt < 0 {
+		return 0, status.Error(codes.InvalidArgument, "热榜snapshot_at不能为负数")
+	}
+
+	requested := time.Unix(requestedSnapshotAt, 0).UTC()
+	if requested.After(now.Add(hotRankFutureTolerance(svcCtx))) {
+		return 0, status.Error(codes.InvalidArgument, "热榜snapshot_at不能晚于当前时间")
+	}
+
+	snapshot := requested.Truncate(time.Minute)
+	// 客户端时钟轻微超前时固定到服务端当前分钟，不创建未来快照。
+	if snapshot.After(currentMinute) {
+		snapshot = currentMinute
+	}
+	if currentMinute.Sub(snapshot) > hotRankMaxSnapshotAge(svcCtx) {
+		return 0, status.Error(codes.InvalidArgument, "热榜快照已过期，请从首页重新获取")
+	}
+	return snapshot.Unix(), nil
+}
+
+// ensureHotRankSnapshot 保证 snapshot_at 对应的聚合榜已经构建。
+// 同进程用 SingleFlight 合并请求，多实例用 Redis 锁只允许一个构建者。
+// 只有 offset=0 的首页允许创建快照；翻页时快照若已丢失必须重新从首页开始，
+// 不能用相同 snapshot_at 重新计算一份可能已经变化的榜单。
+func ensureHotRankSnapshot(
+	ctx context.Context,
+	svcCtx *svc.ServiceContext,
+	snapshotAt int64,
+	offset int64,
+) error {
+	asOf := hotRankSnapshotAsOf(snapshotAt)
+	readyKey := rediskey.HotVideoMergeReadyKey(asOf)
+	snapshotKey := rediskey.HotVideoMergeKey(asOf)
+
+	ready, err := hotRankSnapshotReady(ctx, svcCtx, readyKey, snapshotKey)
+	if err != nil {
+		logx.WithContext(ctx).Errorf("check hot rank snapshot ready failed, as_of:%s error:%v", asOf, err)
+		return status.Error(codes.Unavailable, "热榜缓存暂时不可用")
+	}
+	if ready {
+		return nil
+	}
+	if offset > 0 {
+		return status.Error(codes.FailedPrecondition, "热榜快照已失效，请从首页重新获取")
+	}
+
+	_, err = hotRankSnapshotBuildGroup.Do("hotrank:"+asOf, func() (any, error) {
+		ready, err := hotRankSnapshotReady(ctx, svcCtx, readyKey, snapshotKey)
+		if err != nil || ready {
+			return nil, err
+		}
+
+		lockKey := rediskey.HotVideoMergeBuildLockKey(asOf)
+		lockToken, locked, err := acquireHotRankSnapshotBuildLock(ctx, svcCtx, lockKey)
+		if err != nil {
+			return nil, err
+		}
+		if !locked {
+			return nil, waitHotRankSnapshotReady(ctx, svcCtx, readyKey, snapshotKey)
+		}
+		defer releaseHotRankSnapshotBuildLock(ctx, svcCtx, lockKey, lockToken)
+
+		// 拿锁前可能已有其他构建者刚完成，再检查一次可避免重复 ZUNIONSTORE。
+		ready, err = hotRankSnapshotReady(ctx, svcCtx, readyKey, snapshotKey)
+		if err != nil || ready {
+			return nil, err
+		}
+
+		applied, err := buildHotRankSnapshot(
+			ctx,
+			svcCtx,
+			time.Unix(snapshotAt, 0).UTC(),
+			asOf,
+			lockKey,
+			lockToken,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !applied {
+			return nil, waitHotRankSnapshotReady(ctx, svcCtx, readyKey, snapshotKey)
+		}
+		return nil, nil
+	})
+	if err != nil {
+		logx.WithContext(ctx).Errorf("ensure hot rank snapshot failed, as_of:%s error:%v", asOf, err)
+		return status.Error(codes.Unavailable, "热榜正在生成，请稍后重试")
+	}
+	return nil
+}
+
+// buildHotRankSnapshot 对最近 N 个分钟窗口做带衰减权重的求和，只保留正分 Top K。
+// 正式榜单使用临时 Key + Lua 原子替换，读请求不会看到构建到一半的结果。
+func buildHotRankSnapshot(
+	ctx context.Context,
+	svcCtx *svc.ServiceContext,
+	snapshot time.Time,
+	asOf string,
+	lockKey string,
+	lockToken string,
+) (bool, error) {
+	sourceKeys, weights := hotRankMergeSources(
+		snapshot,
+		hotRankWindowMinutes(svcCtx),
+		hotRankDecayHalfLifeMinutes(svcCtx),
+	)
+	tempKey := rediskey.HotVideoMergeTempKey(asOf, lockToken)
+
+	redisCtx, cancel := context.WithTimeout(ctx, hotRankRedisTimeout(svcCtx))
+	pipe := svcCtx.RedisCli.Pipeline()
+	pipe.ZUnionStore(redisCtx, tempKey, &redis.ZStore{
+		Keys:      sourceKeys,
+		Weights:   weights,
+		Aggregate: "SUM",
+	})
+	pipe.ZRemRangeByScore(redisCtx, tempKey, "-inf", "0")
+	// ZSet 为升序 rank，删除 [0, -(K+1)] 后只留下分数最高的 K 个成员。
+	pipe.ZRemRangeByRank(redisCtx, tempKey, 0, -(hotRankMaxSize(svcCtx) + 1))
+	pipe.Expire(redisCtx, tempKey, hotRankBuildLockTTL(svcCtx))
+	_, err := pipe.Exec(redisCtx)
+	cancel()
+	if err != nil {
+		deleteHotRankTempKey(ctx, svcCtx, tempKey)
+		return false, fmt.Errorf("合并热榜分钟窗口失败: %w", err)
+	}
+
+	redisCtx, cancel = context.WithTimeout(ctx, hotRankRedisTimeout(svcCtx))
+	defer cancel()
+	applied, err := svcCtx.RedisCli.Eval(
+		redisCtx,
+		promoteHotRankSnapshotScript,
+		[]string{
+			rediskey.HotVideoMergeKey(asOf),
+			rediskey.HotVideoMergeReadyKey(asOf),
+			lockKey,
+			tempKey,
+		},
+		lockToken,
+		strconv.FormatInt(int64(hotRankSnapshotTTL(svcCtx)/time.Second), 10),
+	).Int64()
+	if err != nil {
+		return false, fmt.Errorf("发布热榜快照失败: %w", err)
+	}
+	return applied == 1, nil
+}
+
+func hotRankMergeSources(
+	snapshot time.Time,
+	windowMinutes int64,
+	halfLifeMinutes int64,
+) ([]string, []float64) {
+	snapshot = snapshot.UTC().Truncate(time.Minute)
+	keys := make([]string, 0, windowMinutes)
+	weights := make([]float64, 0, windowMinutes)
+	for age := int64(0); age < windowMinutes; age++ {
+		minute := snapshot.Add(-time.Duration(age) * time.Minute)
+		keys = append(keys, rediskey.HotVideoWindowKey(minute.Format(hotRankMinuteLayout)))
+		// 半衰期模型比固定权重更平滑：age=halfLife 时，该分钟事件只保留一半权重。
+		weight := math.Pow(0.5, float64(age)/float64(halfLifeMinutes))
+		weights = append(weights, weight)
+	}
+	return keys, weights
+}
+
+// loadHotRankPage 从固定快照读取 pageSize+1 条，多出的一条只用于判断 has_more。
+// 快照在生命周期内不再更新，因此 offset 分页不会因实时热度变化产生跳页。
+func loadHotRankPage(
+	ctx context.Context,
+	svcCtx *svc.ServiceContext,
+	snapshotAt int64,
+	offset int64,
+	pageSize int64,
+) (hotRankPage, error) {
+	asOf := hotRankSnapshotAsOf(snapshotAt)
+	snapshotKey := rediskey.HotVideoMergeKey(asOf)
+	need := pageSize + 1
+	items := make([]*feed.HotFeedVideoItem, 0, need)
+	invalidMembers := make([]any, 0)
+	scanOffset := offset
+
+	redisCtx, cancel := context.WithTimeout(ctx, hotRankRedisTimeout(svcCtx))
+	defer cancel()
+
+	for int64(len(items)) < need {
+		count := hotRankReadBatchSize
+		remaining := need - int64(len(items))
+		if remaining > count {
+			count = remaining
+		}
+		values, err := svcCtx.RedisCli.ZRevRangeWithScores(
+			redisCtx,
+			snapshotKey,
+			scanOffset,
+			scanOffset+count-1,
+		).Result()
+		if err != nil {
+			return hotRankPage{}, fmt.Errorf("读取热榜快照失败: %w", err)
+		}
+		if len(values) == 0 {
+			break
+		}
+		scanOffset += int64(len(values))
+
+		for _, value := range values {
+			videoID, decodeErr := decodeHotRankVideoID(value.Member)
+			if decodeErr != nil || value.Score <= 0 || math.IsNaN(value.Score) || math.IsInf(value.Score, 0) {
+				invalidMembers = append(invalidMembers, value.Member)
+				continue
+			}
+			items = append(items, &feed.HotFeedVideoItem{
+				VideoId:  videoID,
+				HotScore: value.Score,
+				Rank:     offset + int64(len(items)) + 1,
+			})
+			if int64(len(items)) >= need {
+				break
+			}
+		}
+		if int64(len(values)) < count {
+			break
+		}
+	}
+
+	if len(invalidMembers) > 0 {
+		// 快照成员由 Job 校验后产生，正常不会进入这里；清理失败不影响本次合法结果。
+		_ = svcCtx.RedisCli.ZRem(redisCtx, snapshotKey, invalidMembers...).Err()
+	}
+
+	hasMore := int64(len(items)) > pageSize
+	if hasMore {
+		items = items[:pageSize]
+	}
+	return hotRankPage{Items: items, HasMore: hasMore}, nil
+}
+
+func decodeHotRankVideoID(member any) (uint64, error) {
+	var value string
+	switch typed := member.(type) {
+	case string:
+		value = typed
+	case []byte:
+		value = string(typed)
+	default:
+		return 0, fmt.Errorf("热榜member类型不合法: %T", member)
+	}
+	videoID, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || videoID == 0 {
+		return 0, fmt.Errorf("热榜video_id不合法: %q", value)
+	}
+	return videoID, nil
+}
+
+func hotRankSnapshotReady(
+	ctx context.Context,
+	svcCtx *svc.ServiceContext,
+	readyKey string,
+	snapshotKey string,
+) (bool, error) {
+	redisCtx, cancel := context.WithTimeout(ctx, hotRankRedisTimeout(svcCtx))
+	defer cancel()
+
+	value, err := svcCtx.RedisCli.Get(redisCtx, readyKey).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	size, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || size < 0 {
+		_ = svcCtx.RedisCli.Del(redisCtx, readyKey).Err()
+		return false, errors.New("热榜快照Ready标记损坏")
+	}
+	if size == 0 {
+		return true, nil
+	}
+
+	exists, err := svcCtx.RedisCli.Exists(redisCtx, snapshotKey).Result()
+	if err != nil {
+		return false, err
+	}
+	if exists == 0 {
+		// Redis 淘汰了 ZSet、但 Ready 仍存在时主动修复，避免把非空榜误报为空榜。
+		_ = svcCtx.RedisCli.Del(redisCtx, readyKey).Err()
+		return false, nil
+	}
+	return true, nil
+}
+
+func acquireHotRankSnapshotBuildLock(
+	ctx context.Context,
+	svcCtx *svc.ServiceContext,
+	lockKey string,
+) (string, bool, error) {
+	token, err := randomTimelineToken()
+	if err != nil {
+		return "", false, err
+	}
+	redisCtx, cancel := context.WithTimeout(ctx, hotRankRedisTimeout(svcCtx))
+	defer cancel()
+	locked, err := svcCtx.RedisCli.SetNX(redisCtx, lockKey, token, hotRankBuildLockTTL(svcCtx)).Result()
+	return token, locked, err
+}
+
+func releaseHotRankSnapshotBuildLock(
+	ctx context.Context,
+	svcCtx *svc.ServiceContext,
+	lockKey string,
+	lockToken string,
+) {
+	redisCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hotRankRedisTimeout(svcCtx))
+	defer cancel()
+	if err := svcCtx.RedisCli.Eval(
+		redisCtx,
+		releaseTimelineBuildLockScript,
+		[]string{lockKey},
+		lockToken,
+	).Err(); err != nil {
+		logx.WithContext(ctx).Errorf("release hot rank snapshot lock failed, key:%s error:%v", lockKey, err)
+	}
+}
+
+func waitHotRankSnapshotReady(
+	ctx context.Context,
+	svcCtx *svc.ServiceContext,
+	readyKey string,
+	snapshotKey string,
+) error {
+	deadline := time.NewTimer(hotRankBuildWait(svcCtx))
+	defer deadline.Stop()
+	ticker := time.NewTicker(buildWaitPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return errors.New("等待热榜快照构建超时")
+		case <-ticker.C:
+			ready, err := hotRankSnapshotReady(ctx, svcCtx, readyKey, snapshotKey)
+			if err != nil {
+				return err
+			}
+			if ready {
+				return nil
+			}
+		}
+	}
+}
+
+func deleteHotRankTempKey(ctx context.Context, svcCtx *svc.ServiceContext, tempKey string) {
+	redisCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hotRankRedisTimeout(svcCtx))
+	defer cancel()
+	_ = svcCtx.RedisCli.Del(redisCtx, tempKey).Err()
+}
+
+func hotRankSnapshotAsOf(snapshotAt int64) string {
+	return time.Unix(snapshotAt, 0).UTC().Truncate(time.Minute).Format(hotRankMinuteLayout)
+}
+
+func hotRankWindowMinutes(svcCtx *svc.ServiceContext) int64 {
+	minutes := svcCtx.Config.HotRank.WindowMinutes
+	if minutes <= 0 {
+		return defaultHotRankWindowMinutes
+	}
+	if minutes > maxHotRankWindowMinutes {
+		return maxHotRankWindowMinutes
+	}
+	return minutes
+}
+
+func hotRankMaxSize(svcCtx *svc.ServiceContext) int64 {
+	size := svcCtx.Config.HotRank.MaxRankSize
+	if size <= 0 {
+		return defaultHotRankMaxSize
+	}
+	if size > maxHotRankMaxSize {
+		return maxHotRankMaxSize
+	}
+	return size
+}
+
+func hotRankDecayHalfLifeMinutes(svcCtx *svc.ServiceContext) int64 {
+	minutes := svcCtx.Config.HotRank.DecayHalfLifeMinutes
+	if minutes <= 0 {
+		return defaultHotRankDecayHalfLifeMinutes
+	}
+	return minutes
+}
+
+func hotRankSnapshotTTL(svcCtx *svc.ServiceContext) time.Duration {
+	seconds := svcCtx.Config.HotRank.SnapshotTTLSeconds
+	if seconds <= 0 {
+		return defaultHotRankSnapshotTTL
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func hotRankMaxSnapshotAge(svcCtx *svc.ServiceContext) time.Duration {
+	seconds := svcCtx.Config.HotRank.MaxSnapshotAgeSeconds
+	if seconds <= 0 {
+		return defaultHotRankMaxSnapshotAge
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func hotRankBuildLockTTL(svcCtx *svc.ServiceContext) time.Duration {
+	seconds := svcCtx.Config.HotRank.BuildLockTTLSeconds
+	if seconds <= 0 {
+		return defaultHotRankBuildLockTTL
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func hotRankBuildWait(svcCtx *svc.ServiceContext) time.Duration {
+	milliseconds := svcCtx.Config.HotRank.BuildWaitMs
+	if milliseconds <= 0 {
+		return defaultHotRankBuildWait
+	}
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+func hotRankRedisTimeout(svcCtx *svc.ServiceContext) time.Duration {
+	milliseconds := svcCtx.Config.HotRank.RedisOpTimeoutMs
+	if milliseconds <= 0 {
+		return defaultHotRankRedisTimeout
+	}
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+func hotRankFutureTolerance(svcCtx *svc.ServiceContext) time.Duration {
+	seconds := svcCtx.Config.HotRank.FutureToleranceSeconds
+	if seconds <= 0 {
+		return defaultHotRankFutureTolerance
+	}
+	return time.Duration(seconds) * time.Second
 }

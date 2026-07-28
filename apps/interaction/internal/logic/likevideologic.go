@@ -154,7 +154,29 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 		return nil, status.Error(codes.Internal, "序列化 outbox 事件失败")
 	}
 
-	// 4. MySQL 事务：点赞关系、互动事件、outbox 事件必须一起提交。
+	var notificationOutbox *model.OutboxEvent
+	if video.AuthorID != userID {
+		notificationEventID, err := newEventID("notifyLike")
+		if err != nil {
+			return nil, status.Error(codes.Internal, "生成通知事件ID失败")
+		}
+		notificationOutbox, err = buildInteractionNotificationOutbox(
+			notificationEventID,
+			eventID,
+			video.AuthorID,
+			userID,
+			videoID,
+			0,
+			eventx.NotificationTypeVideoLike,
+			eventx.NotificationActionCreate,
+			now,
+		)
+		if err != nil {
+			return nil, status.Error(codes.Internal, "构造点赞通知事件失败")
+		}
+	}
+
+	// 4. MySQL 事务：点赞关系、互动事件、领域 outbox 与通知 outbox 必须一起提交。
 	//开启事务
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
 		like := model.Like{
@@ -191,8 +213,8 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 			return err
 		}
 
-		//插入Outbox，发给消息队列
-		return tx.Create(&model.OutboxEvent{
+		// 插入领域 Outbox，供 interaction-sync/hotrank 消费。
+		if err := tx.Create(&model.OutboxEvent{
 			EventID:       eventID,
 			Topic:         eventx.TopicInteractionLikeEvents,
 			EventType:     eventx.EventTypeLikeCreated,
@@ -202,7 +224,13 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 			Status:        model.OutboxStatusPending,
 			CreatedAt:     now,
 			UpdatedAt:     now,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+		if notificationOutbox != nil {
+			return tx.Create(notificationOutbox).Error
+		}
+		return nil
 	}); err != nil {
 		l.Errorf("like video transaction failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
 		return nil, status.Error(codes.Internal, "点赞失败")
