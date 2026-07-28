@@ -47,10 +47,12 @@ func (l *GetProfileLogic) GetProfile(in *account.GetProfileReq) (*account.GetPro
 
 	//返回用户信息
 	return &account.GetProfileResp{
-		UserId:    user.ID,
-		Username:  user.Username,
-		Email:     user.Email,
-		AvatarUrl: user.AvatarURL,
-		Bio:       user.Bio,
+		UserId:         user.ID,
+		Username:       user.Username,
+		Email:          user.Email,
+		AvatarUrl:      user.AvatarURL,
+		Bio:            user.Bio,
+		FollowerCount:  user.FollowerCount,
+		FollowingCount: user.FollowingCount,
 	}, nil
 }

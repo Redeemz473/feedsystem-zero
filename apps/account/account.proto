@@ -61,6 +61,8 @@ message LogoutResp{
     string email = 3;
     string avatar_url = 4;
     string bio = 5;
+    int64 follower_count = 6; // 粉丝数，来自 accounts.follower_count 冗余字段
+    int64 following_count = 7; // 关注数，来自 accounts.following_count 冗余字段
   }
 
   // 公开用户资料，不包含邮箱、密码和 token 等敏感字段。
@@ -69,6 +71,8 @@ message LogoutResp{
     string username = 2;
     string avatar_url = 3;
     string bio = 4;
+    int64 follower_count = 5; // 粉丝数，来自 accounts.follower_count 冗余字段
+    int64 following_count = 6; // 关注数，来自 accounts.following_count 冗余字段
   }
 
   // 给 gateway/social 等内部服务批量补齐用户资料，避免逐个 RPC 造成 N+1。

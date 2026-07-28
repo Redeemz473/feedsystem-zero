@@ -43,11 +43,13 @@ type (
 	//获取用户信息
 	GetProfileReq  {}
 	GetProfileResp {
-		Userid    uint64 `json:"user_id"`
-		Username  string `json:"username"`
-		Email     string `json:"email"`
-		Avatarurl string `json:"avatar_url"`
-		Bio       string `json:"bio"`
+		Userid          uint64 `json:"user_id"`
+		Username        string `json:"username"`
+		Email           string `json:"email"`
+		Avatarurl       string `json:"avatar_url"`
+		Bio             string `json:"bio"`
+		Followerscount  int64  `json:"followers_count"`
+		Followingscount int64  `json:"followings_count"`
 	}
 	//更新用户信息
 	UpdateProfileReq {
@@ -325,13 +327,6 @@ type (
 		Nextcursorfollowid  uint64               `json:"next_cursor_follow_id"`
 		Hasmore             bool                 `json:"has_more"`
 	}
-	GetFollowStatsReq {
-		Userid uint64 `path:"id"`
-	}
-	GetFollowStatsResp {
-		Followerscount  int64 `json:"followers_count"`
-		Followingscount int64 `json:"followings_count"`
-	}
 	// 推荐流，允许游客访问。
 	GetRecommendFeedReq {
 		Cursorpublishedat int64  `form:"cursor_published_at,optional"`
@@ -484,9 +479,6 @@ service gateway {
 
 	@handler ListFollowings
 	get /users/:id/followings (ListFollowingsReq) returns (ListFollowingsResp)
-
-	@handler GetFollowStats
-	get /users/:id/stats (GetFollowStatsReq) returns (GetFollowStatsResp)
 }
 
 @server (
@@ -520,3 +512,4 @@ service gateway {
 	@handler GetFollowingFeed
 	get /following (GetFollowingFeedReq) returns (GetFollowingFeedResp)
 }
+

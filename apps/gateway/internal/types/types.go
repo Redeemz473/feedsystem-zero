@@ -62,15 +62,6 @@ type FollowResp struct {
 	Followed bool   `json:"followed"`
 }
 
-type GetFollowStatsReq struct {
-	Userid uint64 `path:"id"`
-}
-
-type GetFollowStatsResp struct {
-	Followerscount  int64 `json:"followers_count"`
-	Followingscount int64 `json:"followings_count"`
-}
-
 type GetFollowingFeedReq struct {
 	Cursorpublishedat int64  `form:"cursor_published_at,optional"`
 	Cursorvideoid     uint64 `form:"cursor_video_id,optional"`
@@ -88,11 +79,13 @@ type GetProfileReq struct {
 }
 
 type GetProfileResp struct {
-	Userid    uint64 `json:"user_id"`
-	Username  string `json:"username"`
-	Email     string `json:"email"`
-	Avatarurl string `json:"avatar_url"`
-	Bio       string `json:"bio"`
+	Userid          uint64 `json:"user_id"`
+	Username        string `json:"username"`
+	Email           string `json:"email"`
+	Avatarurl       string `json:"avatar_url"`
+	Bio             string `json:"bio"`
+	Followerscount  int64  `json:"followers_count"`
+	Followingscount int64  `json:"followings_count"`
 }
 
 type GetRecommendFeedReq struct {

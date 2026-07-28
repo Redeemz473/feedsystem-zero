@@ -41,6 +41,11 @@ const (
 	globalBuildMaxAttempts              = 3
 )
 
+// errGlobalTimelineNotReady 表示全局 Timeline 在 Redis 中丢失（例如被 flush），
+// 需要依赖 BootstrapGlobalTimeline 重建。返回该错误后由 Kafka 重投兜底，
+// 避免在事件处理路径中同步递归调用 bootstrap 造成栈膨胀和多次并发重建。
+var errGlobalTimelineNotReady = errors.New("global timeline not ready, waiting for bootstrap")
+
 const mutateGlobalTimelineScript = `
 redis.call("INCR", KEYS[2])
 if redis.call("EXISTS", KEYS[3]) == 0 then
@@ -365,8 +370,16 @@ func (c *TimelineConsumer) mutateGlobalTimeline(ctx context.Context, action stri
 		return err
 	}
 	if result == 0 {
-		// Redis 被清空但 Job 未重启时，不能用单条事件伪造完整全局流；立即从 MySQL 自愈。
-		return c.BootstrapGlobalTimeline(ctx)
+		// 全局 Timeline Ready 键不存在（可能被运维/故障 flush）。
+		// 不能用单条事件伪造完整全局流，也不能在事件处理路径同步递归 bootstrap
+		// （会阻塞当前批次、并可能与其它调用方并发 bootstrap）。
+		// 记录 warning 后返回 sentinel error 让 Kafka 重投，由下一轮 poll 之前的
+		// bootstrap 流程（Job 启动或后续心跳）负责重建。
+		logx.WithContext(ctx).Errorf(
+			"global timeline ready missing, waiting for bootstrap, action:%s video_id:%d",
+			action, videoID,
+		)
+		return errGlobalTimelineNotReady
 	}
 	return nil
 }

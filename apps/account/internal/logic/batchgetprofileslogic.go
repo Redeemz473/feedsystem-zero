@@ -27,11 +27,13 @@ const (
 )
 
 type publicProfileCacheValue struct {
-	Missing   bool   `json:"missing,omitempty"`
-	UserID    uint64 `json:"user_id"`
-	Username  string `json:"username,omitempty"`
-	AvatarURL string `json:"avatar_url,omitempty"`
-	Bio       string `json:"bio,omitempty"`
+	Missing        bool   `json:"missing,omitempty"`
+	UserID         uint64 `json:"user_id"`
+	Username       string `json:"username,omitempty"`
+	AvatarURL      string `json:"avatar_url,omitempty"`
+	Bio            string `json:"bio,omitempty"`
+	FollowerCount  int64  `json:"follower_count,omitempty"`
+	FollowingCount int64  `json:"following_count,omitempty"`
 }
 
 // 同一实例内合并相同 ID 集合的并发回源，降低热点缓存刚过期时的 MySQL 瞬时压力。
@@ -118,7 +120,7 @@ func (l *BatchGetProfilesLogic) loadPublicProfilesFromDB(userIDs []uint64) (map[
 	value, err := publicProfileDBLoadGroup.Do(publicProfileDBLoadKey(userIDs), func() (any, error) {
 		var users []model.Account
 		if err := l.svcCtx.GormDB.WithContext(l.ctx).
-			Select("id", "username", "avatar_url", "bio").
+			Select("id", "username", "avatar_url", "bio", "follower_count", "following_count").
 			Where("id IN ?", userIDs).
 			Find(&users).Error; err != nil {
 			return nil, err
@@ -128,10 +130,12 @@ func (l *BatchGetProfilesLogic) loadPublicProfilesFromDB(userIDs []uint64) (map[
 		for i := range users {
 			user := &users[i]
 			profiles[user.ID] = &account.PublicProfile{
-				UserId:    user.ID,
-				Username:  user.Username,
-				AvatarUrl: user.AvatarURL,
-				Bio:       user.Bio,
+				UserId:         user.ID,
+				Username:       user.Username,
+				AvatarUrl:      user.AvatarURL,
+				Bio:            user.Bio,
+				FollowerCount:  user.FollowerCount,
+				FollowingCount: user.FollowingCount,
 			}
 		}
 		return profiles, nil
@@ -146,6 +150,7 @@ func (l *BatchGetProfilesLogic) loadPublicProfilesFromDB(userIDs []uint64) (map[
 	return profiles, nil
 }
 
+// 让相同 ID 集合的调用能被识别为同一次请求并合并。
 func publicProfileDBLoadKey(userIDs []uint64) string {
 	sortedUserIDs := append([]uint64(nil), userIDs...)
 	sort.Slice(sortedUserIDs, func(i, j int) bool {
@@ -166,6 +171,7 @@ func (l *BatchGetProfilesLogic) loadPublicProfilesFromCache(
 	userIDs []uint64,
 	profileMap map[uint64]*account.PublicProfile,
 ) ([]uint64, map[uint64]int64, bool) {
+	//一次拿到所有版本号
 	versionPipe := l.svcCtx.RedisCli.Pipeline()
 	versionCmds := make(map[uint64]*redis.StringCmd, len(userIDs))
 	for _, userID := range userIDs {
@@ -176,6 +182,7 @@ func (l *BatchGetProfilesLogic) loadPublicProfilesFromCache(
 		return append([]uint64(nil), userIDs...), nil, false
 	}
 
+	//分离 能查版本缓存 和 直接 miss
 	versions := make(map[uint64]int64, len(userIDs))
 	cacheableUserIDs := make([]uint64, 0, len(userIDs))
 	missUserIDs := make([]uint64, 0, len(userIDs))
@@ -193,6 +200,7 @@ func (l *BatchGetProfilesLogic) loadPublicProfilesFromCache(
 		return missUserIDs, versions, true
 	}
 
+	//查数据缓存，并且再次查版本缓存用来验证，防止中间有更新
 	cachePipe := l.svcCtx.RedisCli.Pipeline()
 	valueCmds := make(map[uint64]*redis.StringCmd, len(cacheableUserIDs))
 	verifyVersionCmds := make(map[uint64]*redis.StringCmd, len(cacheableUserIDs))
@@ -205,6 +213,7 @@ func (l *BatchGetProfilesLogic) loadPublicProfilesFromCache(
 		return append([]uint64(nil), userIDs...), nil, false
 	}
 
+	//检验第二次读的版本号
 	for _, userID := range cacheableUserIDs {
 		currentVersion, err := publicProfileVersionResult(verifyVersionCmds[userID])
 		if err != nil {
@@ -213,6 +222,7 @@ func (l *BatchGetProfilesLogic) loadPublicProfilesFromCache(
 			delete(versions, userID)
 			continue
 		}
+		//如果是版本发生了改变
 		if currentVersion != versions[userID] {
 			versions[userID] = currentVersion
 			missUserIDs = append(missUserIDs, userID)
@@ -221,9 +231,11 @@ func (l *BatchGetProfilesLogic) loadPublicProfilesFromCache(
 
 		data, err := valueCmds[userID].Bytes()
 		switch {
+		//版本对得上但是数据缓存miss，属于普通冷miss，去查mysql
 		case errors.Is(err, redis.Nil):
 			missUserIDs = append(missUserIDs, userID)
 			continue
+		//其他错误也走miss
 		case err != nil:
 			l.Errorf("get public profile cache failed, user_id: %d, error: %v", userID, err)
 			missUserIDs = append(missUserIDs, userID)
@@ -243,15 +255,18 @@ func (l *BatchGetProfilesLogic) loadPublicProfilesFromCache(
 			_ = l.svcCtx.RedisCli.Del(l.ctx, rediskey.AccountPublicProfileKey(userID, currentVersion)).Err()
 			continue
 		}
+		//防穿透，表示这个用户ID在mysql里也不存在，不加入missUserIDs
 		if cached.Missing {
 			continue
 		}
 
 		profileMap[userID] = &account.PublicProfile{
-			UserId:    cached.UserID,
-			Username:  cached.Username,
-			AvatarUrl: cached.AvatarURL,
-			Bio:       cached.Bio,
+			UserId:         cached.UserID,
+			Username:       cached.Username,
+			AvatarUrl:      cached.AvatarURL,
+			Bio:            cached.Bio,
+			FollowerCount:  cached.FollowerCount,
+			FollowingCount: cached.FollowingCount,
 		}
 	}
 
@@ -295,10 +310,12 @@ func (l *BatchGetProfilesLogic) cachePublicProfileMisses(
 		ttl := rediskey.AccountPublicProfileMissingTTL
 		if profile, found := profileMap[userID]; found {
 			cached = publicProfileCacheValue{
-				UserID:    profile.GetUserId(),
-				Username:  profile.GetUsername(),
-				AvatarURL: profile.GetAvatarUrl(),
-				Bio:       profile.GetBio(),
+				UserID:         profile.GetUserId(),
+				Username:       profile.GetUsername(),
+				AvatarURL:      profile.GetAvatarUrl(),
+				Bio:            profile.GetBio(),
+				FollowerCount:  profile.GetFollowerCount(),
+				FollowingCount: profile.GetFollowingCount(),
 			}
 			ttl = publicProfileCacheTTL(userID)
 		}
@@ -321,6 +338,8 @@ func (l *BatchGetProfilesLogic) cachePublicProfileMisses(
 
 func publicProfileVersionResult(cmd *redis.StringCmd) (int64, error) {
 	version, err := cmd.Int64()
+	//第一次Pipe查版本号如果不存在，可能是用户从未被更新过
+	// 数据存在，但是版本号不存在
 	if errors.Is(err, redis.Nil) {
 		return 0, nil
 	}

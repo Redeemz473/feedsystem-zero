@@ -321,9 +321,9 @@ func applyFollowCacheAfterCommit(
 	if stateChanged {
 		// 只有真正的状态变化才需要让统计/列表缓存失效，
 		// 幂等重试路径直接复用现有缓存，避免不必要的击穿。
-		pipe.Del(redisCtx, rediskey.SocialFollowStatsKey(followerID), rediskey.SocialFollowStatsKey(followingID))
-		pipe.Incr(redisCtx, rediskey.SocialFollowStatsVersionKey(followerID))
-		pipe.Incr(redisCtx, rediskey.SocialFollowStatsVersionKey(followingID))
+		// 通过 AccountPublicProfileVersionKey 失效，使其回源拿到最新计数。
+		pipe.Incr(redisCtx, rediskey.AccountPublicProfileVersionKey(followerID))
+		pipe.Incr(redisCtx, rediskey.AccountPublicProfileVersionKey(followingID))
 		pipe.Incr(redisCtx, rediskey.SocialFollowersListVersionKey(followingID))
 		pipe.Incr(redisCtx, rediskey.SocialFollowingsListVersionKey(followerID))
 	}

@@ -23,37 +23,38 @@ func NewSocialServer(svcCtx *svc.ServiceContext) *SocialServer {
 	}
 }
 
+// 关注
 func (s *SocialServer) Follow(ctx context.Context, in *social.FollowReq) (*social.FollowResp, error) {
 	l := logic.NewFollowLogic(ctx, s.svcCtx)
 	return l.Follow(in)
 }
 
+// 取关
 func (s *SocialServer) Unfollow(ctx context.Context, in *social.UnfollowReq) (*social.UnfollowResp, error) {
 	l := logic.NewUnfollowLogic(ctx, s.svcCtx)
 	return l.Unfollow(in)
 }
 
+// 判断是否关注
 func (s *SocialServer) IsFollowing(ctx context.Context, in *social.IsFollowingReq) (*social.IsFollowingResp, error) {
 	l := logic.NewIsFollowingLogic(ctx, s.svcCtx)
 	return l.IsFollowing(in)
 }
 
+// 展示粉丝
 func (s *SocialServer) ListFollowers(ctx context.Context, in *social.ListFollowersReq) (*social.ListFollowersResp, error) {
 	l := logic.NewListFollowersLogic(ctx, s.svcCtx)
 	return l.ListFollowers(in)
 }
 
+// 展示关注
 func (s *SocialServer) ListFollowings(ctx context.Context, in *social.ListFollowingsReq) (*social.ListFollowingsResp, error) {
 	l := logic.NewListFollowingsLogic(ctx, s.svcCtx)
 	return l.ListFollowings(in)
 }
 
+// 批量获取关注信息
 func (s *SocialServer) BatchIsFollowing(ctx context.Context, in *social.BatchIsFollowingReq) (*social.BatchIsFollowingResp, error) {
 	l := logic.NewBatchIsFollowingLogic(ctx, s.svcCtx)
 	return l.BatchIsFollowing(in)
-}
-
-func (s *SocialServer) GetFollowStats(ctx context.Context, in *social.GetFollowStatsReq) (*social.GetFollowStatsResp, error) {
-	l := logic.NewGetFollowStatsLogic(ctx, s.svcCtx)
-	return l.GetFollowStats(in)
 }

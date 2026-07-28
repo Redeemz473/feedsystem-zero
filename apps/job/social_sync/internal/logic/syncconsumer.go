@@ -388,12 +388,10 @@ func (c *SyncConsumer) applyRedisCache(ctx context.Context, events []decodedFoll
 		)
 		// 只在真正状态变化的事件（能进 processed_events 的都是新事件）执行统计/列表失效，
 		// 与 applyFollowCacheAfterCommit 语义保持一致。
-		set.delHash = pipe.Del(redisCtx,
-			rediskey.SocialFollowStatsKey(event.Event.FollowerID),
-			rediskey.SocialFollowStatsKey(event.Event.FollowingID),
-		)
-		set.incrs[0] = pipe.Incr(redisCtx, rediskey.SocialFollowStatsVersionKey(event.Event.FollowerID))
-		set.incrs[1] = pipe.Incr(redisCtx, rediskey.SocialFollowStatsVersionKey(event.Event.FollowingID))
+		// 粉丝数/关注数已冗余进 accounts 表，经 GetProfile/BatchGetProfiles 返回。
+		// 关注关系变化后让两侧用户的 profile 缓存版本失效，使其回源拿到最新计数。
+		set.incrs[0] = pipe.Incr(redisCtx, rediskey.AccountPublicProfileVersionKey(event.Event.FollowerID))
+		set.incrs[1] = pipe.Incr(redisCtx, rediskey.AccountPublicProfileVersionKey(event.Event.FollowingID))
 		set.incrs[2] = pipe.Incr(redisCtx, rediskey.SocialFollowersListVersionKey(event.Event.FollowingID))
 		set.incrs[3] = pipe.Incr(redisCtx, rediskey.SocialFollowingsListVersionKey(event.Event.FollowerID))
 		cmdsByEvent = append(cmdsByEvent, set)
@@ -427,9 +425,6 @@ type followRedisCmdSet struct {
 
 func firstPipelineError(set followRedisCmdSet) error {
 	if err := set.state.Err(); err != nil {
-		return err
-	}
-	if err := set.delHash.Err(); err != nil {
 		return err
 	}
 	for _, cmd := range set.incrs {

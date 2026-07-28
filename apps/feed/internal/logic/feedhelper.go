@@ -159,7 +159,11 @@ func loadTimelinePage(
 			break
 		}
 
+		// 就地更新 currentMax 到"当前处理到的这个 member"，避免内层 for 因 need 满而提前 break 时
+		// 用整批最后一个 member 作为下一轮起点，进而跳过一段未消费的 member。
+		lastMember := members[len(members)-1]
 		for _, member := range members {
+			lastMember = member
 			publishedAt, videoID, decodeErr := feedx.DecodeTimelineMember(member)
 			if decodeErr != nil {
 				invalidMembers = append(invalidMembers, member)
@@ -173,7 +177,7 @@ func loadTimelinePage(
 				break
 			}
 		}
-		currentMax = "(" + members[len(members)-1]
+		currentMax = "(" + lastMember
 		if int64(len(members)) < count {
 			break
 		}
@@ -191,7 +195,9 @@ func loadTimelinePage(
 	return timelinePage{Items: items, HasMore: hasMore}, nil
 }
 
-// ensureGlobalTimeline 在全局 Timeline 未初始化时，用 MySQL 最新视频构建完整快照。
+// ensureGlobalTimeline 只等待 Job 完成全局 Timeline 的 bootstrap，不再抢锁自建。
+// 全局 Timeline 的单点建设由 apps/job/feed_timeline 负责，避免 rpc 与 job 争抢同一把
+// 构建锁导致互相等待失败。
 func ensureGlobalTimeline(ctx context.Context, svcCtx *svc.ServiceContext) error {
 	return ensureTimeline(
 		ctx,
@@ -206,6 +212,7 @@ func ensureGlobalTimeline(ctx context.Context, svcCtx *svc.ServiceContext) error
 		func(loadCtx context.Context) ([]string, error) {
 			return loadGlobalTimelineMembers(loadCtx, svcCtx)
 		},
+		true,
 	)
 }
 
@@ -227,6 +234,7 @@ func ensureFollowingTimeline(ctx context.Context, svcCtx *svc.ServiceContext, us
 		func(loadCtx context.Context) ([]string, error) {
 			return loadFollowingTimelineMembers(loadCtx, svcCtx, userID)
 		},
+		false,
 	)
 }
 
@@ -257,6 +265,7 @@ func ensureTimeline(
 	tempKey func(token string) string,
 	ttl time.Duration,
 	loadMembers func(context.Context) ([]string, error),
+	passiveOnly bool,
 ) error {
 	ready, err := timelineReady(ctx, svcCtx, readyKey)
 	if err != nil {
@@ -264,6 +273,16 @@ func ensureTimeline(
 		return status.Error(codes.Unavailable, "Feed缓存暂时不可用")
 	}
 	if ready {
+		return nil
+	}
+
+	// passiveOnly=true 表示当前 Timeline 由外部（Job）单点负责冷启动，rpc 侧只做等待。
+	// 这样避免 rpc 与 job 争抢同一把 build lock 导致相互阻塞。
+	if passiveOnly {
+		if err := waitTimelineReady(ctx, svcCtx, readyKey); err != nil {
+			logx.WithContext(ctx).Errorf("wait timeline ready failed, build_group:%s error:%v", buildGroupKey, err)
+			return status.Error(codes.Unavailable, "Feed缓存正在初始化，请稍后重试")
+		}
 		return nil
 	}
 

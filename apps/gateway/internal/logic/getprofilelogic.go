@@ -40,10 +40,12 @@ func (l *GetProfileLogic) GetProfile(req *types.GetProfileReq) (resp *types.GetP
 	}
 
 	return &types.GetProfileResp{
-		Userid:    rpcresp.UserId,
-		Username:  rpcresp.Username,
-		Email:     rpcresp.Email,
-		Avatarurl: rpcresp.AvatarUrl,
-		Bio:       rpcresp.Bio,
+		Userid:          rpcresp.UserId,
+		Username:        rpcresp.Username,
+		Email:           rpcresp.Email,
+		Avatarurl:       rpcresp.AvatarUrl,
+		Bio:             rpcresp.Bio,
+		Followerscount:  rpcresp.FollowerCount,
+		Followingscount: rpcresp.FollowingCount,
 	}, nil
 }

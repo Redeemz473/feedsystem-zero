@@ -93,15 +93,6 @@ message BatchIsFollowingResp {
   repeated FollowingState states = 1;
 }
 
-message GetFollowStatsReq {
-  uint64 user_id = 1;
-}
-
-message GetFollowStatsResp {
-  int64 followers_count = 1;
-  int64 followings_count = 2;
-}
-
 // 社交关系服务
 service Social {
   //关注
@@ -116,6 +107,4 @@ service Social {
   rpc ListFollowings(ListFollowingsReq) returns (ListFollowingsResp);
   //批量获取关注信息
   rpc BatchIsFollowing(BatchIsFollowingReq) returns (BatchIsFollowingResp);
-  //获取关注数量
-  rpc GetFollowStats(GetFollowStatsReq) returns (GetFollowStatsResp);
 }

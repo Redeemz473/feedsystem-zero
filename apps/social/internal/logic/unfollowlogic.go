@@ -94,6 +94,19 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 			return nil
 		}
 
+		// 维护 accounts 表冗余计数：被关注者粉丝数 -1，关注者关注数 -1。
+		// 用 GREATEST(..., 0) 防止并发异常导致计数变成负数。
+		if err := tx.Model(&model.Account{}).
+			Where("id = ?", followingID).
+			UpdateColumn("follower_count", gorm.Expr("GREATEST(follower_count - 1, 0)")).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.Account{}).
+			Where("id = ?", followerID).
+			UpdateColumn("following_count", gorm.Expr("GREATEST(following_count - 1, 0)")).Error; err != nil {
+			return err
+		}
+
 		eventID, err := newSocialEventID("unfollow")
 		if err != nil {
 			return err

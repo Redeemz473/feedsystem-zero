@@ -60,7 +60,7 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 	stateChanged := false
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
 		var follow model.Follow
-		//加锁查询关注关系
+		//加悲观行锁查询关注关系，防止并发出现问题导致粉丝数被刷双倍
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("follower_id = ? AND following_id = ?", followerID, followingID).
 			Take(&follow).Error
@@ -84,6 +84,7 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 			}
 			stateChanged = true
 		} else if errors.Is(err, gorm.ErrRecordNotFound) { //没查到
+			//唯一键冲突
 			result := tx.Clauses(clause.OnConflict{
 				Columns: []clause.Column{
 					{Name: "follower_id"},
@@ -130,6 +131,19 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 
 		if !stateChanged {
 			return nil
+		}
+
+		// 维护 accounts 表冗余计数：被关注者粉丝数 +1，关注者关注数 +1。
+		// 与关注关系写在同一个事务里，保证计数与关系强一致。
+		if err := tx.Model(&model.Account{}).
+			Where("id = ?", followingID).
+			UpdateColumn("follower_count", gorm.Expr("follower_count + 1")).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.Account{}).
+			Where("id = ?", followerID).
+			UpdateColumn("following_count", gorm.Expr("following_count + 1")).Error; err != nil {
+			return err
 		}
 
 		eventID, err := newSocialEventID("follow")

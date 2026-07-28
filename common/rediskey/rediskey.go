@@ -29,8 +29,6 @@ const (
 	// SocialFollowingStateTTL 是单条关注状态缓存的有效期。
 	// value 使用 "1"/"0"，必须同时缓存未关注状态，避免不存在关系反复穿透 MySQL。
 	SocialFollowingStateTTL = 10 * time.Minute
-	// SocialFollowStatsTTL 是粉丝数/关注数缓存的有效期。
-	SocialFollowStatsTTL = 5 * time.Minute
 	// SocialListFirstPageCacheTTL 是粉丝/关注列表首页基础数据缓存的有效期。
 	// 写缓存时建议在此基础上增加少量随机抖动，避免大量热点 key 同时失效。
 	SocialListFirstPageCacheTTL = time.Minute
@@ -247,21 +245,6 @@ func CommentListVersionKey(videoID uint64) string {
 // 格式: fsz:social:following:{followerID}:{followingID}
 func SocialFollowingStateKey(followerID, followingID uint64) string {
 	return fmt.Sprintf("%s:social:following:%d:%d", prefix, followerID, followingID)
-}
-
-// SocialFollowStatsKey 用户粉丝数与关注数缓存，HASH。
-// fields: followers_count/followings_count/version
-// 格式: fsz:social:stats:{userID}
-func SocialFollowStatsKey(userID uint64) string {
-	return fmt.Sprintf("%s:social:stats:%d", prefix, userID)
-}
-
-// SocialFollowStatsVersionKey 用户关注统计版本号。
-// 真实关注关系发生变化后递增；统计缓存必须携带相同版本才能命中，
-// 防止并发回源查询把关注/取关之前的旧计数重新写回缓存。
-// 格式: fsz:social:stats:{userID}:version
-func SocialFollowStatsVersionKey(userID uint64) string {
-	return fmt.Sprintf("%s:social:stats:%d:version", prefix, userID)
 }
 
 // SocialFollowersListVersionKey 用户粉丝列表版本号。

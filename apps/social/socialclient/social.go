@@ -20,8 +20,6 @@ type (
 	FollowReq            = social.FollowReq
 	FollowResp           = social.FollowResp
 	FollowingState       = social.FollowingState
-	GetFollowStatsReq    = social.GetFollowStatsReq
-	GetFollowStatsResp   = social.GetFollowStatsResp
 	IsFollowingReq       = social.IsFollowingReq
 	IsFollowingResp      = social.IsFollowingResp
 	ListFollowersReq     = social.ListFollowersReq
@@ -32,13 +30,18 @@ type (
 	UnfollowResp         = social.UnfollowResp
 
 	Social interface {
+		// 关注
 		Follow(ctx context.Context, in *FollowReq, opts ...grpc.CallOption) (*FollowResp, error)
+		// 取关
 		Unfollow(ctx context.Context, in *UnfollowReq, opts ...grpc.CallOption) (*UnfollowResp, error)
+		// 判断是否关注
 		IsFollowing(ctx context.Context, in *IsFollowingReq, opts ...grpc.CallOption) (*IsFollowingResp, error)
+		// 展示粉丝
 		ListFollowers(ctx context.Context, in *ListFollowersReq, opts ...grpc.CallOption) (*ListFollowersResp, error)
+		// 展示关注
 		ListFollowings(ctx context.Context, in *ListFollowingsReq, opts ...grpc.CallOption) (*ListFollowingsResp, error)
+		// 批量获取关注信息
 		BatchIsFollowing(ctx context.Context, in *BatchIsFollowingReq, opts ...grpc.CallOption) (*BatchIsFollowingResp, error)
-		GetFollowStats(ctx context.Context, in *GetFollowStatsReq, opts ...grpc.CallOption) (*GetFollowStatsResp, error)
 	}
 
 	defaultSocial struct {
@@ -52,37 +55,38 @@ func NewSocial(cli zrpc.Client) Social {
 	}
 }
 
+// 关注
 func (m *defaultSocial) Follow(ctx context.Context, in *FollowReq, opts ...grpc.CallOption) (*FollowResp, error) {
 	client := social.NewSocialClient(m.cli.Conn())
 	return client.Follow(ctx, in, opts...)
 }
 
+// 取关
 func (m *defaultSocial) Unfollow(ctx context.Context, in *UnfollowReq, opts ...grpc.CallOption) (*UnfollowResp, error) {
 	client := social.NewSocialClient(m.cli.Conn())
 	return client.Unfollow(ctx, in, opts...)
 }
 
+// 判断是否关注
 func (m *defaultSocial) IsFollowing(ctx context.Context, in *IsFollowingReq, opts ...grpc.CallOption) (*IsFollowingResp, error) {
 	client := social.NewSocialClient(m.cli.Conn())
 	return client.IsFollowing(ctx, in, opts...)
 }
 
+// 展示粉丝
 func (m *defaultSocial) ListFollowers(ctx context.Context, in *ListFollowersReq, opts ...grpc.CallOption) (*ListFollowersResp, error) {
 	client := social.NewSocialClient(m.cli.Conn())
 	return client.ListFollowers(ctx, in, opts...)
 }
 
+// 展示关注
 func (m *defaultSocial) ListFollowings(ctx context.Context, in *ListFollowingsReq, opts ...grpc.CallOption) (*ListFollowingsResp, error) {
 	client := social.NewSocialClient(m.cli.Conn())
 	return client.ListFollowings(ctx, in, opts...)
 }
 
+// 批量获取关注信息
 func (m *defaultSocial) BatchIsFollowing(ctx context.Context, in *BatchIsFollowingReq, opts ...grpc.CallOption) (*BatchIsFollowingResp, error) {
 	client := social.NewSocialClient(m.cli.Conn())
 	return client.BatchIsFollowing(ctx, in, opts...)
-}
-
-func (m *defaultSocial) GetFollowStats(ctx context.Context, in *GetFollowStatsReq, opts ...grpc.CallOption) (*GetFollowStatsResp, error) {
-	client := social.NewSocialClient(m.cli.Conn())
-	return client.GetFollowStats(ctx, in, opts...)
 }

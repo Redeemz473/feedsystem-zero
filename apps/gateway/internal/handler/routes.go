@@ -205,11 +205,6 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 					Path:    "/users/:id/followings",
 					Handler: ListFollowingsHandler(serverCtx),
 				},
-				{
-					Method:  http.MethodGet,
-					Path:    "/users/:id/stats",
-					Handler: GetFollowStatsHandler(serverCtx),
-				},
 			}...,
 		),
 		rest.WithPrefix("/social"),
