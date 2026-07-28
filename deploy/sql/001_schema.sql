@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   refresh_token VARCHAR(255) NULL,
   avatar_url VARCHAR(512) DEFAULT '',
   bio VARCHAR(512) DEFAULT '',
+  follower_count BIGINT NOT NULL DEFAULT 0 COMMENT '粉丝数，冗余自 follows 表，由 social 模块维护',
+  following_count BIGINT NOT NULL DEFAULT 0 COMMENT '关注数，冗余自 follows 表，由 social 模块维护',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uk_username (username),
