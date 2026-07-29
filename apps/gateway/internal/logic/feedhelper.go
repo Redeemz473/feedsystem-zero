@@ -22,7 +22,7 @@ func hydrateFeedVideos(
 			videoIDs = append(videoIDs, item.GetVideoId())
 		}
 	}
-	videoMap, err := loadHTTPVideosByIDs(ctx, svcCtx.VideoRpc, svcCtx.InteractionRpc, viewerID, videoIDs)
+	videoMap, err := loadHTTPVideosByIDs(ctx, svcCtx.AccountRpc, svcCtx.VideoRpc, svcCtx.InteractionRpc, viewerID, videoIDs)
 	if err != nil {
 		return nil, err
 	}

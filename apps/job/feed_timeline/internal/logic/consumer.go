@@ -145,14 +145,7 @@ func (c *TimelineConsumer) handleMessageGroup(ctx context.Context, group timelin
 			continue
 		}
 
-		switch event.Kind {
-		case timelineEventKindVideo:
-			err = c.applyVideoEvent(ctx, *event.Video)
-		case timelineEventKindFollow:
-			err = c.applyFollowEvent(ctx, *event.Follow)
-		default:
-			err = fmt.Errorf("unknown timeline event kind: %d", event.Kind)
-		}
+		err = c.applyEventWithTimelineRecovery(ctx, event)
 		if err != nil {
 			return fmt.Errorf("apply timeline event failed, event_id:%s: %w", event.Envelope.EventID, err)
 		}
@@ -172,6 +165,33 @@ func (c *TimelineConsumer) handleMessageGroup(ctx context.Context, group timelin
 		processed[event.Envelope.EventID] = struct{}{}
 	}
 	return c.recordProcessedEvents(ctx, records)
+}
+
+func (c *TimelineConsumer) applyEventWithTimelineRecovery(ctx context.Context, event decodedTimelineEvent) error {
+	apply := func() error {
+		switch event.Kind {
+		case timelineEventKindVideo:
+			return c.applyVideoEvent(ctx, *event.Video)
+		case timelineEventKindFollow:
+			return c.applyFollowEvent(ctx, *event.Follow)
+		default:
+			return fmt.Errorf("unknown timeline event kind: %d", event.Kind)
+		}
+	}
+
+	err := apply()
+	if !errors.Is(err, errGlobalTimelineNotReady) {
+		return err
+	}
+
+	logx.WithContext(ctx).Errorf(
+		"global timeline ready marker missing, rebuilding before retry, event_id:%s",
+		event.Envelope.EventID,
+	)
+	if err := c.BootstrapGlobalTimeline(ctx); err != nil {
+		return fmt.Errorf("bootstrap global timeline after ready loss failed: %w", err)
+	}
+	return apply()
 }
 
 func (c *TimelineConsumer) decodeMessage(message kafkax.Message) (decodedTimelineEvent, model.DeadLetterEvent, bool) {

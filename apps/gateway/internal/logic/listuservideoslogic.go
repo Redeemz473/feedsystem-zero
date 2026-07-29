@@ -49,6 +49,11 @@ func (l *ListUserVideosLogic) ListUserVideos(req *types.ListUserVideosReq) (resp
 	} else {
 		videos = enrichedVideos
 	}
+	if enrichedVideos, enrichErr := enrichHTTPVideoAuthors(l.ctx, l.svcCtx.AccountRpc, videos); enrichErr != nil {
+		l.Errorf("enrich user videos author failed, author_id: %d, error: %v", req.Authorid, enrichErr)
+	} else {
+		videos = enrichedVideos
+	}
 
 	return &types.ListUserVideosResp{
 		Videos:              videos,

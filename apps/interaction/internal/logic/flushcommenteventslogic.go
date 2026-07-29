@@ -61,7 +61,7 @@ func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommen
 	resp := &interaction.FlushCommentEventsResp{
 		FailedEventIds: make([]string, 0),
 	}
-	flushedDeltas := make(map[uint64]videoStatDelta)
+	acks := make([]interactionDeltaAck, 0, len(events))
 
 	for index, event := range events {
 		eventID, delta, err := validateCommentFlushEvent(event, index)
@@ -71,21 +71,22 @@ func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommen
 			continue
 		}
 
-		applied, err := l.applyCommentFlushEvent(event, delta)
+		_, err = l.applyCommentFlushEvent(event, delta)
 		if err != nil {
 			resp.FailedEventIds = append(resp.FailedEventIds, eventID)
 			l.Errorf("flush comment event failed, event_id:%s video_id:%d comment_id:%d error:%v", eventID, event.GetVideoId(), event.GetCommentId(), err)
 			continue
 		}
-		if !applied {
-			continue
-		}
-
-		resp.SuccessCount++
-		mergeVideoStatDelta(flushedDeltas, event.GetVideoId(), delta)
+		// 重复事件仍要执行 Redis ack，修复“DB 已提交但 Redis 扣减失败”的中断窗口。
+		acks = append(acks, interactionDeltaAck{
+			EventID:         eventID,
+			VideoID:         event.GetVideoId(),
+			Delta:           delta,
+			InvalidationKey: rediskey.CommentListVersionKey(event.GetVideoId()),
+		})
 	}
 
-	l.refreshRedisAfterCommentFlush(flushedDeltas)
+	l.ackCommentEventDeltas(resp, acks)
 	return resp, nil
 }
 
@@ -152,26 +153,22 @@ func (l *FlushCommentEventsLogic) applyCommentFlushEvent(event *interaction.Comm
 	return applied, err
 }
 
-func (l *FlushCommentEventsLogic) refreshRedisAfterCommentFlush(flushedDeltas map[uint64]videoStatDelta) {
-	if len(flushedDeltas) == 0 {
+func (l *FlushCommentEventsLogic) ackCommentEventDeltas(resp *interaction.FlushCommentEventsResp, acks []interactionDeltaAck) {
+	if len(acks) == 0 {
 		return
 	}
 
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
+	redisCtx, cancel := context.WithTimeout(l.ctx, interactionDeltaAckTimeout)
 	defer cancel()
 
-	if err := subtractFlushedVideoDeltas(redisCtx, l.svcCtx.RedisCli, flushedDeltas); err != nil {
-		l.Errorf("subtract flushed comment deltas failed, error:%v", err)
-	}
-
-	pipe := l.svcCtx.RedisCli.Pipeline()
-	for _, videoID := range uniqueVideoIDsFromDeltas(flushedDeltas) {
-		pipe.Del(redisCtx, rediskey.VideoStatsCacheKey(videoID))
-		// 如果前台评论写 Redis 失败，job 至少能推进评论列表版本。
-		queueBumpCommentListVersion(redisCtx, pipe, videoID)
-	}
-	if _, err := pipe.Exec(redisCtx); err != nil {
-		l.Errorf("refresh redis after comment flush failed, error:%v", err)
+	failed := acknowledgeInteractionDeltas(redisCtx, l.svcCtx.RedisCli, acks)
+	for _, ack := range acks {
+		if err, ok := failed[ack.EventID]; ok {
+			resp.FailedEventIds = append(resp.FailedEventIds, ack.EventID)
+			l.Errorf("ack redis comment delta failed, event_id:%s video_id:%d error:%v", ack.EventID, ack.VideoID, err)
+			continue
+		}
+		resp.SuccessCount++
 	}
 }
 

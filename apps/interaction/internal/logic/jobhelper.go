@@ -2,7 +2,6 @@ package logic
 
 import (
 	"context"
-	"errors"
 	"strconv"
 	"time"
 
@@ -21,6 +20,7 @@ const (
 	maxFlushInteractionEvents      = 500
 	maxRebuildInteractionStatItems = 100
 	interactionJobLockTTL          = 30 * time.Second
+	interactionDeltaAckTimeout     = 3 * time.Second
 
 	interactionFlushLikeEventsJob    = "interaction:flush_like_events"
 	interactionFlushCommentEventsJob = "interaction:flush_comment_events"
@@ -36,6 +36,13 @@ type videoStatDelta struct {
 type videoStatCount struct {
 	VideoID uint64
 	Count   int64
+}
+
+type interactionDeltaAck struct {
+	EventID         string
+	VideoID         uint64
+	Delta           videoStatDelta
+	InvalidationKey string
 }
 
 // 一次处理事件的个数
@@ -137,76 +144,83 @@ func applyVideoStatDelta(ctx context.Context, tx *gorm.DB, videoID uint64, delta
 	return nil
 }
 
-func mergeVideoStatDelta(deltas map[uint64]videoStatDelta, videoID uint64, delta videoStatDelta) {
-	current := deltas[videoID]
-	current.LikeDelta += delta.LikeDelta
-	current.CommentDelta += delta.CommentDelta
-	current.PopularityDelta += delta.PopularityDelta
-	deltas[videoID] = current
-}
-
-func subtractFlushedVideoDeltas(ctx context.Context, redisCli *redis.Client, deltas map[uint64]videoStatDelta) error {
-	var joined error
-	for videoID, delta := range deltas {
-		// deltas 保存的是“本批已成功落库事件”的净增量。
-		// 同一个视频在同一批里 create/delete 抵消时，只扣减 Redis 中相同净增量，避免重复扣减。
-		field := redisHashField(videoID)
-		if delta.LikeDelta != 0 {
-			joined = errors.Join(joined, subtractRedisHashDelta(ctx, redisCli, rediskey.VideoLikeDeltaKey(), field, delta.LikeDelta))
-		}
-		if delta.CommentDelta != 0 {
-			joined = errors.Join(joined, subtractRedisHashDelta(ctx, redisCli, rediskey.VideoCommentDeltaKey(), field, delta.CommentDelta))
-		}
-		if delta.PopularityDelta != 0 {
-			joined = errors.Join(joined, subtractRedisHashDelta(ctx, redisCli, rediskey.VideoPopularityDeltaKey(), field, delta.PopularityDelta))
-		}
-	}
-	return joined
-}
-
-func subtractRedisHashDelta(ctx context.Context, redisCli *redis.Client, key string, field string, delta int64) error {
-	if delta == 0 {
-		return nil
-	}
-
-	const script = `
-local current = redis.call("HGET", KEYS[1], ARGV[1])
-if not current then
+const acknowledgeInteractionDeltaScript = `
+if redis.call("EXISTS", KEYS[2]) == 1 then
 	return 0
 end
-current = tonumber(current)
-if not current then
-	redis.call("HDEL", KEYS[1], ARGV[1])
-	return 0
+
+local function subtract(key, field, delta)
+	if delta == 0 then
+		return
+	end
+	local current = redis.call("HGET", key, field)
+	if not current then
+		return
+	end
+	current = tonumber(current)
+	if not current then
+		redis.call("HDEL", key, field)
+		return
+	end
+	local nextValue = current - delta
+	if nextValue == 0 then
+		redis.call("HDEL", key, field)
+	else
+		redis.call("HSET", key, field, nextValue)
+	end
 end
-local nextValue = current - tonumber(ARGV[2])
-if nextValue == 0 then
-	redis.call("HDEL", KEYS[1], ARGV[1])
-else
-	redis.call("HSET", KEYS[1], ARGV[1], nextValue)
+
+if redis.call("EXISTS", KEYS[1]) == 1 then
+	subtract(KEYS[3], ARGV[1], tonumber(ARGV[2]))
+	subtract(KEYS[4], ARGV[1], tonumber(ARGV[3]))
+	subtract(KEYS[5], ARGV[1], tonumber(ARGV[4]))
+	redis.call("DEL", KEYS[1])
 end
-return nextValue
+
+redis.call("SET", KEYS[2], "1", "EX", ARGV[5])
+redis.call("DEL", KEYS[6])
+redis.call("INCR", KEYS[7])
+return 1
 `
-	return redisCli.Eval(ctx, script, []string{key}, field, strconv.FormatInt(delta, 10)).Err()
-}
 
-func deleteVideoStatsCaches(ctx context.Context, redisCli *redis.Client, videoIDs []uint64) error {
-	if len(videoIDs) == 0 {
-		return nil
+// acknowledgeInteractionDeltas 在 MySQL 事务提交后按事件确认 Redis 实时增量。
+// Pipeline 只减少网络往返；每条 Eval 仍是独立原子操作，因此可以精确返回需要重试的事件。
+func acknowledgeInteractionDeltas(ctx context.Context, redisCli *redis.Client, acks []interactionDeltaAck) map[string]error {
+	failed := make(map[string]error)
+	if len(acks) == 0 {
+		return failed
 	}
 
 	pipe := redisCli.Pipeline()
-	for _, videoID := range videoIDs {
-		pipe.Del(ctx, rediskey.VideoStatsCacheKey(videoID))
+	commands := make(map[string]*redis.Cmd, len(acks))
+	ttlSeconds := strconv.FormatInt(int64(interactionDeltaTTL/time.Second), 10)
+	for _, ack := range acks {
+		field := redisHashField(ack.VideoID)
+		commands[ack.EventID] = pipe.Eval(
+			ctx,
+			acknowledgeInteractionDeltaScript,
+			[]string{
+				rediskey.InteractionDeltaPendingKey(ack.EventID),
+				rediskey.InteractionDeltaAckKey(ack.EventID),
+				rediskey.VideoLikeDeltaKey(),
+				rediskey.VideoCommentDeltaKey(),
+				rediskey.VideoPopularityDeltaKey(),
+				rediskey.VideoStatsCacheKey(ack.VideoID),
+				ack.InvalidationKey,
+			},
+			field,
+			strconv.FormatInt(ack.Delta.LikeDelta, 10),
+			strconv.FormatInt(ack.Delta.CommentDelta, 10),
+			strconv.FormatInt(ack.Delta.PopularityDelta, 10),
+			ttlSeconds,
+		)
 	}
-	_, err := pipe.Exec(ctx)
-	return err
-}
+	_, _ = pipe.Exec(ctx)
 
-func uniqueVideoIDsFromDeltas(deltas map[uint64]videoStatDelta) []uint64 {
-	videoIDs := make([]uint64, 0, len(deltas))
-	for videoID := range deltas {
-		videoIDs = append(videoIDs, videoID)
+	for eventID, command := range commands {
+		if err := command.Err(); err != nil {
+			failed[eventID] = err
+		}
 	}
-	return videoIDs
+	return failed
 }

@@ -47,7 +47,7 @@ func (l *ListMyLikedVideosLogic) ListMyLikedVideos(req *types.ListMyLikedVideosR
 	for _, item := range rpcResp.GetLikedVideos() {
 		videoIDs = append(videoIDs, item.GetVideoId())
 	}
-	videoMap, err := loadHTTPVideosByIDs(l.ctx, l.svcCtx.VideoRpc, l.svcCtx.InteractionRpc, userID, videoIDs)
+	videoMap, err := loadHTTPVideosByIDs(l.ctx, l.svcCtx.AccountRpc, l.svcCtx.VideoRpc, l.svcCtx.InteractionRpc, userID, videoIDs)
 	if err != nil {
 		return nil, err
 	}

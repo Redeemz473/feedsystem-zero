@@ -6,6 +6,7 @@ const (
 	FileAssetStatusActive        int32 = 1
 	FileAssetStatusPendingDelete int32 = 2
 	FileAssetStatusDeleted       int32 = 3
+	FileAssetStatusCleaning      int32 = 4
 )
 
 const (

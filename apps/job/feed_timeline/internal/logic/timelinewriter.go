@@ -44,8 +44,8 @@ const (
 )
 
 // errGlobalTimelineNotReady 表示全局 Timeline 在 Redis 中丢失（例如被 flush），
-// 需要依赖 BootstrapGlobalTimeline 重建。返回该错误后由 Kafka 重投兜底，
-// 避免在事件处理路径中同步递归调用 bootstrap 造成栈膨胀和多次并发重建。
+// 需要依赖 BootstrapGlobalTimeline 重建。事件处理层捕获该错误后只执行一次
+// 带分布式锁的重建并重试当前事件，避免 Kafka 原地重试却永远无人恢复 ready 标记。
 var errGlobalTimelineNotReady = errors.New("global timeline not ready, waiting for bootstrap")
 
 const mutateGlobalTimelineScript = `

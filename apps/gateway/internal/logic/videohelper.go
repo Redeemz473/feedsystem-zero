@@ -1,6 +1,7 @@
 package logic
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -16,7 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"feedsystem-zero/apps/account/accountclient"
 	"feedsystem-zero/apps/gateway/internal/config"
+	"feedsystem-zero/apps/gateway/internal/model"
 	"feedsystem-zero/apps/gateway/internal/types"
 	"feedsystem-zero/apps/interaction/interactionclient"
 	"feedsystem-zero/apps/video/videoclient"
@@ -25,6 +28,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"gorm.io/gorm"
 )
 
 const (
@@ -182,6 +186,7 @@ func gatewayGeneratedPublishRequestID(userID uint64) (string, error) {
 
 func loadHTTPVideosByIDs(
 	ctx context.Context,
+	accountRpc accountclient.Account,
 	videoRpc videoclient.Video,
 	interactionRpc interactionclient.Interaction,
 	viewerID uint64,
@@ -209,12 +214,36 @@ func loadHTTPVideosByIDs(
 	if enrichedVideos, err := enrichHTTPVideoInteractions(ctx, interactionRpc, viewerID, videos); err == nil {
 		videos = enrichedVideos
 	}
+	if enrichedVideos, err := enrichHTTPVideoAuthors(ctx, accountRpc, videos); err == nil {
+		videos = enrichedVideos
+	}
 
 	videoMap := make(map[uint64]types.VideoInfo, len(videos))
 	for _, video := range videos {
 		videoMap[video.Videoid] = video
 	}
 	return videoMap, nil
+}
+
+func enrichHTTPVideoAuthors(
+	ctx context.Context,
+	accountRpc accountclient.Account,
+	videos []types.VideoInfo,
+) ([]types.VideoInfo, error) {
+	authorIDs := make([]uint64, 0, len(videos))
+	for _, video := range videos {
+		authorIDs = append(authorIDs, video.Authorid)
+	}
+	profiles, err := loadSocialUserInfoMap(ctx, accountRpc, authorIDs)
+	if err != nil {
+		return nil, err
+	}
+	for index := range videos {
+		if profile, ok := profiles[videos[index].Authorid]; ok {
+			videos[index].Authorusername = profile.Username
+		}
+	}
+	return videos, nil
 }
 
 func uniqueUint64(raw []uint64) []uint64 {
@@ -245,8 +274,7 @@ func saveVideoUpload(r *http.Request, upload config.UploadConf) (*savedUploadAss
 	if upload.MaxVideoBytes > 0 && upload.MaxVideoBytes < maxBytes {
 		maxBytes = upload.MaxVideoBytes
 	}
-	expectedHash := normalizeFormHash(r, "file_hash")
-	return saveMultipartUpload(r, upload, "videos", maxBytes, videoExts, []string{"file", "video"}, expectedHash)
+	return saveMultipartUpload(r, upload, "videos", maxBytes, videoExts, []string{"file", "video"})
 }
 
 func saveCoverUpload(r *http.Request, upload config.UploadConf) (*savedUploadAsset, error) {
@@ -254,25 +282,24 @@ func saveCoverUpload(r *http.Request, upload config.UploadConf) (*savedUploadAss
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxCoverBytes
 	}
-	expectedHash := normalizeFormHash(r, "file_hash")
-	return saveMultipartUpload(r, upload, "covers", maxBytes, coverExts, []string{"file", "cover"}, expectedHash)
+	return saveMultipartUpload(r, upload, "covers", maxBytes, coverExts, []string{"file", "cover"})
 }
 
 // normalizeFormHash 从 multipart 表单中读取 file_hash 字段并归一化为标准哈希。
 // 字段不存在或为空时返回空串（表示前端未提供 hash，跳过校验，保持向后兼容）。
-func normalizeFormHash(r *http.Request, field string) string {
+func normalizeFormHash(r *http.Request, field string) (string, error) {
 	if r == nil || r.MultipartForm == nil || r.MultipartForm.Value == nil {
-		return ""
+		return "", nil
 	}
 	values := r.MultipartForm.Value[field]
 	if len(values) == 0 {
-		return ""
+		return "", nil
 	}
-	hash, err := normalizeUploadHash(values[0])
-	if err != nil {
-		return ""
+	rawHash := strings.TrimSpace(values[0])
+	if rawHash == "" {
+		return "", nil
 	}
-	return hash
+	return normalizeUploadHash(rawHash)
 }
 
 // 整文件直传
@@ -283,10 +310,13 @@ func saveMultipartUpload(
 	maxBytes int64,
 	allowedExts map[string]struct{},
 	fieldNames []string,
-	expectedHash string,
 ) (*savedUploadAsset, error) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		return nil, status.Error(codes.InvalidArgument, "上传文件解析失败")
+	}
+	expectedHash, err := normalizeFormHash(r, "file_hash")
+	if err != nil {
+		return nil, err
 	}
 
 	for _, fieldName := range fieldNames {
@@ -302,6 +332,9 @@ func saveMultipartUpload(
 		}
 		if header.Size > maxBytes {
 			return nil, status.Error(codes.InvalidArgument, "上传文件过大")
+		}
+		if err := validateUploadedFileSignature(file, ext); err != nil {
+			return nil, err
 		}
 
 		targetDir := filepath.Join(uploadBaseDir(upload), subDir)
@@ -363,13 +396,62 @@ func saveMultipartUpload(
 
 		return &savedUploadAsset{
 			URL:         publicURL(upload, subDir, filename),
-			StoragePath: targetPath,
+			StoragePath: absolutePath(targetPath),
 			FileHash:    fileHash,
 			Size:        written,
 		}, nil
 	}
 
 	return nil, status.Error(codes.InvalidArgument, "缺少上传文件")
+}
+
+func absolutePath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return path
+	}
+	return abs
+}
+
+func validateUploadedFileSignature(file io.ReadSeeker, ext string) error {
+	header := make([]byte, 512)
+	n, err := file.Read(header)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return status.Error(codes.InvalidArgument, "读取上传文件失败")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return status.Error(codes.Internal, "重置上传文件失败")
+	}
+	header = header[:n]
+
+	valid := false
+	switch ext {
+	case ".jpg", ".jpeg":
+		valid = bytes.HasPrefix(header, []byte{0xff, 0xd8, 0xff})
+	case ".png":
+		valid = bytes.HasPrefix(header, []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a})
+	case ".webp":
+		valid = len(header) >= 12 &&
+			string(header[:4]) == "RIFF" &&
+			string(header[8:12]) == "WEBP"
+	case ".mp4", ".mov", ".m4v":
+		valid = len(header) >= 12 && string(header[4:8]) == "ftyp"
+	case ".webm":
+		valid = bytes.HasPrefix(header, []byte{0x1a, 0x45, 0xdf, 0xa3})
+	}
+	if !valid {
+		return status.Error(codes.InvalidArgument, "文件内容与扩展名不匹配")
+	}
+	return nil
+}
+
+func validateUploadedFilePathSignature(path string, ext string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return status.Error(codes.Internal, "读取上传文件失败")
+	}
+	defer file.Close()
+	return validateUploadedFileSignature(file, ext)
 }
 
 func randomFilename(ext string) (string, error) {
@@ -542,28 +624,52 @@ func loadUploadedChunks(ctx context.Context, redisCli *redis.Client, uploadID st
 	return uploadedChunks, nil
 }
 
-func lookupInstantUploadedFile(ctx context.Context, redisCli *redis.Client, upload config.UploadConf, userID uint64, fileHash string) (string, error) {
-	playURL, err := redisCli.Get(ctx, rediskey.ChunkUploadHashKey(userID, fileHash)).Result()
-	if err == nil {
-		return playURL, nil
-	}
-	if !errors.Is(err, redis.Nil) {
-		return "", status.Error(codes.Internal, "查询秒传缓存失败")
-	}
-
-	playURL, err = redisCli.Get(ctx, rediskey.ChunkUploadGlobalHashKey(fileHash)).Result()
-	if err == nil {
-		_ = redisCli.Set(
-			ctx,
-			rediskey.ChunkUploadHashKey(userID, fileHash),
-			playURL,
-			uploadedFileTTL(upload),
-		).Err()
-		return playURL, nil
-	}
-	if !errors.Is(err, redis.Nil) {
-		return "", status.Error(codes.Internal, "查询秒传缓存失败")
+func lookupInstantUploadedFile(ctx context.Context, redisCli *redis.Client, db *gorm.DB, upload config.UploadConf, userID uint64, fileHash string) (string, error) {
+	// Redis 只用于加速，file_assets 状态和磁盘文件才决定能否秒传。
+	// 这样视频最后一个引用被删除后，即使旧秒传 key 尚未过期，也不会返回待清理文件。
+	var asset model.FileAsset
+	err := db.WithContext(ctx).
+		Where("file_hash = ? AND file_type = ? AND status = ?", fileHash, model.FileAssetTypeVideo, model.FileAssetStatusActive).
+		First(&asset).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			pipe := redisCli.Pipeline()
+			pipe.Del(ctx, rediskey.ChunkUploadHashKey(userID, fileHash))
+			pipe.Del(ctx, rediskey.ChunkUploadGlobalHashKey(fileHash))
+			_, _ = pipe.Exec(ctx)
+			return "", nil
+		}
+		return "", status.Error(codes.Internal, "查询视频资源失败")
 	}
 
-	return "", nil
+	info, err := os.Stat(asset.StoragePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && asset.RefCount == 0 {
+			_ = db.WithContext(ctx).
+				Model(&model.FileAsset{}).
+				Where("id = ? AND status = ? AND ref_count = 0", asset.ID, model.FileAssetStatusActive).
+				Updates(map[string]any{
+					"status":     model.FileAssetStatusDeleted,
+					"deleted_at": time.Now(),
+				}).Error
+			pipe := redisCli.Pipeline()
+			pipe.Del(ctx, rediskey.ChunkUploadHashKey(userID, fileHash))
+			pipe.Del(ctx, rediskey.ChunkUploadGlobalHashKey(fileHash))
+			_, _ = pipe.Exec(ctx)
+			return "", nil
+		}
+		return "", status.Error(codes.Internal, "秒传源文件不可用")
+	}
+	if !info.Mode().IsRegular() || strings.TrimSpace(asset.URL) == "" {
+		return "", status.Error(codes.Internal, "秒传源文件异常")
+	}
+
+	ttl := uploadedFileTTL(upload)
+	pipe := redisCli.Pipeline()
+	pipe.Set(ctx, rediskey.ChunkUploadHashKey(userID, fileHash), asset.URL, ttl)
+	pipe.Set(ctx, rediskey.ChunkUploadGlobalHashKey(fileHash), asset.URL, ttl)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return "", status.Error(codes.Internal, "刷新秒传缓存失败")
+	}
+	return asset.URL, nil
 }

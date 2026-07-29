@@ -251,7 +251,7 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 	//发布评论改为只更新版本号，不去DEL缓存，让缓存自动TTL过期，防止在DEL和更新版本号之间有请求，白建缓存
 	commentsCount := nonNegative(video.CommentsCount + 1)
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	commentDelta, err := applyRedisCommentCreatedState(redisCtx, l.svcCtx.RedisCli, videoID, userID, comment.ID, requestID)
+	commentDelta, err := applyRedisCommentCreatedState(redisCtx, l.svcCtx.RedisCli, eventID, videoID, userID, comment.ID, requestID)
 	cancel()
 	if err != nil {
 		l.Errorf("apply redis comment created state failed, video_id: %d, user_id: %d, comment_id: %d, error: %v", videoID, userID, comment.ID, err)

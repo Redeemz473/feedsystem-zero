@@ -1,0 +1,21 @@
+Name: asset-cleanup.job
+
+Mysql:
+  DataSource: root:123456@tcp(127.0.0.1:3308)/feedsystem_zero?charset=utf8mb4&parseTime=true&loc=Local
+
+BizRedis:
+  Addr: 127.0.0.1:6380
+  Password: "123456"
+  DB: 0
+
+# 必须与 gateway 的 Upload.Dir 指向同一个本地目录。
+# 该默认值适用于从 apps/job/asset_cleanup 目录启动本任务。
+Upload:
+  Dir: ../../gateway/uploads
+
+AssetCleanup:
+  BatchSize: 100
+  PollIntervalSeconds: 30
+  GraceSeconds: 300
+  ClaimTimeoutSeconds: 300
+  DeleteTimeoutMs: 5000

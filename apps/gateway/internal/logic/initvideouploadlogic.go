@@ -92,7 +92,7 @@ func (l *InitVideoUploadLogic) InitVideoUpload(req *types.InitVideoUploadReq) (r
 	// 3. file_size <= ChunkThresholdBytes 时返回 need_chunk=false，让前端走 /video/upload 小文件直传。
 	// 4. EnableInstantUpload=true 时先查 rediskey.ChunkUploadHashKey 或 ChunkUploadGlobalHashKey，命中则直接返回 play_url。
 	if l.svcCtx.Config.Upload.EnableInstantUpload {
-		playURL, err := lookupInstantUploadedFile(l.ctx, l.svcCtx.RedisCli, l.svcCtx.Config.Upload, userID, fileHash)
+		playURL, err := lookupInstantUploadedFile(l.ctx, l.svcCtx.RedisCli, l.svcCtx.GormDB, l.svcCtx.Config.Upload, userID, fileHash)
 		if err != nil {
 			return nil, err
 		}

@@ -53,7 +53,7 @@ func (l *VideoUploadStatusLogic) VideoUploadStatus(req *types.VideoUploadStatusR
 			return nil, err
 		}
 
-		playURL, err := lookupInstantUploadedFile(l.ctx, l.svcCtx.RedisCli, l.svcCtx.Config.Upload, userID, requestFileHash)
+		playURL, err := lookupInstantUploadedFile(l.ctx, l.svcCtx.RedisCli, l.svcCtx.GormDB, l.svcCtx.Config.Upload, userID, requestFileHash)
 		if err != nil {
 			return nil, err
 		}
@@ -108,7 +108,7 @@ func (l *VideoUploadStatusLogic) VideoUploadStatus(req *types.VideoUploadStatusR
 	}
 
 	// 4. 如果 file_hash 对应秒传 key 已存在，返回 completed=true 和 play_url。
-	playURL, err := lookupInstantUploadedFile(l.ctx, l.svcCtx.RedisCli, l.svcCtx.Config.Upload, userID, fileHash)
+	playURL, err := lookupInstantUploadedFile(l.ctx, l.svcCtx.RedisCli, l.svcCtx.GormDB, l.svcCtx.Config.Upload, userID, fileHash)
 	if err != nil {
 		return nil, err
 	}

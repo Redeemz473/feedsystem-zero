@@ -75,7 +75,7 @@ func hydrateNotifications(
 	}
 
 	// 视频侧只需要标题+封面，直接复用 BatchGetVideos。viewerID 传 0 表示不查询点赞状态。
-	videoMap, err := loadHTTPVideosByIDs(ctx, svcCtx.VideoRpc, svcCtx.InteractionRpc, 0, videoIDs)
+	videoMap, err := loadHTTPVideosByIDs(ctx, svcCtx.AccountRpc, svcCtx.VideoRpc, svcCtx.InteractionRpc, 0, videoIDs)
 	if err != nil {
 		// 视频信息获取失败时降级为空 map，通知列表本身不应因视频服务抖动而不可用。
 		videoMap = map[uint64]types.VideoInfo{}

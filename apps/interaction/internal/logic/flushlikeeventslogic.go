@@ -58,8 +58,7 @@ func (l *FlushLikeEventsLogic) FlushLikeEvents(in *interaction.FlushLikeEventsRe
 	resp := &interaction.FlushLikeEventsResp{
 		FailedEventIds: make([]string, 0),
 	}
-	flushedDeltas := make(map[uint64]videoStatDelta)
-	changedUsers := make(map[uint64]struct{})
+	acks := make([]interactionDeltaAck, 0, len(events))
 
 	for index, event := range events {
 		eventID, delta, err := validateLikeFlushEvent(event, index)
@@ -69,22 +68,23 @@ func (l *FlushLikeEventsLogic) FlushLikeEvents(in *interaction.FlushLikeEventsRe
 			continue
 		}
 
-		applied, err := l.applyLikeFlushEvent(event, delta)
+		_, err = l.applyLikeFlushEvent(event, delta)
 		if err != nil {
 			resp.FailedEventIds = append(resp.FailedEventIds, eventID)
 			l.Errorf("flush like event failed, event_id:%s video_id:%d user_id:%d error:%v", eventID, event.GetVideoId(), event.GetUserId(), err)
 			continue
 		}
-		if !applied {
-			continue
-		}
-
-		resp.SuccessCount++
-		mergeVideoStatDelta(flushedDeltas, event.GetVideoId(), delta)
-		changedUsers[event.GetUserId()] = struct{}{}
+		// 即使 processed_events 已存在，也必须重试 Redis ack；上次可能在 DB
+		// 提交后、确认增量前中断。
+		acks = append(acks, interactionDeltaAck{
+			EventID:         eventID,
+			VideoID:         event.GetVideoId(),
+			Delta:           delta,
+			InvalidationKey: rediskey.LikeUserVideosListVersionKey(event.GetUserId()),
+		})
 	}
 
-	l.refreshRedisAfterLikeFlush(flushedDeltas, changedUsers)
+	l.ackLikeEventDeltas(resp, acks)
 	return resp, nil
 }
 
@@ -149,28 +149,22 @@ func (l *FlushLikeEventsLogic) applyLikeFlushEvent(event *interaction.LikeEvent,
 	return applied, err
 }
 
-func (l *FlushLikeEventsLogic) refreshRedisAfterLikeFlush(flushedDeltas map[uint64]videoStatDelta, changedUsers map[uint64]struct{}) {
-	if len(flushedDeltas) == 0 && len(changedUsers) == 0 {
+func (l *FlushLikeEventsLogic) ackLikeEventDeltas(resp *interaction.FlushLikeEventsResp, acks []interactionDeltaAck) {
+	if len(acks) == 0 {
 		return
 	}
 
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
+	redisCtx, cancel := context.WithTimeout(l.ctx, interactionDeltaAckTimeout)
 	defer cancel()
 
-	if err := subtractFlushedVideoDeltas(redisCtx, l.svcCtx.RedisCli, flushedDeltas); err != nil {
-		l.Errorf("subtract flushed like deltas failed, error:%v", err)
-	}
-
-	pipe := l.svcCtx.RedisCli.Pipeline()
-	for _, videoID := range uniqueVideoIDsFromDeltas(flushedDeltas) {
-		pipe.Del(redisCtx, rediskey.VideoStatsCacheKey(videoID))
-	}
-	for userID := range changedUsers {
-		// 如果前台写 Redis 失败，job 至少能让“我的喜欢列表”缓存版本前进。
-		pipe.Incr(redisCtx, rediskey.LikeUserVideosListVersionKey(userID))
-	}
-	if _, err := pipe.Exec(redisCtx); err != nil {
-		l.Errorf("refresh redis after like flush failed, error:%v", err)
+	failed := acknowledgeInteractionDeltas(redisCtx, l.svcCtx.RedisCli, acks)
+	for _, ack := range acks {
+		if err, ok := failed[ack.EventID]; ok {
+			resp.FailedEventIds = append(resp.FailedEventIds, ack.EventID)
+			l.Errorf("ack redis like delta failed, event_id:%s video_id:%d error:%v", ack.EventID, ack.VideoID, err)
+			continue
+		}
+		resp.SuccessCount++
 	}
 }
 

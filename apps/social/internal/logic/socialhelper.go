@@ -19,6 +19,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -39,6 +41,30 @@ end
 redis.call("SET", KEYS[2], ARGV[2], "PX", ARGV[3])
 return 1
 `
+
+// lockFollowAccounts 按主键升序锁住关注双方的账户行。
+// A 关注 B 与 B 关注 A 必须使用相同的加锁顺序，否则两个事务分别先锁
+// 对方账户时会形成经典的锁顺序反转。
+func lockFollowAccounts(ctx context.Context, tx *gorm.DB, followerID, followingID uint64) error {
+	firstID, secondID := followerID, followingID
+	if firstID > secondID {
+		firstID, secondID = secondID, firstID
+	}
+
+	var accounts []model.Account
+	if err := tx.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Select("id").
+		Where("id IN ?", []uint64{firstID, secondID}).
+		Order("id ASC").
+		Find(&accounts).Error; err != nil {
+		return err
+	}
+	if len(accounts) != 2 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
 
 const releaseSocialCacheLockScript = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then

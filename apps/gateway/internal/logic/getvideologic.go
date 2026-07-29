@@ -45,6 +45,11 @@ func (l *GetVideoLogic) GetVideo(req *types.GetVideoReq) (resp *types.GetVideoRe
 	} else {
 		videos = enrichedVideos
 	}
+	if enrichedVideos, enrichErr := enrichHTTPVideoAuthors(l.ctx, l.svcCtx.AccountRpc, videos); enrichErr != nil {
+		l.Errorf("enrich video author failed, video_id: %d, error: %v", req.Videoid, enrichErr)
+	} else {
+		videos = enrichedVideos
+	}
 
 	return &types.GetVideoResp{
 		Video: videos[0],

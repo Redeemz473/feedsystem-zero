@@ -132,12 +132,16 @@ func (l *CompleteVideoUploadLogic) CompleteVideoUpload(req *types.CompleteVideoU
 		if existingHash != fileHash {
 			return nil, status.Error(codes.Internal, "目标文件 hash 异常")
 		}
-		if err := l.finishCompletedUpload(userID, uploadID, fileHash, playURL, finalPath, req.Filesize); err != nil {
+		if err := validateUploadedFilePathSignature(finalPath, finalExt); err != nil {
+			return nil, err
+		}
+		canonicalURL, err := l.finishCompletedUpload(userID, uploadID, fileHash, playURL, absolutePath(finalPath), req.Filesize)
+		if err != nil {
 			return nil, err
 		}
 		return &types.CompleteVideoUploadResp{
 			Msg:      "合并成功",
-			Playurl:  playURL,
+			Playurl:  canonicalURL,
 			Filehash: fileHash,
 		}, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -202,6 +206,9 @@ func (l *CompleteVideoUploadLogic) CompleteVideoUpload(req *types.CompleteVideoU
 	if actualHash != fileHash {
 		return nil, status.Error(codes.InvalidArgument, "合并文件 hash 校验失败")
 	}
+	if err := validateUploadedFilePathSignature(tmpPath, finalExt); err != nil {
+		return nil, err
+	}
 
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return nil, status.Error(codes.Internal, "保存最终视频失败")
@@ -210,38 +217,40 @@ func (l *CompleteVideoUploadLogic) CompleteVideoUpload(req *types.CompleteVideoU
 
 	// 6. 写入 ChunkUploadHashKey/ChunkUploadGlobalHashKey 做秒传。
 	// 7. 删除临时 chunk 目录和 upload 会话 key，返回 play_url。
-	if err := l.finishCompletedUpload(userID, uploadID, fileHash, playURL, finalPath, req.Filesize); err != nil {
+	canonicalURL, err := l.finishCompletedUpload(userID, uploadID, fileHash, playURL, absolutePath(finalPath), req.Filesize)
+	if err != nil {
 		return nil, err
 	}
 
 	return &types.CompleteVideoUploadResp{
 		Msg:      "合并成功",
-		Playurl:  playURL,
+		Playurl:  canonicalURL,
 		Filehash: fileHash,
 	}, nil
 }
 
-func (l *CompleteVideoUploadLogic) finishCompletedUpload(userID uint64, uploadID string, fileHash string, playURL string, storagePath string, fileSize int64) error {
-	if err := upsertFileAsset(l.ctx, l.svcCtx.GormDB, model.FileAssetTypeVideo, fileHash, playURL, storagePath, fileSize); err != nil {
+func (l *CompleteVideoUploadLogic) finishCompletedUpload(userID uint64, uploadID string, fileHash string, playURL string, storagePath string, fileSize int64) (string, error) {
+	canonicalAsset, err := upsertFileAsset(l.ctx, l.svcCtx.GormDB, model.FileAssetTypeVideo, fileHash, playURL, storagePath, fileSize)
+	if err != nil {
 		l.Errorf("upsert video file asset failed, upload_id: %s, file_hash: %s, error: %v", uploadID, fileHash, err)
-		return status.Error(codes.Internal, "保存视频资源失败")
+		return "", status.Error(codes.Internal, "保存视频资源失败")
 	}
 
 	ttl := uploadedFileTTL(l.svcCtx.Config.Upload)
 	pipe := l.svcCtx.RedisCli.TxPipeline()
-	pipe.Set(l.ctx, rediskey.ChunkUploadHashKey(userID, fileHash), playURL, ttl)
-	pipe.Set(l.ctx, rediskey.ChunkUploadGlobalHashKey(fileHash), playURL, ttl)
+	pipe.Set(l.ctx, rediskey.ChunkUploadHashKey(userID, fileHash), canonicalAsset.URL, ttl)
+	pipe.Set(l.ctx, rediskey.ChunkUploadGlobalHashKey(fileHash), canonicalAsset.URL, ttl)
 	pipe.Del(l.ctx, rediskey.ChunkUploadMetaKey(uploadID))
 	pipe.Del(l.ctx, rediskey.ChunkUploadKey(uploadID))
 	pipe.Del(l.ctx, rediskey.ChunkUploadSessionKey(userID, fileHash))
 	if _, err := pipe.Exec(l.ctx); err != nil {
-		return status.Error(codes.Internal, "保存秒传状态失败")
+		return "", status.Error(codes.Internal, "保存秒传状态失败")
 	}
 
 	if err := os.RemoveAll(chunkTempDir(l.svcCtx.Config.Upload, uploadID)); err != nil {
 		l.Errorf("remove chunk temp dir failed, upload_id: %s, error: %v", uploadID, err)
 	}
-	return nil
+	return canonicalAsset.URL, nil
 }
 
 func (l *CompleteVideoUploadLogic) releaseUploadLock(lockKey string, lockToken string) {

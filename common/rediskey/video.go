@@ -65,6 +65,21 @@ func VideoStatsCacheKey(videoID uint64) string {
 	return fmt.Sprintf("%s:video:stats:%d", prefix, videoID)
 }
 
+// InteractionDeltaPendingKey 标记某个互动事件的实时增量已经写入 Redis、尚未确认落库。
+// consumer 只有看到该标记时才扣减对应增量，避免 Kafka 先消费、在线请求后写 Redis
+// 导致计数被永久重复计算。
+// 格式: fsz:interaction:delta:pending:{eventID}
+func InteractionDeltaPendingKey(eventID string) string {
+	return fmt.Sprintf("%s:interaction:delta:pending:%s", prefix, eventID)
+}
+
+// InteractionDeltaAckKey 标记某个互动事件已经完成 MySQL 聚合并处理过 Redis 增量。
+// 在线请求若发现该标记，不再写入实时增量；consumer 重试时也不会重复扣减。
+// 格式: fsz:interaction:delta:acked:{eventID}
+func InteractionDeltaAckKey(eventID string) string {
+	return fmt.Sprintf("%s:interaction:delta:acked:%s", prefix, eventID)
+}
+
 // HotVideoRealtimeKey 实时热榜，ZSET，score=实时热度，member=videoID
 // 格式: fsz:hot:video:realtime
 func HotVideoRealtimeKey() string {

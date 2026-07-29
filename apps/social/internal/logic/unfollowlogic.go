@@ -59,6 +59,10 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 	now := time.Now()
 	stateChanged := false
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockFollowAccounts(l.ctx, tx, followerID, followingID); err != nil {
+			return err
+		}
+
 		var follow model.Follow
 		//加锁查询关注关系
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).

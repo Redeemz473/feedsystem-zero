@@ -1233,6 +1233,7 @@ func loadFollowingFeedMerged(
 	// 3. 逐个懒加载 + 读大 V outbox
 	// 顺序处理保持逻辑简单；后续如果 fan-in 变大可以改为并发。
 	outboxItems := make([]*feed.FeedVideoItem, 0, len(bigCreatorIDs)*int(pageSize))
+	outboxHasMore := false
 	for _, authorID := range bigCreatorIDs {
 		if err := ensureAuthorOutbox(ctx, svcCtx, authorID); err != nil {
 			// 单个大 V outbox 失败不阻塞整个 feed，降级为该作者视频不出现在本页。
@@ -1257,11 +1258,14 @@ func loadFollowingFeedMerged(
 			continue
 		}
 		outboxItems = append(outboxItems, page.Items...)
+		outboxHasMore = outboxHasMore || page.HasMore
 	}
 
 	// 4. 归并去重
 	merged := mergeFeedItems(inboxPage.Items, outboxItems, pageSize)
-	hasMore := inboxPage.HasMore || int64(len(inboxPage.Items)+len(outboxItems)) > pageSize
+	hasMore := inboxPage.HasMore ||
+		outboxHasMore ||
+		int64(len(inboxPage.Items)+len(outboxItems)) > pageSize
 	return timelinePage{Items: merged, HasMore: hasMore}, nil
 }
 

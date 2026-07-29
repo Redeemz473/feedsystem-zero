@@ -191,7 +191,7 @@ func (l *DeleteCommentLogic) DeleteComment(in *interaction.DeleteCommentReq) (*i
 
 	commentsCount := nonNegative(video.CommentsCount - 1)
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	commentDelta, err := applyRedisCommentDeletedState(redisCtx, l.svcCtx.RedisCli, video.ID, userID, comment.ID, comment.RequestID)
+	commentDelta, err := applyRedisCommentDeletedState(redisCtx, l.svcCtx.RedisCli, eventID, video.ID, userID, comment.ID, comment.RequestID)
 	cancel()
 	if err != nil {
 		l.Errorf("apply redis comment deleted state failed, video_id: %d, user_id: %d, comment_id: %d, error: %v", video.ID, userID, comment.ID, err)

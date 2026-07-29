@@ -39,13 +39,14 @@ func (l *UploadCoverLogic) UploadCover(r *http.Request) (resp *types.UploadCover
 	if err != nil {
 		return nil, err
 	}
-	if err := upsertFileAsset(l.ctx, l.svcCtx.GormDB, model.FileAssetTypeCover, asset.FileHash, asset.URL, asset.StoragePath, asset.Size); err != nil {
+	canonicalAsset, err := upsertFileAsset(l.ctx, l.svcCtx.GormDB, model.FileAssetTypeCover, asset.FileHash, asset.URL, asset.StoragePath, asset.Size)
+	if err != nil {
 		l.Errorf("upsert cover file asset failed, cover_url: %s, error: %v", asset.URL, err)
 		return nil, status.Error(codes.Internal, "保存封面资源失败")
 	}
 
 	return &types.UploadCoverResp{
 		Msg:      "上传成功",
-		Coverurl: asset.URL,
+		Coverurl: canonicalAsset.URL,
 	}, nil
 }

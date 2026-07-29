@@ -21,6 +21,7 @@ const (
 	likeActionLockTTL       = 3 * time.Second
 	likeStateTTL            = 7 * 24 * time.Hour
 	commentIdempotencyTTL   = 24 * time.Hour
+	interactionDeltaTTL     = time.Duration(eventx.DefaultProcessedEventTTLDays) * 24 * time.Hour
 	likePopularityWeight    = eventx.LikePopularityWeight
 	commentPopularityWeight = eventx.CommentPopularityWeight
 )
@@ -260,36 +261,86 @@ func fillUnlikedState(ctx context.Context, redisCli *redis.Client, videoID uint6
 	return err
 }
 
-// applyRedisLikeState 写点赞后的 Redis 实时状态和增量计数。
-func applyRedisLikeState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64) error {
+const applyInteractionDeltaScript = `
+if redis.call("EXISTS", KEYS[2]) == 1 then
+	return 0
+end
+local inserted = redis.call("SET", KEYS[1], "1", "NX", "EX", ARGV[5])
+if not inserted then
+	return 0
+end
+if ARGV[2] ~= "0" then
+	redis.call("HINCRBY", KEYS[3], ARGV[1], ARGV[2])
+end
+if ARGV[3] ~= "0" then
+	redis.call("HINCRBY", KEYS[4], ARGV[1], ARGV[3])
+end
+if ARGV[4] ~= "0" then
+	redis.call("HINCRBY", KEYS[5], ARGV[1], ARGV[4])
+end
+redis.call("DEL", KEYS[6])
+return 1
+`
+
+// applyInteractionDelta 按 event_id 原子写入尚未落库的实时增量。
+// pending/acked 两个标记让在线请求与 Kafka consumer 无论谁先执行都不会重复计数。
+func applyInteractionDelta(ctx context.Context, redisCli *redis.Client, eventID string, videoID uint64, delta videoStatDelta) error {
 	field := redisHashField(videoID)
+	return redisCli.Eval(
+		ctx,
+		applyInteractionDeltaScript,
+		[]string{
+			rediskey.InteractionDeltaPendingKey(eventID),
+			rediskey.InteractionDeltaAckKey(eventID),
+			rediskey.VideoLikeDeltaKey(),
+			rediskey.VideoCommentDeltaKey(),
+			rediskey.VideoPopularityDeltaKey(),
+			rediskey.VideoStatsCacheKey(videoID),
+		},
+		field,
+		strconv.FormatInt(delta.LikeDelta, 10),
+		strconv.FormatInt(delta.CommentDelta, 10),
+		strconv.FormatInt(delta.PopularityDelta, 10),
+		strconv.FormatInt(int64(interactionDeltaTTL/time.Second), 10),
+	).Err()
+}
+
+// applyRedisLikeState 写点赞后的 Redis 实时状态和增量计数。
+func applyRedisLikeState(ctx context.Context, redisCli *redis.Client, eventID string, videoID uint64, userID uint64) error {
+	field := redisHashField(videoID)
+	if err := applyInteractionDelta(ctx, redisCli, eventID, videoID, videoStatDelta{
+		LikeDelta:       1,
+		PopularityDelta: likePopularityWeight,
+	}); err != nil {
+		return err
+	}
 
 	pipe := redisCli.TxPipeline()
 	pipe.SAdd(ctx, rediskey.LikeVideoUsersKey(videoID), strconv.FormatUint(userID, 10))
 	pipe.SAdd(ctx, rediskey.LikeUserVideosKey(userID), strconv.FormatUint(videoID, 10))
 	pipe.Set(ctx, rediskey.LikeStateKey(videoID, userID), "1", likeStateTTL)
-	pipe.HIncrBy(ctx, rediskey.VideoLikeDeltaKey(), field, 1)
-	pipe.HIncrBy(ctx, rediskey.VideoPopularityDeltaKey(), field, likePopularityWeight)
 	pipe.ZIncrBy(ctx, rediskey.HotVideoRealtimeKey(), float64(likePopularityWeight), field)
 	pipe.Incr(ctx, rediskey.LikeUserVideosListVersionKey(userID))
-	pipe.Del(ctx, rediskey.VideoStatsCacheKey(videoID))
 	_, err := pipe.Exec(ctx)
 	return err
 }
 
 // applyRedisUnlikeState 写取消点赞后的 Redis 实时状态和增量计数。
-func applyRedisUnlikeState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64) error {
+func applyRedisUnlikeState(ctx context.Context, redisCli *redis.Client, eventID string, videoID uint64, userID uint64) error {
 	field := redisHashField(videoID)
+	if err := applyInteractionDelta(ctx, redisCli, eventID, videoID, videoStatDelta{
+		LikeDelta:       -1,
+		PopularityDelta: -likePopularityWeight,
+	}); err != nil {
+		return err
+	}
 
 	pipe := redisCli.TxPipeline()
 	pipe.SRem(ctx, rediskey.LikeVideoUsersKey(videoID), strconv.FormatUint(userID, 10))
 	pipe.SRem(ctx, rediskey.LikeUserVideosKey(userID), strconv.FormatUint(videoID, 10))
 	pipe.Set(ctx, rediskey.LikeStateKey(videoID, userID), "0", likeStateTTL)
-	pipe.HIncrBy(ctx, rediskey.VideoLikeDeltaKey(), field, -1)
-	pipe.HIncrBy(ctx, rediskey.VideoPopularityDeltaKey(), field, -likePopularityWeight)
 	pipe.ZIncrBy(ctx, rediskey.HotVideoRealtimeKey(), -float64(likePopularityWeight), field)
 	pipe.Incr(ctx, rediskey.LikeUserVideosListVersionKey(userID))
-	pipe.Del(ctx, rediskey.VideoStatsCacheKey(videoID))
 	_, err := pipe.Exec(ctx)
 	return err
 }
@@ -304,41 +355,57 @@ func realtimeLikesCount(ctx context.Context, redisCli *redis.Client, video model
 }
 
 // applyRedisCommentCreatedState 写评论发布后的 Redis 实时状态和增量计数，并返回最新评论数 delta。
-func applyRedisCommentCreatedState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64, commentID uint64, requestID string) (int64, error) {
+func applyRedisCommentCreatedState(ctx context.Context, redisCli *redis.Client, eventID string, videoID uint64, userID uint64, commentID uint64, requestID string) (int64, error) {
 	field := redisHashField(videoID)
+	if err := applyInteractionDelta(ctx, redisCli, eventID, videoID, videoStatDelta{
+		CommentDelta:    1,
+		PopularityDelta: commentPopularityWeight,
+	}); err != nil {
+		return 0, err
+	}
 
 	pipe := redisCli.TxPipeline()
 	queueBumpCommentListVersion(ctx, pipe, videoID)
-	commentDeltaCmd := pipe.HIncrBy(ctx, rediskey.VideoCommentDeltaKey(), field, 1)
-	pipe.HIncrBy(ctx, rediskey.VideoPopularityDeltaKey(), field, commentPopularityWeight)
+	commentDeltaCmd := pipe.HGet(ctx, rediskey.VideoCommentDeltaKey(), field)
 	pipe.ZIncrBy(ctx, rediskey.HotVideoRealtimeKey(), float64(commentPopularityWeight), field)
-	pipe.Del(ctx, rediskey.VideoStatsCacheKey(videoID))
 	if requestID != "" {
 		pipe.Set(ctx, rediskey.CommentIdempotencyKey(userID, requestID), strconv.FormatUint(commentID, 10), commentIdempotencyTTL)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return 0, err
 	}
-	return commentDeltaCmd.Val(), nil
+	commentDelta, err := commentDeltaCmd.Int64()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	}
+	return commentDelta, err
 }
 
 // applyRedisCommentDeletedState 写评论删除后的 Redis 实时状态和增量计数，并返回最新评论数 delta。
-func applyRedisCommentDeletedState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64, commentID uint64, requestID string) (int64, error) {
+func applyRedisCommentDeletedState(ctx context.Context, redisCli *redis.Client, eventID string, videoID uint64, userID uint64, commentID uint64, requestID string) (int64, error) {
 	field := redisHashField(videoID)
+	if err := applyInteractionDelta(ctx, redisCli, eventID, videoID, videoStatDelta{
+		CommentDelta:    -1,
+		PopularityDelta: -commentPopularityWeight,
+	}); err != nil {
+		return 0, err
+	}
 
 	pipe := redisCli.TxPipeline()
 	queueBumpCommentListVersion(ctx, pipe, videoID)
-	commentDeltaCmd := pipe.HIncrBy(ctx, rediskey.VideoCommentDeltaKey(), field, -1)
-	pipe.HIncrBy(ctx, rediskey.VideoPopularityDeltaKey(), field, -commentPopularityWeight)
+	commentDeltaCmd := pipe.HGet(ctx, rediskey.VideoCommentDeltaKey(), field)
 	pipe.ZIncrBy(ctx, rediskey.HotVideoRealtimeKey(), -float64(commentPopularityWeight), field)
-	pipe.Del(ctx, rediskey.VideoStatsCacheKey(videoID))
 	if requestID != "" {
 		pipe.Del(ctx, rediskey.CommentIdempotencyKey(userID, requestID))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return 0, err
 	}
-	return commentDeltaCmd.Val(), nil
+	commentDelta, err := commentDeltaCmd.Int64()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	}
+	return commentDelta, err
 }
 
 // realtimeCommentsCount 返回 MySQL 基准评论数 + Redis 尚未刷库的增量。

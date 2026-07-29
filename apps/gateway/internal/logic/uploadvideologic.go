@@ -41,20 +41,21 @@ func (l *UploadVideoLogic) UploadVideo(r *http.Request) (resp *types.UploadVideo
 	if err != nil {
 		return nil, err
 	}
-	if err := upsertFileAsset(l.ctx, l.svcCtx.GormDB, model.FileAssetTypeVideo, asset.FileHash, asset.URL, asset.StoragePath, asset.Size); err != nil {
+	canonicalAsset, err := upsertFileAsset(l.ctx, l.svcCtx.GormDB, model.FileAssetTypeVideo, asset.FileHash, asset.URL, asset.StoragePath, asset.Size)
+	if err != nil {
 		l.Errorf("upsert video file asset failed, play_url: %s, error: %v", asset.URL, err)
 		return nil, status.Error(codes.Internal, "保存视频资源失败")
 	}
 	ttl := uploadedFileTTL(l.svcCtx.Config.Upload)
 	pipe := l.svcCtx.RedisCli.TxPipeline()
-	pipe.Set(l.ctx, rediskey.ChunkUploadHashKey(userID, asset.FileHash), asset.URL, ttl)
-	pipe.Set(l.ctx, rediskey.ChunkUploadGlobalHashKey(asset.FileHash), asset.URL, ttl)
+	pipe.Set(l.ctx, rediskey.ChunkUploadHashKey(userID, asset.FileHash), canonicalAsset.URL, ttl)
+	pipe.Set(l.ctx, rediskey.ChunkUploadGlobalHashKey(asset.FileHash), canonicalAsset.URL, ttl)
 	if _, err := pipe.Exec(l.ctx); err != nil {
 		l.Errorf("save instant upload cache failed, file_hash: %s, error: %v", asset.FileHash, err)
 	}
 
 	return &types.UploadVideoResp{
 		Msg:     "上传成功",
-		Playurl: asset.URL,
+		Playurl: canonicalAsset.URL,
 	}, nil
 }

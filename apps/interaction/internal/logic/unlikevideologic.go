@@ -242,7 +242,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 
 	// 6. MySQL 已经成功后，再更新 Redis 实时状态和计数。若失败，核心 MySQL 状态已经成功，仍返回本次操作后的合理计数。
 	likesCount := fallbackLikesCount
-	if err := applyRedisUnlikeState(l.ctx, l.svcCtx.RedisCli, videoID, userID); err != nil {
+	if err := applyRedisUnlikeState(l.ctx, l.svcCtx.RedisCli, eventID, videoID, userID); err != nil {
 		l.Errorf("apply redis unlike state failed after mysql committed, video_id: %d, user_id: %d, fallback_likes_count: %d, error: %v", videoID, userID, fallbackLikesCount, err)
 	} else {
 		likesCount = realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video)

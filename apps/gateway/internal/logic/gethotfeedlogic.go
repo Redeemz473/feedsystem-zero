@@ -48,7 +48,7 @@ func (l *GetHotFeedLogic) GetHotFeed(req *types.GetHotFeedReq) (resp *types.GetH
 			videoIDs = append(videoIDs, it.GetVideoId())
 		}
 	}
-	videoMap, err := loadHTTPVideosByIDs(l.ctx, l.svcCtx.VideoRpc, l.svcCtx.InteractionRpc, viewerID, videoIDs)
+	videoMap, err := loadHTTPVideosByIDs(l.ctx, l.svcCtx.AccountRpc, l.svcCtx.VideoRpc, l.svcCtx.InteractionRpc, viewerID, videoIDs)
 	if err != nil {
 		return nil, err
 	}

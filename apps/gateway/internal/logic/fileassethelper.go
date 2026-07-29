@@ -3,21 +3,24 @@ package logic
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"feedsystem-zero/apps/gateway/internal/config"
 	"feedsystem-zero/apps/gateway/internal/model"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
-func upsertFileAsset(ctx context.Context, db *gorm.DB, fileType string, fileHash string, url string, storagePath string, size int64) error {
+// upsertFileAsset 登记文件并返回数据库中的规范资产地址。
+// file_hash 唯一，因此同一内容即使使用不同扩展名再次上传，也复用已有 URL，
+// 不允许把已被视频引用的记录悄悄改指向另一个路径。
+func upsertFileAsset(ctx context.Context, db *gorm.DB, fileType string, fileHash string, url string, storagePath string, size int64) (model.FileAsset, error) {
 	if strings.TrimSpace(fileHash) == "" || strings.TrimSpace(url) == "" || strings.TrimSpace(storagePath) == "" {
-		return nil
+		return model.FileAsset{}, errors.New("文件资产参数不完整")
 	}
 
 	asset := model.FileAsset{
@@ -30,118 +33,94 @@ func upsertFileAsset(ctx context.Context, db *gorm.DB, fileType string, fileHash
 		Status:      model.FileAssetStatusActive,
 	}
 
-	return db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "file_hash"}},
-		DoUpdates: clause.Assignments(map[string]any{
-			"file_type":    fileType,
-			"url":          url,
-			"storage_path": storagePath,
-			"size":         size,
-			"status":       model.FileAssetStatusActive,
-			"deleted_at":   nil,
-		}),
-	}).Create(&asset).Error
-}
-
-// NOTE: file_assets 的引用计数变更 (+1 / -1) 已经全部下沉到 video-rpc 端，
-//       与 videos 表的写入放在同一个本地事务里保证强一致性；
-//       gateway 侧的 reserveFileAssetRefByURL / releaseFileAssetRefByURL 已删除。
-//
-//       decreaseFileAssetRefAndCleanup 和 removeLocalAssetFile 当前不再被调用，
-//       保留作为未来 asset_cleanup job 的参考实现——
-//       该 job 会扫 file_assets 中 status=PendingDelete 的记录，
-//       调用类似逻辑做磁盘物理清理并最终置 Deleted。
-//       等 job 独立成型后，这两个函数可以整体迁移到 apps/job/asset_cleanup 里删除。
-
-func decreaseFileAssetRefAndCleanup(ctx context.Context, db *gorm.DB, upload config.UploadConf, url string) error {
-	if strings.TrimSpace(url) == "" {
-		return nil
+	result := db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "file_hash"}},
+		DoNothing: true,
+	}).Create(&asset)
+	if result.Error != nil {
+		return model.FileAsset{}, result.Error
+	}
+	if result.RowsAffected == 1 {
+		return asset, nil
 	}
 
-	var cleanupPath string
-	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var asset model.FileAsset
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("url = ? AND status <> ?", url, model.FileAssetStatusDeleted).
-			First(&asset).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil
-			}
-			return err
+	var existing model.FileAsset
+	cleaningWaitDeadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := db.WithContext(ctx).
+			Where("file_hash = ?", fileHash).
+			First(&existing).Error; err != nil {
+			return model.FileAsset{}, err
+		}
+		if existing.FileType != fileType {
+			return model.FileAsset{}, fmt.Errorf("文件 hash 已被另一种资产类型占用: %s", existing.FileType)
+		}
+		if existing.Status != model.FileAssetStatusCleaning {
+			break
+		}
+		if time.Now().After(cleaningWaitDeadline) {
+			return model.FileAsset{}, errors.New("文件资产正在清理，请稍后重试")
 		}
 
-		var activeRefs int64
-		if err := tx.Table("videos").
-			Where("status = ? AND deleted_at IS NULL AND (play_url = ? OR cover_url = ?)", 1, url, url).
-			Count(&activeRefs).Error; err != nil {
-			return err
+		// cleanup job 已认领该资产时等待它完成物理删除，再决定是否重新激活。
+		// 不能直接把 Cleaning 改回 Active，否则 job 可能在激活后删除新上传文件。
+		select {
+		case <-ctx.Done():
+			return model.FileAsset{}, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
 		}
+	}
 
-		nextRef := asset.RefCount - 1
-		if nextRef < 0 {
-			nextRef = 0
+	if existing.Status != model.FileAssetStatusActive {
+		if _, err := os.Stat(storagePath); err != nil {
+			return model.FileAsset{}, fmt.Errorf("待登记文件不可用: %w", err)
 		}
-		if activeRefs > nextRef {
-			nextRef = activeRefs
-		}
-		if nextRef > 0 {
-			return tx.Model(&model.FileAsset{}).
-				Where("id = ?", asset.ID).
-				Updates(map[string]any{
-					"ref_count":  nextRef,
-					"status":     model.FileAssetStatusActive,
-					"deleted_at": nil,
-				}).Error
-		}
-
-		now := time.Now()
-		if err := tx.Model(&model.FileAsset{}).
-			Where("id = ?", asset.ID).
+		update := db.WithContext(ctx).
+			Model(&model.FileAsset{}).
+			Where("id = ? AND status = ?", existing.ID, existing.Status).
 			Updates(map[string]any{
-				"ref_count":  0,
-				"status":     model.FileAssetStatusPendingDelete,
-				"deleted_at": now,
-			}).Error; err != nil {
-			return err
+				"url":          url,
+				"storage_path": storagePath,
+				"size":         size,
+				"status":       model.FileAssetStatusActive,
+				"deleted_at":   nil,
+			})
+		if update.Error != nil {
+			return model.FileAsset{}, update.Error
 		}
-		cleanupPath = asset.StoragePath
-		return nil
-	}); err != nil {
-		return err
-	}
-	if cleanupPath == "" {
-		return nil
-	}
-
-	if err := removeLocalAssetFile(upload, cleanupPath); err != nil {
-		return err
-	}
-
-	return db.WithContext(ctx).
-		Model(&model.FileAsset{}).
-		Where("url = ? AND status = ? AND ref_count = 0", url, model.FileAssetStatusPendingDelete).
-		Update("status", model.FileAssetStatusDeleted).Error
-}
-
-func removeLocalAssetFile(upload config.UploadConf, storagePath string) error {
-	if strings.TrimSpace(storagePath) == "" {
-		return nil
+		if update.RowsAffected == 0 {
+			// 状态在查询后被 cleanup job 抢占，重新读取并按最新状态处理。
+			return upsertFileAsset(ctx, db, fileType, fileHash, url, storagePath, size)
+		}
+		existing.URL = url
+		existing.StoragePath = storagePath
+		existing.Size = size
+		existing.Status = model.FileAssetStatusActive
+		existing.DeletedAt = nil
+		return existing, nil
 	}
 
-	baseAbs, err := filepath.Abs(uploadBaseDir(upload))
-	if err != nil {
-		return err
+	// 已有活跃资产是规范副本。新上传路径不同时删除重复文件，调用方统一返回已有 URL。
+	existingAbs, existingAbsErr := filepath.Abs(existing.StoragePath)
+	uploadedAbs, uploadedAbsErr := filepath.Abs(storagePath)
+	samePath := existingAbsErr == nil && uploadedAbsErr == nil && existingAbs == uploadedAbs
+	if !samePath {
+		if _, err := os.Stat(existing.StoragePath); err == nil {
+			if err := os.Remove(storagePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return model.FileAsset{}, err
+			}
+		} else if errors.Is(err, os.ErrNotExist) {
+			// 记录存在但文件意外丢失时，用本次已通过 hash 校验的副本修复规范路径，
+			// 保持已有 videos.play_url / cover_url 不变。
+			if err := os.MkdirAll(filepath.Dir(existing.StoragePath), 0755); err != nil {
+				return model.FileAsset{}, err
+			}
+			if err := os.Rename(storagePath, existing.StoragePath); err != nil {
+				return model.FileAsset{}, err
+			}
+		} else {
+			return model.FileAsset{}, err
+		}
 	}
-	pathAbs, err := filepath.Abs(storagePath)
-	if err != nil {
-		return err
-	}
-	if pathAbs != baseAbs && !strings.HasPrefix(pathAbs, baseAbs+string(os.PathSeparator)) {
-		return nil
-	}
-
-	if err := os.Remove(pathAbs); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
+	return existing, nil
 }

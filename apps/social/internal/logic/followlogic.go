@@ -60,6 +60,10 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 	now := time.Now()
 	stateChanged := false
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockFollowAccounts(l.ctx, tx, followerID, followingID); err != nil {
+			return err
+		}
+
 		var follow model.Follow
 		//加悲观行锁查询关注关系，防止并发出现问题导致粉丝数被刷双倍
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
