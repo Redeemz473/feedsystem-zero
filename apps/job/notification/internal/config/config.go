@@ -10,12 +10,22 @@ import (
 type Config struct {
 	Name         string
 	Mysql        MysqlConf
+	BizRedis     RedisConf
 	Kafka        kafkax.ConsumerConf
 	Notification NotificationConf
 }
 
 type MysqlConf struct {
 	DataSource string
+}
+
+// RedisConf 是通知未读数缓存使用的 Redis 连接配置。
+// notification-job 事件处理成功后需要 INCR 用户的未读数 version key，
+// 让 rpc 侧的缓存自然失效。
+type RedisConf struct {
+	Addr     string
+	Password string `json:",optional"`
+	DB       int    `json:",default=0"`
 }
 
 type NotificationConf struct {

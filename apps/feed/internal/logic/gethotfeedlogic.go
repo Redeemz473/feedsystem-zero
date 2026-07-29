@@ -7,6 +7,8 @@ import (
 	"feedsystem-zero/apps/feed/internal/svc"
 
 	"github.com/zeromicro/go-zero/core/logx"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type GetHotFeedLogic struct {
@@ -23,22 +25,45 @@ func NewGetHotFeedLogic(ctx context.Context, svcCtx *svc.ServiceContext) *GetHot
 	}
 }
 
-// 热榜：按固定分钟快照读取最近时间窗口内的热门视频
+// 热榜：按固定分钟快照读取最近时间窗口内的热门视频，未登录也可访问
 func (l *GetHotFeedLogic) GetHotFeed(in *feed.GetHotFeedReq) (*feed.GetHotFeedResp, error) {
-	// HotRank Job 已负责把互动事件写成 UTC 分钟窗口，这里只需串联 helper：
-	//  1. query, err := normalizeHotFeedQuery(l.svcCtx, in.GetSnapshotAt(),
-	//     in.GetOffset(), in.GetPageSize())
-	//     该函数会完成分钟规范化、快照时效、offset 上限和翻页快照校验；
-	//  2. ensureHotRankSnapshot(l.ctx, l.svcCtx, query.SnapshotAt, query.Offset)
-	//     缓存未命中时会通过 SingleFlight + Redis 锁合并分钟窗口并生成固定快照；
-	//  3. page, err := loadHotRankPage(l.ctx, l.svcCtx, query.SnapshotAt,
-	//     query.Offset, query.PageSize)
-	//     helper 已完成 ZREVRANGE、脏 member 清理、rank 计算和 has_more 判断；
-	//  4. 组装 GetHotFeedResp：
-	//     Items=page.Items，SnapshotAt=query.SnapshotAt，
-	//     NextOffset=query.Offset+int64(len(page.Items))，HasMore=page.HasMore；
-	//  5. Feed RPC 只返回候选视频ID、热度分和排名。视频详情、作者资料以及
-	//     当前访问者的点赞状态由 gateway 批量聚合，不在这里跨服务查询。
+	viewerID := in.GetViewerId()
+	requestedSnapshotAt := in.GetSnapshotAt()
+	offset := in.GetOffset()
 
-	return &feed.GetHotFeedResp{}, nil
+	query, err := normalizeHotFeedQuery(l.svcCtx, requestedSnapshotAt, offset, in.GetPageSize())
+	if err != nil {
+		return nil, err
+	}
+
+	//缓存未命中时通过 SingleFlight + Redis 锁合并分钟窗口生成固定快照。
+	if err := ensureHotRankSnapshot(l.ctx, l.svcCtx, query.SnapshotAt, query.Offset); err != nil {
+		l.Errorf(
+			"ensure hot rank snapshot failed, viewer_id:%d snapshot_at:%d offset:%d page_size:%d error:%v",
+			viewerID, query.SnapshotAt, query.Offset, query.PageSize, err,
+		)
+		if code := status.Code(err); code == codes.InvalidArgument || code == codes.FailedPrecondition {
+			return nil, err
+		}
+		return nil, status.Error(codes.Unavailable, "热榜暂时不可用，请稍后重试")
+	}
+
+	page, err := loadHotRankPage(l.ctx, l.svcCtx, query.SnapshotAt, query.Offset, query.PageSize)
+	if err != nil {
+		l.Errorf(
+			"load hot rank page failed, viewer_id:%d snapshot_at:%d offset:%d page_size:%d error:%v",
+			viewerID, query.SnapshotAt, query.Offset, query.PageSize, err,
+		)
+		return nil, status.Error(codes.Unavailable, "热榜暂时不可用，请稍后重试")
+	}
+
+	resp := &feed.GetHotFeedResp{
+		Items:      page.Items,
+		SnapshotAt: query.SnapshotAt,
+		HasMore:    page.HasMore,
+	}
+	if page.HasMore {
+		resp.NextOffset = query.Offset + int64(len(page.Items))
+	}
+	return resp, nil
 }

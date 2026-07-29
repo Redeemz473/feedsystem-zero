@@ -32,6 +32,19 @@ func (Follow) TableName() string {
 	return "follows"
 }
 
+// Account 是 Feed 判定大 V 时使用的最小只读投影。
+// 依赖 accounts.is_big_v 只升不降标记位，一次主键查询即可完成判定；
+// follower_count 仅在需要排序或诊断时使用，不再参与写侧 fanout 判定。
+type Account struct {
+	ID            uint64 `gorm:"column:id;primaryKey"`
+	FollowerCount int64  `gorm:"column:follower_count"`
+	IsBigV        bool   `gorm:"column:is_big_v"`
+}
+
+func (Account) TableName() string {
+	return "accounts"
+}
+
 // ProcessedEvent 在 Redis 副作用完成后写入。
 // Timeline 的 ZADD/ZREM 天然幂等，因此进程在“写 Redis 后、写幂等表前”崩溃时，
 // Kafka 重投只会重复执行同一最终状态，不会产生重复数据。

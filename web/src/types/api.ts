@@ -37,6 +37,8 @@ export interface GetProfileResp {
   email: string;
   avatar_url: string;
   bio: string;
+  followers_count: number;
+  followings_count: number;
 }
 
 export interface UpdateProfileReq {
@@ -264,4 +266,101 @@ export interface ListFollowingsResp {
 export interface GetFollowStatsResp {
   followers_count: number;
   followings_count: number;
+}
+
+/* ============ Social 批量关注状态（列表页去 N+1） ============ */
+
+export interface BatchIsFollowingReq {
+  target_user_ids: number[];
+}
+export interface FollowingStateInfo {
+  target_user_id: number;
+  following: boolean;
+}
+export interface BatchIsFollowingResp {
+  states: FollowingStateInfo[];
+}
+
+/* ==================== Feed ==================== */
+
+export interface CursorFeedReq {
+  cursor_published_at?: number;
+  cursor_video_id?: number;
+  page_size?: number;
+}
+export interface CursorFeedResp {
+  videos: VideoInfo[];
+  next_cursor_published_at: number;
+  next_cursor_video_id: number;
+  has_more: boolean;
+}
+
+export type GetRecommendFeedReq = CursorFeedReq;
+export type GetRecommendFeedResp = CursorFeedResp;
+
+export type GetFollowingFeedReq = CursorFeedReq;
+export type GetFollowingFeedResp = CursorFeedResp;
+
+export interface HotFeedVideo {
+  video: VideoInfo;
+  hot_score: number;
+  rank: number;
+}
+export interface GetHotFeedReq {
+  snapshot_at?: number;
+  offset?: number;
+  page_size?: number;
+}
+export interface GetHotFeedResp {
+  items: HotFeedVideo[];
+  snapshot_at: number;
+  next_offset: number;
+  has_more: boolean;
+}
+
+/* ==================== Notification ==================== */
+
+export type NotificationType = "like" | "comment" | "follow" | string;
+export type NotificationStatus = "unread" | "read" | string;
+
+export interface NotificationActor {
+  user_id: number;
+  username: string;
+  avatar_url: string;
+}
+export interface NotificationVideo {
+  video_id: number;
+  title: string;
+  cover_url: string;
+}
+export interface NotificationItem {
+  notification_id: number;
+  type: NotificationType;
+  status: NotificationStatus;
+  actor: NotificationActor;
+  video?: NotificationVideo;
+  comment_id?: number;
+  occurred_at: number;
+  read_at: number;
+}
+
+export interface ListNotificationsReq {
+  cursor_occurred_at?: number;
+  cursor_notification_id?: number;
+  page_size?: number;
+}
+export interface ListNotificationsResp {
+  notifications: NotificationItem[];
+  next_cursor_occurred_at: number;
+  next_cursor_notification_id: number;
+  has_more: boolean;
+}
+export interface GetUnreadCountResp {
+  unread_count: number;
+}
+export interface MarkNotificationReadResp {
+  changed: boolean;
+}
+export interface MarkAllNotificationsReadResp {
+  changed_count: number;
 }

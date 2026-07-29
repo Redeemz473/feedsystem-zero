@@ -10,15 +10,16 @@ import (
 
 type Config struct {
 	rest.RestConf
-	Auth           AuthConf
-	AccountRpc     zrpc.RpcClientConf
-	VideoRpc       zrpc.RpcClientConf
-	InteractionRpc zrpc.RpcClientConf
-	SocialRpc      zrpc.RpcClientConf
-	FeedRpc        zrpc.RpcClientConf
-	BizRedis       RedisConf
-	Mysql          MysqlConf
-	Upload         UploadConf
+	Auth            AuthConf
+	AccountRpc      zrpc.RpcClientConf
+	VideoRpc        zrpc.RpcClientConf
+	InteractionRpc  zrpc.RpcClientConf
+	SocialRpc       zrpc.RpcClientConf
+	FeedRpc         zrpc.RpcClientConf
+	NotificationRpc zrpc.RpcClientConf
+	BizRedis        RedisConf
+	Mysql           MysqlConf
+	Upload          UploadConf
 }
 
 type AuthConf struct {

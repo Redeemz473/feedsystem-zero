@@ -27,6 +27,9 @@ type TimelineConf struct {
 	GlobalTimelineMaxLen   int64 `json:",default=10000"`
 	UserTimelineMaxLen     int64 `json:",default=2000"`
 	UserTimelineTTLSeconds int64 `json:",default=2592000"`
+	AuthorOutboxMaxLen     int64 `json:",default=500"`
+	AuthorOutboxTTLSeconds int64 `json:",default=2592000"`
+	MaxBigCreatorFanIn     int   `json:",default=100"`
 	BuildLockTTLSeconds    int64 `json:",default=15"`
 	BuildWaitMs            int64 `json:",default=1500"`
 	RedisOpTimeoutMs       int64 `json:",default=1000"`

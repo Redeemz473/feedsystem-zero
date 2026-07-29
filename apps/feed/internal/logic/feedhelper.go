@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"time"
 
@@ -29,6 +30,9 @@ const (
 	defaultGlobalTimelineLimit int64 = 10000
 	defaultUserTimelineLimit   int64 = 2000
 	defaultUserTimelineTTL           = 30 * 24 * time.Hour
+	defaultAuthorOutboxLimit   int64 = 500
+	defaultAuthorOutboxTTL           = 30 * 24 * time.Hour
+	defaultMaxBigCreatorFanIn  int   = 100
 	defaultBuildLockTTL              = 15 * time.Second
 	defaultBuildWait                 = 1500 * time.Millisecond
 	defaultFeedRedisTimeout          = time.Second
@@ -264,6 +268,8 @@ func ensureGlobalTimeline(ctx context.Context, svcCtx *svc.ServiceContext) error
 	)
 }
 
+// 用户首次访问或 Timeline 过期时，通过本地 SingleFlight 和 Redis 分布式锁
+// 从 MySQL 的 follows + videos 构建快照，并用版本号避免覆盖并发写入。
 // ensureFollowingTimeline 在用户 Timeline 未初始化或已过期时，从 MySQL 关注关系构建完整快照。
 func ensureFollowingTimeline(ctx context.Context, svcCtx *svc.ServiceContext, userID uint64) error {
 	if userID == 0 {
@@ -1087,4 +1093,205 @@ func hotRankFutureTolerance(svcCtx *svc.ServiceContext) time.Duration {
 		return defaultHotRankFutureTolerance
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+// feedAuthorOutboxTTL 大 V outbox 的有效期，写侧续期由 Job 负责，
+// 读侧懒加载会在冷启动时使用同一 TTL 首次写入。
+func feedAuthorOutboxTTL(svcCtx *svc.ServiceContext) time.Duration {
+	seconds := svcCtx.Config.Timeline.AuthorOutboxTTLSeconds
+	if seconds <= 0 {
+		return defaultAuthorOutboxTTL
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// feedAuthorOutboxLimit 单个大 V outbox 保留的最大条数，用于冷启动查 MySQL。
+func feedAuthorOutboxLimit(svcCtx *svc.ServiceContext) int64 {
+	value := svcCtx.Config.Timeline.AuthorOutboxMaxLen
+	if value <= 0 {
+		return defaultAuthorOutboxLimit
+	}
+	return value
+}
+
+// feedMaxBigCreatorFanIn 单次读侧最多合并的大 V outbox 数量。
+// viewer 关注的大 V 超过阈值时，只挑最近 N 个避免读放大。
+func feedMaxBigCreatorFanIn(svcCtx *svc.ServiceContext) int {
+	value := svcCtx.Config.Timeline.MaxBigCreatorFanIn
+	if value <= 0 {
+		return defaultMaxBigCreatorFanIn
+	}
+	return value
+}
+
+// ensureAuthorOutbox 懒加载单个大 V 的 outbox。
+// 复用通用的 ensureTimeline 冷启动流程（分布式锁 + 版本号 CAS + 临时 ZSet 原子替换），
+// passiveOnly=false 表示 rpc 侧自己抢锁构建，与 Job 侧写事件互不阻塞
+// （Job 通过 mutateAuthorOutbox 的版本递增让并发构建重来）。
+func ensureAuthorOutbox(ctx context.Context, svcCtx *svc.ServiceContext, authorID uint64) error {
+	if authorID == 0 {
+		return nil
+	}
+	return ensureTimeline(
+		ctx,
+		svcCtx,
+		"author_outbox:"+strconv.FormatUint(authorID, 10),
+		rediskey.FeedAuthorOutboxReadyKey(authorID),
+		rediskey.FeedAuthorOutboxBuildLockKey(authorID),
+		rediskey.FeedAuthorOutboxVersionKey(authorID),
+		rediskey.FeedAuthorOutboxKey(authorID),
+		func(token string) string { return rediskey.FeedAuthorOutboxTempKey(authorID, token) },
+		feedAuthorOutboxTTL(svcCtx),
+		func(loadCtx context.Context) ([]string, error) {
+			return loadAuthorOutboxMembers(loadCtx, svcCtx, authorID)
+		},
+		false,
+	)
+}
+
+// loadAuthorOutboxMembers 从 MySQL 读取该作者最近 N 条视频，用于冷启动 outbox。
+// 只查发布态、未软删的视频；下沉/审核不通过的视频 Job 侧的事件会补上删除动作。
+func loadAuthorOutboxMembers(ctx context.Context, svcCtx *svc.ServiceContext, authorID uint64) ([]string, error) {
+	var videos []model.Video
+	if err := svcCtx.GormDB.WithContext(ctx).
+		Select("id", "author_id", "status", "deleted_at", "created_at").
+		Where("author_id = ? AND status = ? AND deleted_at IS NULL", authorID, model.VideoStatusNormal).
+		Order("created_at DESC, id DESC").
+		Limit(int(feedAuthorOutboxLimit(svcCtx))).
+		Find(&videos).Error; err != nil {
+		return nil, fmt.Errorf("查询大V outbox 快照失败, author_id:%d: %w", authorID, err)
+	}
+	return timelineMembersFromVideos(videos)
+}
+
+// listFollowingBigCreators 返回 viewer 关注的所有大 V 作者 id。
+// 通过 join accounts.is_big_v = 1 做筛选，避免应用层拉全表再过滤。
+// 该标记位由 social 模块在关注事务内维护，只升不降，能天然覆盖两类场景：
+//  1. 阈值反向穿越：大 V 掉粉后 is_big_v 仍为 1，历史 outbox 视频照常被 union，不会消失；
+//  2. 阈值抖动：is_big_v 一次升级永久生效，避免读侧判定与写侧不一致。
+//
+// 结果按 accounts.follower_count DESC 排序，超过 fan-in 上限时优先保留粉丝多的作者
+// 输出去掉了不必要的 status/deleted_at 判空，因为查询本身已经按有效关注过滤。
+func listFollowingBigCreators(ctx context.Context, svcCtx *svc.ServiceContext, viewerID uint64) ([]uint64, error) {
+	if viewerID == 0 {
+		return nil, nil
+	}
+	var authorIDs []uint64
+	err := svcCtx.GormDB.WithContext(ctx).
+		Table("follows AS f").
+		Select("f.following_id").
+		Joins("JOIN accounts AS a ON a.id = f.following_id").
+		Where("f.follower_id = ? AND f.status = ? AND f.deleted_at IS NULL", viewerID, model.FollowStatusActive).
+		Where("a.is_big_v = ?", true).
+		Order("a.follower_count DESC, f.following_id ASC").
+		Limit(feedMaxBigCreatorFanIn(svcCtx)).
+		Pluck("f.following_id", &authorIDs).Error
+	if err != nil {
+		return nil, fmt.Errorf("查询关注的大V失败, viewer_id:%d: %w", viewerID, err)
+	}
+	return authorIDs, nil
+}
+
+// loadFollowingFeedMerged 读侧推拉合并入口：
+//  1. 读 viewer 自己的 inbox（小 V 推过来的） pageSize+1 条；
+//  2. 并行懒加载/读取 viewer 关注的大 V 的 outbox，各取 pageSize+1 条；
+//  3. 按 timeline member 字典序（等价 publishedAt DESC + videoID DESC）归并去重；
+//  4. 截断到 pageSize，返回是否 hasMore。
+//
+// 复杂度：Redis 调用次数 = 1 (inbox) + N (大 V outbox)，N 最多为 MaxBigCreatorFanIn。
+// 不再需要对大 V 的每次发布都做一次全量 fanout，写侧成本从 O(followers) 降至 O(1)。
+func loadFollowingFeedMerged(
+	ctx context.Context,
+	svcCtx *svc.ServiceContext,
+	viewerID uint64,
+	cursorPublishedAt int64,
+	cursorVideoID uint64,
+	pageSize int64,
+) (timelinePage, error) {
+	// 1. 关注的大 V 列表
+	dbCtx, cancel := context.WithTimeout(ctx, feedDBTimeout(svcCtx))
+	bigCreatorIDs, err := listFollowingBigCreators(dbCtx, svcCtx, viewerID)
+	cancel()
+	if err != nil {
+		return timelinePage{}, err
+	}
+
+	// 2. inbox（一定要读，即使没有大 V 关注也要读）
+	inboxPage, err := loadTimelinePage(
+		ctx, svcCtx,
+		rediskey.FeedTimelineKey(viewerID),
+		cursorPublishedAt, cursorVideoID,
+		pageSize,
+	)
+	if err != nil {
+		return timelinePage{}, err
+	}
+	if len(bigCreatorIDs) == 0 {
+		return inboxPage, nil
+	}
+
+	// 3. 逐个懒加载 + 读大 V outbox
+	// 顺序处理保持逻辑简单；后续如果 fan-in 变大可以改为并发。
+	outboxItems := make([]*feed.FeedVideoItem, 0, len(bigCreatorIDs)*int(pageSize))
+	for _, authorID := range bigCreatorIDs {
+		if err := ensureAuthorOutbox(ctx, svcCtx, authorID); err != nil {
+			// 单个大 V outbox 失败不阻塞整个 feed，降级为该作者视频不出现在本页。
+			// 下次访问 outbox ready 后会被读到，最坏情况用户会短暂看不到该作者最新视频。
+			logx.WithContext(ctx).Errorf(
+				"ensure author outbox failed, viewer_id:%d author_id:%d error:%v",
+				viewerID, authorID, err,
+			)
+			continue
+		}
+		page, err := loadTimelinePage(
+			ctx, svcCtx,
+			rediskey.FeedAuthorOutboxKey(authorID),
+			cursorPublishedAt, cursorVideoID,
+			pageSize,
+		)
+		if err != nil {
+			logx.WithContext(ctx).Errorf(
+				"load author outbox page failed, viewer_id:%d author_id:%d error:%v",
+				viewerID, authorID, err,
+			)
+			continue
+		}
+		outboxItems = append(outboxItems, page.Items...)
+	}
+
+	// 4. 归并去重
+	merged := mergeFeedItems(inboxPage.Items, outboxItems, pageSize)
+	hasMore := inboxPage.HasMore || int64(len(inboxPage.Items)+len(outboxItems)) > pageSize
+	return timelinePage{Items: merged, HasMore: hasMore}, nil
+}
+
+// mergeFeedItems 合并 inbox 和多个 outbox 的结果，按 (publishedAt DESC, videoID DESC) 排序，
+// 相同 videoID 去重（inbox 里如果历史推送过该大 V 视频，outbox 会覆盖）。
+func mergeFeedItems(inbox, outbox []*feed.FeedVideoItem, pageSize int64) []*feed.FeedVideoItem {
+	seen := make(map[uint64]struct{}, len(inbox)+len(outbox))
+	all := make([]*feed.FeedVideoItem, 0, len(inbox)+len(outbox))
+	for _, item := range inbox {
+		if _, ok := seen[item.GetVideoId()]; ok {
+			continue
+		}
+		seen[item.GetVideoId()] = struct{}{}
+		all = append(all, item)
+	}
+	for _, item := range outbox {
+		if _, ok := seen[item.GetVideoId()]; ok {
+			continue
+		}
+		seen[item.GetVideoId()] = struct{}{}
+		all = append(all, item)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].GetPublishedAt() != all[j].GetPublishedAt() {
+			return all[i].GetPublishedAt() > all[j].GetPublishedAt()
+		}
+		return all[i].GetVideoId() > all[j].GetVideoId()
+	})
+	if int64(len(all)) > pageSize {
+		all = all[:pageSize]
+	}
+	return all
 }

@@ -1,0 +1,9 @@
+flowchart TD
+    A[资源类型] --> B{变更频率?}
+    B -->|低频<br/>profile/video 元数据| C[版本号 + 长 TTL<br/>写路径 INCR 版本号<br/>读时用当前版本组合 key]
+    B -->|高频<br/>点赞计数| D[定点更新 + 定期回源<br/>写时 INCR/DECR<br/>miss 时 COUNT 回填]
+    B -->|派生数据<br/>Timeline / 未读数 / 热榜| E[事件驱动<br/>Kafka 扇出维护<br/>Redis 挂了直接回源 MySQL]
+
+    C --> F[代表: AccountPublicProfileKey]
+    D --> G[代表: video:likes:*]
+    E --> H[代表: feed:timeline:* / notification:unread:*]

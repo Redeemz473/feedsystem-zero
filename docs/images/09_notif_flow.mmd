@@ -1,0 +1,25 @@
+sequenceDiagram
+    autonumber
+    participant S as Social/Interaction<br/>业务 RPC
+    participant DB as MySQL
+    participant OB as Outbox
+    participant K as Kafka
+    participant J as notification-job
+    participant R as Redis
+
+    S->>DB: BEGIN
+    S->>DB: 业务写入
+    S->>DB: INSERT outbox(notification.events)
+    S->>DB: COMMIT
+
+    OB->>K: NotificationEvent
+
+    K->>J: 按 (topic, partition) 分组
+    J->>DB: BEGIN tx
+    J->>DB: SELECT processed_events (幂等检查)
+    J->>DB: SELECT notifications FOR UPDATE WHERE business_key=?
+    J->>J: 判定 6 种情况之一
+    J->>DB: INSERT/UPDATE notifications
+    J->>DB: INSERT processed_events
+    J->>DB: COMMIT
+    J->>R: bumpReceiverID>0 → Lua INCR+DEL 旧 version key

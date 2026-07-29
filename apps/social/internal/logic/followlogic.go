@@ -10,6 +10,7 @@ import (
 	"feedsystem-zero/apps/social/internal/svc"
 	"feedsystem-zero/apps/social/social"
 	"feedsystem-zero/common/eventx"
+	"feedsystem-zero/common/feedx"
 
 	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
@@ -144,6 +145,25 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 			Where("id = ?", followerID).
 			UpdateColumn("following_count", gorm.Expr("following_count + 1")).Error; err != nil {
 			return err
+		}
+
+		// 大 V 只升不降标记维护：读回被关注者的最新粉丝数与 is_big_v，
+		// 若首次达到阈值则在同事务内把 is_big_v 置 1。
+		// 使用 WHERE is_big_v = 0 的条件 UPDATE 保持并发幂等，
+		// 多个并发关注请求最多只有一个会真正把 0 改为 1。
+		var followingAccount model.Account
+		if err := tx.Model(&model.Account{}).
+			Select("id", "follower_count", "is_big_v").
+			Where("id = ?", followingID).
+			Take(&followingAccount).Error; err != nil {
+			return err
+		}
+		if feedx.ShouldPromoteBigCreator(followingAccount.FollowerCount, followingAccount.IsBigV) {
+			if err := tx.Model(&model.Account{}).
+				Where("id = ? AND is_big_v = ?", followingID, false).
+				UpdateColumn("is_big_v", true).Error; err != nil {
+				return err
+			}
 		}
 
 		eventID, err := newSocialEventID("follow")

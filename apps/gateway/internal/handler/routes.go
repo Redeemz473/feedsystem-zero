@@ -224,6 +224,11 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 					Path:    "/users/:id/follow",
 					Handler: UnfollowHandler(serverCtx),
 				},
+				{
+					Method:  http.MethodPost,
+					Path:    "/users/following/batch",
+					Handler: BatchIsFollowingHandler(serverCtx),
+				},
 			}...,
 		),
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
@@ -238,6 +243,11 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 					Method:  http.MethodGet,
 					Path:    "/recommend",
 					Handler: GetRecommendFeedHandler(serverCtx),
+				},
+				{
+					Method:  http.MethodGet,
+					Path:    "/hot",
+					Handler: GetHotFeedHandler(serverCtx),
 				},
 			}...,
 		),
@@ -257,5 +267,35 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 		),
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
 		rest.WithPrefix("/feed"),
+	)
+
+	server.AddRoutes(
+		rest.WithMiddlewares(
+			[]rest.Middleware{serverCtx.TokenAuth},
+			[]rest.Route{
+				{
+					Method:  http.MethodGet,
+					Path:    "/",
+					Handler: ListNotificationsHandler(serverCtx),
+				},
+				{
+					Method:  http.MethodGet,
+					Path:    "/unread-count",
+					Handler: GetUnreadCountHandler(serverCtx),
+				},
+				{
+					Method:  http.MethodPost,
+					Path:    "/:id/read",
+					Handler: MarkNotificationReadHandler(serverCtx),
+				},
+				{
+					Method:  http.MethodPost,
+					Path:    "/read-all",
+					Handler: MarkAllNotificationsReadHandler(serverCtx),
+				},
+			}...,
+		),
+		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
+		rest.WithPrefix("/notification"),
 	)
 }

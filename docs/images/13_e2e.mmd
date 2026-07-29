@@ -1,0 +1,61 @@
+sequenceDiagram
+    autonumber
+    participant U1 as 作者
+    participant U2 as 粉丝
+    participant G as Gateway
+    participant V as Video RPC
+    participant I as Interaction RPC
+    participant F as Feed RPC
+    participant N as Notification RPC
+    participant DB as MySQL
+    participant OB as Outbox
+    participant K as Kafka
+    participant JT as feed_timeline
+    participant JI as interaction_sync
+    participant JH as hotrank
+    participant JN as notification-job
+    participant R as Redis
+
+    Note over U1: 1) 作者发布视频
+    U1->>G: POST /video/publish
+    G->>V: PublishVideo
+    V->>DB: 事务:INSERT videos + outbox(video.published)
+    OB->>K: video.published
+    K->>JT: FeedVideoEvent
+    JT->>DB: 查作者 is_big_v
+    JT->>R: 小 V→ZADD 全部粉丝 inbox / 大 V→ZADD 作者 outbox
+
+    Note over U2: 2) 粉丝拉取关注流
+    U2->>G: GET /feed/following
+    G->>F: GetFollowingFeed
+    F->>R: ZREVRANGEBYLEX inbox + 关注的大 V outbox 合并
+    F-->>G: video_ids
+    G->>V: BatchGetVideos
+    G->>N: (可选) 未读数
+    G-->>U2: 视频列表
+
+    Note over U2: 3) 粉丝点赞
+    U2->>G: POST /interaction/like
+    G->>I: LikeVideo
+    I->>DB: 事务:INSERT likes + outbox(like.created) + outbox(notification.events)
+    OB->>K: 双事件
+    K->>JI: LikeEvent → 校准计数 → Produce stat.delta
+    K->>JH: VideoStatDeltaEvent → ZINCRBY hot:window:*
+    K->>JN: NotificationEvent → INSERT notifications → BumpUnreadVersion
+
+    Note over U1: 4) 作者查看通知
+    U1->>G: GET /notification/unread-count
+    G->>N: GetUnreadCount
+    N->>R: 读 version → 读 count → hit or miss
+    alt miss
+        N->>DB: SELECT COUNT WHERE status=1
+        N->>R: SETEX 回填
+    end
+    N-->>U1: 未读数
+
+    U1->>G: GET /notification/
+    G->>N: ListNotifications
+    N->>DB: 游标分页
+    G->>V: BatchGetVideos (缩略图)
+    G->>N: BatchGetProfiles (actor 昵称)
+    G-->>U1: 通知列表

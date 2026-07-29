@@ -38,8 +38,6 @@ func (l *GetRecommendFeedLogic) GetRecommendFeed(in *feed.GetRecommendFeedReq) (
 	}
 	pageSize := normalizeFeedPageSize(l.svcCtx, in.GetPageSize())
 
-	// 全局 Timeline 由 feed_timeline Job 单点构建。RPC 只检查 Ready 标记并有界等待，
-	// 避免 RPC 与 Job 同时回源 MySQL、争抢构建锁。
 	if err := ensureGlobalTimeline(l.ctx, l.svcCtx); err != nil {
 		l.Errorf(
 			"ensure global timeline failed, viewer_id:%d cursor_published_at:%d cursor_video_id:%d error:%v",

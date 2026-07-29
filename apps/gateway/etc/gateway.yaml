@@ -43,6 +43,12 @@ FeedRpc:
       - 127.0.0.1:23790
     Key: feed.rpc
 
+NotificationRpc:
+  Etcd:
+    Hosts:
+      - 127.0.0.1:23790
+    Key: notification.rpc
+
 Upload:
   Dir: uploads
   PublicPrefix: /uploads

@@ -1,0 +1,16 @@
+flowchart TD
+    A[GetFollowingFeed viewer, cursor] --> B[ZREVRANGEBYLEX fsz:feed:timeline:user:viewer]
+    B --> C{Timeline 有数据?}
+    C -->|有| D[得到小 V 视频集合 A]
+    C -->|冷启动/miss| E[获取 build_lock:viewer]
+    E --> F{抢到锁?}
+    F -->|抢到| G[SELECT follows 关注列表<br/>MySQL 拉最近 200 视频<br/>ZADD 回填 inbox]
+    F -->|没抢到| H[等待 200ms 重读]
+    G --> D
+    H --> D
+
+    D --> I[SELECT accounts WHERE is_big_v=1<br/>AND id IN 关注列表]
+    I --> J[对每个大 V ZREVRANGEBYLEX author_outbox]
+    J --> K[得到大 V 视频集合 B]
+    K --> L[合并 A∪B → 按 published_at DESC 归并]
+    L --> M[游标裁剪 → 返回 items + next_cursor]

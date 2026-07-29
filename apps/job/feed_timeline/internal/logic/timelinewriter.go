@@ -30,6 +30,8 @@ const (
 	defaultUserTimelineMaxLen     int64 = 2000
 	defaultFollowBackfillLimit          = 100
 	defaultUserTimelineTTL              = 30 * 24 * time.Hour
+	defaultAuthorOutboxMaxLen     int64 = 500
+	defaultAuthorOutboxTTL              = 30 * 24 * time.Hour
 	defaultTimelineRedisTimeout         = 3 * time.Second
 	defaultTimelineDBTimeout            = 5 * time.Second
 	defaultTimelineFlushInterval        = time.Second
@@ -67,6 +69,42 @@ return 1
 `
 
 const mutateUserTimelineScript = `
+redis.call("INCR", KEYS[2])
+local ttl = tonumber(ARGV[3])
+if ttl and ttl > 0 then
+    redis.call("EXPIRE", KEYS[2], ttl)
+end
+if redis.call("EXISTS", KEYS[3]) == 0 then
+    return 0
+end
+
+local action = ARGV[1]
+for i = 4, #ARGV do
+    if action == "add" then
+        redis.call("ZADD", KEYS[1], 0, ARGV[i])
+    else
+        redis.call("ZREM", KEYS[1], ARGV[i])
+    end
+end
+
+local maxLen = tonumber(ARGV[2])
+if maxLen and maxLen > 0 then
+    redis.call("ZREMRANGEBYRANK", KEYS[1], 0, -(maxLen + 1))
+end
+if ttl and ttl > 0 then
+    if redis.call("EXISTS", KEYS[1]) == 1 then
+        redis.call("EXPIRE", KEYS[1], ttl)
+    end
+    redis.call("EXPIRE", KEYS[3], ttl)
+end
+return 1
+`
+
+// mutateAuthorOutboxScript 与用户 Timeline 脚本同构：
+//   - 版本号无条件递增，冷启动检测到版本变化会走版本比较分支重试；
+//   - outbox ZSet 只在 ready 标记存在时写入，避免部分写入产生脏数据；
+//   - 每次写入都刷新 outbox / version / ready 三者的 TTL，保持一致的生命周期。
+const mutateAuthorOutboxScript = `
 redis.call("INCR", KEYS[2])
 local ttl = tonumber(ARGV[3])
 if ttl and ttl > 0 then
@@ -200,7 +238,7 @@ func (c *TimelineConsumer) applyVideoEvent(ctx context.Context, event eventx.Fee
 			if err := c.mutateGlobalTimeline(ctx, "remove", event.VideoID, member); err != nil {
 				return err
 			}
-			return c.fanoutVideoToFollowers(ctx, event.AuthorID, "remove", member)
+			return c.dispatchAuthorTimeline(ctx, event.AuthorID, "remove", member)
 		}
 		return err
 	}
@@ -214,17 +252,69 @@ func (c *TimelineConsumer) applyVideoEvent(ctx context.Context, event eventx.Fee
 		action = "add"
 	}
 
-	// 全局 Timeline 始终维护；用户 Timeline 只在 ready 标记存在时写入。
+	// 全局 Timeline 始终维护；用户 Timeline / 大 V outbox 根据 ready 标记按需写入。
 	if err := c.mutateGlobalTimeline(ctx, action, video.ID, member); err != nil {
 		return err
 	}
-	return c.fanoutVideoToFollowers(ctx, video.AuthorID, action, member)
+	return c.dispatchAuthorTimeline(ctx, video.AuthorID, action, member)
+}
+
+// dispatchAuthorTimeline 根据作者是否为大 V 决定推 / 拉：
+//   - 大 V：只写入作者自己的 outbox（1 次 Redis 写），跳过对海量粉丝的 fanout；
+//   - 小 V：走原有 fanoutVideoToFollowers 流程，把 member 推送到每个粉丝的 inbox。
+//
+// 是否为大 V 由 accounts.is_big_v 只升不降标记位决定（social 模块在关注事务内维护），
+// 一次主键查询即可完成判定，避免直接比较 follower_count 引发的阈值反向穿越。
+// 如果 accounts 记录暂时缺失（例如账号被删除），保守按小 V 处理避免历史视频消失。
+func (c *TimelineConsumer) dispatchAuthorTimeline(ctx context.Context, authorID uint64, action, member string) error {
+	if authorID == 0 {
+		return nil
+	}
+	isBigV, err := c.loadAuthorBigVFlag(ctx, authorID)
+	if err != nil {
+		return err
+	}
+	if feedx.IsBigCreator(isBigV) {
+		return c.mutateAuthorOutbox(ctx, authorID, action, []string{member})
+	}
+	return c.fanoutVideoToFollowers(ctx, authorID, action, member)
+}
+
+// loadAuthorBigVFlag 读取作者的大 V 标记位用于推拉分离判定。
+// 记录不存在时返回 false，让上游按小 V 处理避免误将新账号视频吞掉。
+// 该字段只升不降，一旦为 true 就永久有效，掉粉不会回退，保证已入 outbox 的历史视频可被读侧 union。
+func (c *TimelineConsumer) loadAuthorBigVFlag(ctx context.Context, authorID uint64) (bool, error) {
+	var account model.Account
+	dbCtx, cancel := context.WithTimeout(ctx, c.dbTimeout())
+	defer cancel()
+	err := c.svcCtx.GormDB.WithContext(dbCtx).
+		Select("id", "is_big_v").
+		Where("id = ?", authorID).
+		First(&account).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load author big_v flag failed, author_id:%d: %w", authorID, err)
+	}
+	return account.IsBigV, nil
 }
 
 func (c *TimelineConsumer) applyFollowEvent(ctx context.Context, event eventx.FollowEvent) error {
 	followed, err := c.loadFollowFinalState(ctx, event.FollowerID, event.FollowingID)
 	if err != nil {
 		return err
+	}
+
+	// 大 V 无需 inbox 回填 / 清理：读侧会自动 union / 剔除该作者的 outbox。
+	// is_big_v 只升不降，即使该作者后续掉粉低于阈值，已经入 outbox 的历史视频仍可被读到，
+	// 不会像直接比较 follower_count 那样出现阈值反向穿越导致视频消失。
+	isBigV, err := c.loadAuthorBigVFlag(ctx, event.FollowingID)
+	if err != nil {
+		return err
+	}
+	if feedx.IsBigCreator(isBigV) {
+		return nil
 	}
 
 	action := "remove"
@@ -410,6 +500,41 @@ func (c *TimelineConsumer) mutateUserTimelines(ctx context.Context, userIDs []ui
 
 func (c *TimelineConsumer) mutateUserTimeline(ctx context.Context, userID uint64, action string, members []string) error {
 	return c.mutateUserTimelines(ctx, []uint64{userID}, action, members)
+}
+
+// mutateAuthorOutbox 对大 V 的 outbox 进行 add / remove。
+// ready 标记不存在时视为 outbox 尚未冷启动，只递增版本号并刷新 TTL；
+// 版本变化会让 rpc 侧的懒加载在冷启动完成前重试，最终读到最新数据。
+func (c *TimelineConsumer) mutateAuthorOutbox(ctx context.Context, authorID uint64, action string, members []string) error {
+	if authorID == 0 || len(members) == 0 {
+		return nil
+	}
+	redisCtx, cancel := context.WithTimeout(ctx, c.redisTimeout())
+	defer cancel()
+
+	args := make([]any, 0, len(members)+3)
+	args = append(args,
+		action,
+		strconv.FormatInt(c.authorOutboxMaxLen(), 10),
+		strconv.FormatInt(int64(c.authorOutboxTTL()/time.Second), 10),
+	)
+	for _, member := range members {
+		args = append(args, member)
+	}
+	_, err := c.svcCtx.RedisCli.Eval(
+		redisCtx,
+		mutateAuthorOutboxScript,
+		[]string{
+			rediskey.FeedAuthorOutboxKey(authorID),
+			rediskey.FeedAuthorOutboxVersionKey(authorID),
+			rediskey.FeedAuthorOutboxReadyKey(authorID),
+		},
+		args...,
+	).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("mutate author outbox failed, author_id:%d: %w", authorID, err)
+	}
+	return nil
 }
 
 func (c *TimelineConsumer) userTimelineMutationArgs(action string, members []string) []any {
@@ -604,6 +729,26 @@ func (c *TimelineConsumer) followBackfillLimit() int {
 		return defaultFollowBackfillLimit
 	}
 	return min(value, int(c.userTimelineMaxLen()))
+}
+
+// authorOutboxMaxLen 单个大 V outbox 的最大保留条数。
+// 配置未提供时使用默认值；读侧对多份 outbox 做 union，因此长度不宜过大。
+func (c *TimelineConsumer) authorOutboxMaxLen() int64 {
+	value := c.svcCtx.Config.Timeline.AuthorOutboxMaxLen
+	if value <= 0 {
+		return defaultAuthorOutboxMaxLen
+	}
+	return value
+}
+
+// authorOutboxTTL 大 V outbox 的有效期。
+// 有事件到达或读侧访问都会自动续期；长期无人访问的大 V 会随 TTL 淘汰。
+func (c *TimelineConsumer) authorOutboxTTL() time.Duration {
+	seconds := c.svcCtx.Config.Timeline.AuthorOutboxTTLSeconds
+	if seconds <= 0 {
+		return defaultAuthorOutboxTTL
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (c *TimelineConsumer) redisTimeout() time.Duration {

@@ -1,0 +1,33 @@
+sequenceDiagram
+    autonumber
+    participant U as 前端
+    participant G as Gateway
+    participant V as Video RPC
+    participant DB as MySQL
+    participant OSS as 对象存储
+
+    U->>G: 计算 file_hash（前端 SHA256 or MD5）
+    U->>G: /video/upload/init { file_hash }
+    G->>V: 查询 file_assets WHERE file_hash=?
+
+    alt 已存在（秒传命中）
+        V->>DB: BEGIN
+        V->>DB: file_assets.ref_count += 1
+        V->>DB: COMMIT
+        V-->>G: { existed:true, url }
+        G-->>U: 秒传成功
+    else 需要真实上传
+        V-->>G: 生成上传 token
+        G-->>U: 上传 URL
+        U->>OSS: 分片上传
+        U->>G: /video/upload/complete
+        G->>V: BEGIN → INSERT file_assets(ref_count=1) → COMMIT
+    end
+
+    U->>G: /video/publish { file_asset_id, title, tags, request_id }
+    G->>V: PublishVideo
+    V->>DB: BEGIN
+    V->>DB: INSERT videos + INSERT video_tags
+    V->>DB: INSERT outbox_events(feed.video.events, published)
+    V->>DB: COMMIT
+    V-->>G: VideoInfo

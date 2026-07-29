@@ -30,6 +30,8 @@ type TimelineConf struct {
 	UserTimelineMaxLen       int64 `json:",default=2000"`
 	UserTimelineTTLSeconds   int64 `json:",default=2592000"`
 	FollowBackfillVideoLimit int   `json:",default=100"`
+	AuthorOutboxMaxLen       int64 `json:",default=500"`
+	AuthorOutboxTTLSeconds   int64 `json:",default=2592000"`
 	RedisOpTimeoutMs         int   `json:",default=3000"`
 	DBQueryTimeoutMs         int   `json:",default=5000"`
 	ProcessedEventTTLDays    int   `json:",default=14"`

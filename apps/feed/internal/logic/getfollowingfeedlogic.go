@@ -5,7 +5,6 @@ import (
 
 	"feedsystem-zero/apps/feed/feed"
 	"feedsystem-zero/apps/feed/internal/svc"
-	"feedsystem-zero/common/rediskey"
 
 	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
@@ -26,7 +25,10 @@ func NewGetFollowingFeedLogic(ctx context.Context, svcCtx *svc.ServiceContext) *
 	}
 }
 
-// 关注流：viewer 关注的所有作者的最新视频，按发布时间倒序
+// GetFollowingFeed 返回 viewer 的关注流。
+// 推拉结合：小 V 视频通过 inbox 推送；大 V（accounts.is_big_v = 1）视频由读侧
+// 按需拉取该作者的 outbox 并与 inbox 做归并合并，避免对大 V 的每次发布做扇出风暴。
+// is_big_v 只升不降，因此掉粉的大 V 仍会被读侧合并 outbox，历史视频不会消失。
 func (l *GetFollowingFeedLogic) GetFollowingFeed(in *feed.GetFollowingFeedReq) (*feed.GetFollowingFeedResp, error) {
 	viewerID := in.GetViewerId()
 	if viewerID == 0 {
@@ -40,8 +42,7 @@ func (l *GetFollowingFeedLogic) GetFollowingFeed(in *feed.GetFollowingFeedReq) (
 	}
 	pageSize := normalizeFeedPageSize(l.svcCtx, in.GetPageSize())
 
-	// 用户首次访问或 Timeline 过期时，通过本地 SingleFlight 和 Redis 分布式锁
-	// 从 MySQL 的 follows + videos 构建快照，并用版本号避免覆盖并发写入。
+	// inbox 冷启动仍由 rpc 自身兜底：如果 timeline 未 ready 就从 MySQL 快照建一份。
 	if err := ensureFollowingTimeline(l.ctx, l.svcCtx, viewerID); err != nil {
 		l.Errorf(
 			"ensure following timeline failed, viewer_id:%d cursor_published_at:%d cursor_video_id:%d error:%v",
@@ -53,10 +54,10 @@ func (l *GetFollowingFeedLogic) GetFollowingFeed(in *feed.GetFollowingFeedReq) (
 		return nil, err
 	}
 
-	page, err := loadTimelinePage(
+	page, err := loadFollowingFeedMerged(
 		l.ctx,
 		l.svcCtx,
-		rediskey.FeedTimelineKey(viewerID),
+		viewerID,
 		cursorPublishedAt,
 		cursorVideoID,
 		pageSize,
@@ -76,7 +77,7 @@ func (l *GetFollowingFeedLogic) GetFollowingFeed(in *feed.GetFollowingFeedReq) (
 		return nil, status.Error(codes.Unavailable, "关注流暂时不可用，请稍后重试")
 	}
 
-	// TTL续期
+	// inbox TTL 续期，让活跃用户持续保有更长的 timeline 生命周期。
 	refreshFollowingTimelineTTL(l.ctx, l.svcCtx, viewerID)
 
 	resp := &feed.GetFollowingFeedResp{

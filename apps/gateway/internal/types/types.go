@@ -389,3 +389,97 @@ type VideoUploadStatusResp struct {
 	Completed      bool    `json:"completed"`
 	Playurl        string  `json:"play_url"`
 }
+
+// ============================ 热榜 ============================
+
+type HotFeedVideo struct {
+	Video    VideoInfo `json:"video"`
+	Hotscore float64   `json:"hot_score"`
+	Rank     int64     `json:"rank"`
+}
+
+type GetHotFeedReq struct {
+	Snapshotat int64 `form:"snapshot_at,optional"`
+	Offset     int64 `form:"offset,optional"`
+	Pagesize   int64 `form:"page_size,optional"`
+}
+
+type GetHotFeedResp struct {
+	Items      []HotFeedVideo `json:"items"`
+	Snapshotat int64          `json:"snapshot_at"`
+	Nextoffset int64          `json:"next_offset"`
+	Hasmore    bool           `json:"has_more"`
+}
+
+// ======================= 批量关注状态查询 =======================
+
+type BatchIsFollowingReq struct {
+	Targetuserids []uint64 `json:"target_user_ids"`
+}
+
+type FollowingStateInfo struct {
+	Targetuserid uint64 `json:"target_user_id"`
+	Following    bool   `json:"following"`
+}
+
+type BatchIsFollowingResp struct {
+	States []FollowingStateInfo `json:"states"`
+}
+
+// =========================== 通知 ==============================
+
+type NotificationActor struct {
+	Userid    uint64 `json:"user_id"`
+	Username  string `json:"username"`
+	Avatarurl string `json:"avatar_url"`
+}
+
+type NotificationVideo struct {
+	Videoid  uint64 `json:"video_id"`
+	Title    string `json:"title"`
+	Coverurl string `json:"cover_url"`
+}
+
+type NotificationItem struct {
+	Notificationid uint64             `json:"notification_id"`
+	Type           string             `json:"type"`
+	Status         string             `json:"status"`
+	Actor          NotificationActor  `json:"actor"`
+	Video          *NotificationVideo `json:"video,omitempty"`
+	Commentid      uint64             `json:"comment_id,omitempty"`
+	Occurredat     int64              `json:"occurred_at"`
+	Readat         int64              `json:"read_at"`
+}
+
+type ListNotificationsReq struct {
+	Cursoroccurredat     int64  `form:"cursor_occurred_at,optional"`
+	Cursornotificationid uint64 `form:"cursor_notification_id,optional"`
+	Pagesize             int64  `form:"page_size,optional"`
+}
+
+type ListNotificationsResp struct {
+	Notifications            []NotificationItem `json:"notifications"`
+	Nextcursoroccurredat     int64              `json:"next_cursor_occurred_at"`
+	Nextcursornotificationid uint64             `json:"next_cursor_notification_id"`
+	Hasmore                  bool               `json:"has_more"`
+}
+
+type GetUnreadCountReq struct{}
+
+type GetUnreadCountResp struct {
+	Unreadcount int64 `json:"unread_count"`
+}
+
+type MarkNotificationReadReq struct {
+	Notificationid uint64 `path:"id"`
+}
+
+type MarkNotificationReadResp struct {
+	Changed bool `json:"changed"`
+}
+
+type MarkAllNotificationsReadReq struct{}
+
+type MarkAllNotificationsReadResp struct {
+	Changedcount int64 `json:"changed_count"`
+}

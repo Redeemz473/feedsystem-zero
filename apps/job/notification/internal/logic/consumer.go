@@ -15,6 +15,7 @@ import (
 	"feedsystem-zero/apps/job/notification/internal/svc"
 	"feedsystem-zero/common/eventx"
 	"feedsystem-zero/common/kafkax"
+	"feedsystem-zero/common/notificationcache"
 
 	"github.com/zeromicro/go-zero/core/logx"
 	"gorm.io/gorm"
@@ -259,6 +260,13 @@ func (c *NotificationConsumer) processEvents(ctx context.Context, events []decod
 
 // processChunk 将 processed_events 幂等标记与通知状态写入同一个事务。
 // 事务失败时 Kafka offset 不会提交；重试后也不会出现“已标记但通知未落库”的空洞。
+//
+// 事务提交成功后，对本批次内所有“真正影响未读数”的 receiver 触发 Redis version bump。
+// 判定规则见 applyNotificationEvent 返回的 bumpReceiverID：
+//   - 新建 unread / 已撤回 -> unread 复活 / unread -> canceled 才需要 bump
+//   - 旧事件被跳过、canceled 事件针对已读记录 等情况都不 bump，避免无谓的缓存失效
+//
+// Redis 失败仅打日志、绝不回滚 MySQL：TTL 会兜底收敛不一致，未读数属于弱一致展示字段。
 func (c *NotificationConsumer) processChunk(ctx context.Context, events []decodedNotificationEvent) error {
 	if len(events) == 0 {
 		return nil
@@ -269,7 +277,11 @@ func (c *NotificationConsumer) processChunk(ctx context.Context, events []decode
 
 	now := c.currentTime()
 	expireAt := now.Add(c.processedEventTTL())
-	return c.svcCtx.GormDB.WithContext(dbCtx).Transaction(func(tx *gorm.DB) error {
+
+	// 事务内收集需要 bump version 的 receiver。提交成功前不写 Redis，防止事务回滚后
+	// 缓存已被清空、下一次读又把“会被回滚”的中间值 COUNT 进来。
+	bumpReceivers := make(map[uint64]struct{})
+	txErr := c.svcCtx.GormDB.WithContext(dbCtx).Transaction(func(tx *gorm.DB) error {
 		for _, decoded := range events {
 			inserted, err := insertNotificationProcessedEvent(tx, decoded, now, expireAt)
 			if err != nil {
@@ -278,12 +290,25 @@ func (c *NotificationConsumer) processChunk(ctx context.Context, events []decode
 			if !inserted {
 				continue
 			}
-			if err := applyNotificationEvent(tx, decoded, now); err != nil {
+			bumpReceiverID, err := applyNotificationEvent(tx, decoded, now)
+			if err != nil {
 				return err
+			}
+			if bumpReceiverID != 0 {
+				bumpReceivers[bumpReceiverID] = struct{}{}
 			}
 		}
 		return nil
 	})
+	if txErr != nil {
+		return txErr
+	}
+
+	// 事务已经提交，MySQL 状态是最终值；即便 Redis 全部失败，下一次读走 MySQL COUNT 也仍然正确。
+	for receiverID := range bumpReceivers {
+		notificationcache.BumpUnreadVersion(ctx, c.svcCtx.RedisCli, receiverID)
+	}
+	return nil
 }
 
 func insertNotificationProcessedEvent(
@@ -308,24 +333,42 @@ func insertNotificationProcessedEvent(
 	return result.RowsAffected == 1, nil
 }
 
-func applyNotificationEvent(tx *gorm.DB, decoded decodedNotificationEvent, now time.Time) error {
+// applyNotificationEvent 把一条已解码的事件落到 notifications 表，并返回是否需要
+// bump 该 receiver 的未读数 version（用于事务提交后失效 Redis 缓存）。
+// bumpReceiverID == 0 表示本次不需要 bump；具体判定见函数内注释。
+func applyNotificationEvent(
+	tx *gorm.DB,
+	decoded decodedNotificationEvent,
+	now time.Time,
+) (bumpReceiverID uint64, err error) {
 	var current model.Notification
-	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+	err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("business_key = ?", decoded.BusinessKey).
 		Take(&current).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		record := notificationRecordFromEvent(decoded, now)
-		return tx.Create(&record).Error
+		if err := tx.Create(&record).Error; err != nil {
+			return 0, err
+		}
+		// 全新记录：create 事件直接落 unread（未读数 +1，需 bump）；
+		// delete 事件用于补偿旧撤回，落 canceled，从未存在于未读集合，不 bump。
+		if decoded.Event.Action == eventx.NotificationActionCreate {
+			return decoded.Event.ReceiverID, nil
+		}
+		return 0, nil
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// 手工重放或跨集群补偿可能让旧事件晚到。旧事件只记 processed_events，
-	// 不能覆盖业务键上已经应用的更新状态。
+	// 不能覆盖业务键上已经应用的更新状态，也不改变未读集合，因此不 bump。
 	if decoded.OccurredAt.Before(current.OccurredAt) {
-		return nil
+		return 0, nil
 	}
+
+	// 记录变更前是否处于“未读”集合，以便与变更后对比——只有翻转才是真正影响未读数的事件。
+	wasUnread := current.Status == model.NotificationStatusUnread && current.DeletedAt == nil
 
 	updates := map[string]any{
 		"source_event_id":   decoded.Event.SourceEventID,
@@ -337,18 +380,36 @@ func applyNotificationEvent(tx *gorm.DB, decoded decodedNotificationEvent, now t
 		"occurred_at":       decoded.OccurredAt,
 		"updated_at":        now,
 	}
+	var willBeUnread bool
 	if decoded.Event.Action == eventx.NotificationActionCreate {
 		updates["status"] = model.NotificationStatusUnread
 		updates["read_at"] = nil
 		updates["deleted_at"] = nil
+		willBeUnread = true
 	} else {
 		updates["status"] = model.NotificationStatusCanceled
 		updates["read_at"] = nil
 		updates["deleted_at"] = decoded.OccurredAt
+		willBeUnread = false
 	}
-	return tx.Model(&model.Notification{}).
+	if err := tx.Model(&model.Notification{}).
 		Where("id = ?", current.ID).
-		Updates(updates).Error
+		Updates(updates).Error; err != nil {
+		return 0, err
+	}
+
+	// unread 集合是否发生翻转：
+	//   - 复活已撤回通知（false -> true）：未读数 +1，bump
+	//   - 撤回一条未读通知（true -> false）：未读数 -1，bump
+	//   - 撤回已读通知（false -> false）：未读集合不变，不 bump
+	//   - 幂等重放同一 create（true -> true）：未读集合不变，不 bump
+	//
+	// receiver_id 使用变更后的值：正常场景两者一致；理论上事件重定向到不同 receiver 时，
+	// 只对最终生效的接收者失效缓存即可（旧 receiver 的未读集合本来就没算这条）。
+	if wasUnread != willBeUnread {
+		return decoded.Event.ReceiverID, nil
+	}
+	return 0, nil
 }
 
 func notificationRecordFromEvent(decoded decodedNotificationEvent, now time.Time) model.Notification {

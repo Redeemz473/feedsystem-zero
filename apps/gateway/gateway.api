@@ -351,6 +351,82 @@ type (
 		Nextcursorvideoid     uint64      `json:"next_cursor_video_id"`
 		Hasmore               bool        `json:"has_more"`
 	}
+	// 热榜候选项：包含视频详情、热度分与榜内排名。
+	HotFeedVideo {
+		Video    VideoInfo `json:"video"`
+		Hotscore float64   `json:"hot_score"`
+		Rank     int64     `json:"rank"`
+	}
+	// 热榜：按分钟级快照 + offset 分页，一次浏览期间快照稳定。
+	GetHotFeedReq {
+		Snapshotat int64 `form:"snapshot_at,optional"`
+		Offset     int64 `form:"offset,optional"`
+		Pagesize   int64 `form:"page_size,optional"`
+	}
+	GetHotFeedResp {
+		Items      []HotFeedVideo `json:"items"`
+		Snapshotat int64          `json:"snapshot_at"`
+		Nextoffset int64          `json:"next_offset"`
+		Hasmore    bool           `json:"has_more"`
+	}
+	// 批量查询当前登录用户是否关注给定的多个用户，避免列表页 N+1 RPC。
+	BatchIsFollowingReq {
+		Targetuserids []uint64 `json:"target_user_ids"`
+	}
+	FollowingStateInfo {
+		Targetuserid uint64 `json:"target_user_id"`
+		Following    bool   `json:"following"`
+	}
+	BatchIsFollowingResp {
+		States []FollowingStateInfo `json:"states"`
+	}
+	// 通知类型/状态由 gateway 转换为字符串枚举，方便前端理解。
+	NotificationActor {
+		Userid    uint64 `json:"user_id"`
+		Username  string `json:"username"`
+		Avatarurl string `json:"avatar_url"`
+	}
+	// 通知里带的视频摘要，仅用于展示，不含互动统计。
+	NotificationVideo {
+		Videoid  uint64 `json:"video_id"`
+		Title    string `json:"title"`
+		Coverurl string `json:"cover_url"`
+	}
+	NotificationItem {
+		Notificationid uint64             `json:"notification_id"`
+		Type           string             `json:"type"`   // like / comment / follow
+		Status         string             `json:"status"` // unread / read
+		Actor          NotificationActor  `json:"actor"`
+		Video          *NotificationVideo `json:"video,omitempty"`
+		Commentid      uint64             `json:"comment_id,omitempty"`
+		Occurredat     int64              `json:"occurred_at"`
+		Readat         int64              `json:"read_at"`
+	}
+	ListNotificationsReq {
+		Cursoroccurredat     int64  `form:"cursor_occurred_at,optional"`
+		Cursornotificationid uint64 `form:"cursor_notification_id,optional"`
+		Pagesize             int64  `form:"page_size,optional"`
+	}
+	ListNotificationsResp {
+		Notifications             []NotificationItem `json:"notifications"`
+		Nextcursoroccurredat      int64              `json:"next_cursor_occurred_at"`
+		Nextcursornotificationid  uint64             `json:"next_cursor_notification_id"`
+		Hasmore                   bool               `json:"has_more"`
+	}
+	GetUnreadCountReq {}
+	GetUnreadCountResp {
+		Unreadcount int64 `json:"unread_count"`
+	}
+	MarkNotificationReadReq {
+		Notificationid uint64 `path:"id"`
+	}
+	MarkNotificationReadResp {
+		Changed bool `json:"changed"`
+	}
+	MarkAllNotificationsReadReq {}
+	MarkAllNotificationsReadResp {
+		Changedcount int64 `json:"changed_count"`
+	}
 )
 
 @server (
@@ -492,6 +568,9 @@ service gateway {
 
 	@handler Unfollow
 	delete /users/:id/follow (UnfollowReq) returns (UnfollowResp)
+
+	@handler BatchIsFollowing
+	post /users/following/batch (BatchIsFollowingReq) returns (BatchIsFollowingResp)
 }
 
 @server (
@@ -501,6 +580,9 @@ service gateway {
 service gateway {
 	@handler GetRecommendFeed
 	get /recommend (GetRecommendFeedReq) returns (GetRecommendFeedResp)
+
+	@handler GetHotFeed
+	get /hot (GetHotFeedReq) returns (GetHotFeedResp)
 }
 
 @server (
@@ -513,3 +595,21 @@ service gateway {
 	get /following (GetFollowingFeedReq) returns (GetFollowingFeedResp)
 }
 
+@server (
+	prefix:     /notification
+	jwt:        Auth
+	middleware: TokenAuth
+)
+service gateway {
+	@handler ListNotifications
+	get / (ListNotificationsReq) returns (ListNotificationsResp)
+
+	@handler GetUnreadCount
+	get /unread-count (GetUnreadCountReq) returns (GetUnreadCountResp)
+
+	@handler MarkNotificationRead
+	post /:id/read (MarkNotificationReadReq) returns (MarkNotificationReadResp)
+
+	@handler MarkAllNotificationsRead
+	post /read-all (MarkAllNotificationsReadReq) returns (MarkAllNotificationsReadResp)
+}

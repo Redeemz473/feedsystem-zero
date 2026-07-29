@@ -31,6 +31,8 @@ Timeline:
   UserTimelineMaxLen: 2000
   UserTimelineTTLSeconds: 2592000
   FollowBackfillVideoLimit: 100
+  AuthorOutboxMaxLen: 500
+  AuthorOutboxTTLSeconds: 2592000
   RedisOpTimeoutMs: 3000
   DBQueryTimeoutMs: 5000
   ProcessedEventTTLDays: 14

@@ -1,16 +1,18 @@
 import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { LogOut, User } from "lucide-react";
+import { Bell, LogOut, User } from "lucide-react";
 
 import { logout } from "@/api/account";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
+import { useUnreadCount } from "@/hooks/useUnreadCount";
 import { useAuthStore } from "@/stores/auth";
 import { extractErrMsg } from "@/api/request";
 
 // 顶部导航栏 + 主内容区域的骨架
 export default function MainLayout() {
   const { data: me } = useCurrentUser();
+  const { data: unread } = useUnreadCount();
   const navigate = useNavigate();
   const qc = useQueryClient();
 
@@ -26,6 +28,8 @@ export default function MainLayout() {
       navigate("/login", { replace: true });
     }
   }
+
+  const unreadCount = unread?.unread_count ?? 0;
 
   return (
     <div className="min-h-full flex flex-col">
@@ -45,7 +49,19 @@ export default function MainLayout() {
             {me ? (
               <>
                 <Link
-                  to="/profile"
+                  to="/notifications"
+                  className="relative text-gray-500 hover:text-brand-600"
+                  title="消息"
+                >
+                  <Bell size={18} />
+                  {unreadCount > 0 ? (
+                    <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-red-500 text-white text-[10px] leading-4 text-center">
+                      {unreadCount > 99 ? "99+" : unreadCount}
+                    </span>
+                  ) : null}
+                </Link>
+                <Link
+                  to={`/users/${me.user_id}`}
                   className="flex items-center gap-1 text-gray-700 hover:text-brand-600"
                 >
                   <User size={16} />

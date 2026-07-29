@@ -5,6 +5,12 @@ import LoginPage from "@/pages/LoginPage";
 import RegisterPage from "@/pages/RegisterPage";
 import HomePage from "@/pages/HomePage";
 import ProfilePage from "@/pages/ProfilePage";
+import UploadPage from "@/pages/UploadPage";
+import LikesPage from "@/pages/LikesPage";
+import VideoDetailPage from "@/pages/VideoDetailPage";
+import UserPage from "@/pages/UserPage";
+import FollowListPage from "@/pages/FollowListPage";
+import NotificationsPage from "@/pages/NotificationsPage";
 import ComingSoon from "@/pages/ComingSoon";
 import { RequireAuth } from "@/router/RequireAuth";
 
@@ -32,26 +38,33 @@ export default function App() {
           path="/upload"
           element={
             <RequireAuth>
-              <ComingSoon name="视频上传（M2）" />
+              <UploadPage />
             </RequireAuth>
           }
         />
+
         <Route
           path="/likes"
           element={
             <RequireAuth>
-              <ComingSoon name="我的喜欢（M3）" />
+              <LikesPage />
             </RequireAuth>
           }
         />
+
         <Route
-          path="/videos/:id"
-          element={<ComingSoon name="视频详情（M3）" />}
+          path="/notifications"
+          element={
+            <RequireAuth>
+              <NotificationsPage />
+            </RequireAuth>
+          }
         />
-        <Route
-          path="/users/:id"
-          element={<ComingSoon name="用户主页（M4）" />}
-        />
+
+        <Route path="/videos/:id" element={<VideoDetailPage />} />
+        <Route path="/users/:id" element={<UserPage />} />
+        <Route path="/users/:id/followers" element={<FollowListPage />} />
+        <Route path="/users/:id/followings" element={<FollowListPage />} />
 
         <Route path="*" element={<ComingSoon name="页面不存在" />} />
       </Route>

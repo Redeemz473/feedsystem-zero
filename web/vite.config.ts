@@ -18,6 +18,8 @@ export default defineConfig({
       "/video": { target: "http://127.0.0.1:8888", changeOrigin: true },
       "/interaction": { target: "http://127.0.0.1:8888", changeOrigin: true },
       "/social": { target: "http://127.0.0.1:8888", changeOrigin: true },
+      "/feed": { target: "http://127.0.0.1:8888", changeOrigin: true },
+      "/notification": { target: "http://127.0.0.1:8888", changeOrigin: true },
       "/uploads": { target: "http://127.0.0.1:8888", changeOrigin: true },
     },
   },
