@@ -14,15 +14,17 @@ const (
 )
 
 // AccountPublicProfileVersionKey 公开用户资料缓存版本号。
-// 用户资料更新成功后递增版本；旧版本缓存无需扫描删除，等待 TTL 自动淘汰。
-// 格式: fsz:account:profile:{userID}:version
+// 数据结构: STRING (int64)
+// key: fsz:account:profile:{userID}:version  value: 单调递增版本号
+// 用途: 资料更新成功后 INCR；旧版本缓存无需扫描删除，等待 TTL 自动淘汰。
 func AccountPublicProfileVersionKey(userID uint64) string {
 	return fmt.Sprintf("%s:account:profile:%d:version", prefix, userID)
 }
 
-// AccountPublicProfileKey 公开用户资料缓存，value 是 JSON。
-// 缓存内容只能包含 user_id、username、avatar_url、bio，禁止存放邮箱等敏感字段。
-// 格式: fsz:account:profile:{userID}:v:{version}
+// AccountPublicProfileKey 公开用户资料缓存。
+// 数据结构: STRING (JSON)
+// key: fsz:account:profile:{userID}:v:{version}  value: {user_id, username, avatar_url, bio}
+// 用途: account-rpc 读侧惰性回源；只允许存放公开字段，禁止写入邮箱等敏感信息。
 func AccountPublicProfileKey(userID uint64, version int64) string {
 	return fmt.Sprintf("%s:account:profile:%d:v:%d", prefix, userID, version)
 }

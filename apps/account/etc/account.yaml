@@ -21,7 +21,7 @@ Jwt:
 Email:
   Host: smtp.163.com
   Port: 465
-  Username: 18598833168@163.com
-  Password: "VETWGhkqXUHxZ2m8"
-  From: 18598833168@163.com
-  FromName: 91视频验证码
+  Username: your-email@163.com
+  Password: "YOUR_SMTP_AUTH_CODE"
+  From: your-email@163.com
+  FromName: FeedSystem 验证码

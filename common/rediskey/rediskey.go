@@ -21,39 +21,44 @@ const prefix = "fsz"
 // VerificationCodeTTL 邮箱验证码有效期，5 分钟。
 const VerificationCodeTTL = 5 * time.Minute
 
-// TokenKey 当前有效 access token，value 是 JWT 字符串。
-// 当前采用单设备/单会话模型：同一用户新登录会覆盖旧 token。
-// 格式: fsz:token:{userID}
+// TokenKey 当前有效 access token。
+// 数据结构: STRING
+// key: fsz:token:{userID}  value: JWT 字符串
+// 用途: 单设备/单会话模型，同一用户新登录会覆盖旧 token；登出/踢下线时 DEL 即可。
 func TokenKey(userID uint64) string {
 	return fmt.Sprintf("%s:token:%d", prefix, userID)
 }
 
-// VerificationCodeKey 邮箱验证码，value 是 6 位验证码。
-// TTL 通常设 5 分钟（参见 VerificationCodeTTL）。
-// 格式: fsz:verify:{email}
+// VerificationCodeKey 邮箱验证码。
+// 数据结构: STRING
+// key: fsz:verify:{email}  value: 6 位数字验证码
+// 用途: 注册/找回密码流程写入，TTL 由 VerificationCodeTTL 控制（5 分钟）。
 func VerificationCodeKey(email string) string {
 	email = strings.ToLower(strings.TrimSpace(email))
 	return fmt.Sprintf("%s:verify:%s", prefix, email)
 }
 
-// ProcessedEventKey Kafka 消费幂等标记，value=1。
-// TTL 建议 7 天，防止同一条消息被重复消费。
-// 该 key 是 processed_events 表的补充：MySQL 是权威幂等来源，
-// Redis 提供更快的短窗口拦截。
-// 格式: fsz:processed:{eventID}:{consumerName}
+// ProcessedEventKey Kafka 消费幂等标记。
+// 数据结构: STRING
+// key: fsz:processed:{eventID}:{consumerName}  value: 1
+// 用途: 消费者提交后写入并设 7 天 TTL，作为 MySQL processed_events 表的短窗口快速前置拦截；
+// MySQL 仍是权威幂等来源，Redis 只是加速。
 func ProcessedEventKey(eventID string, consumerName string) string {
 	return fmt.Sprintf("%s:processed:%s:%s", prefix, eventID, consumerName)
 }
 
 // OutboxDispatchLockKey outbox dispatcher 全局短锁。
-// 防止多个 dispatcher 同时抢同一批 pending 事件。
-// 格式: fsz:outbox:dispatch:lock
+// 数据结构: STRING
+// key: fsz:outbox:dispatch:lock  value: 持锁实例标识
+// 用途: 防止多个 outbox job 副本同时抢同一批 pending 事件造成重复投递。
 func OutboxDispatchLockKey() string {
 	return fmt.Sprintf("%s:outbox:dispatch:lock", prefix)
 }
 
-// JobLockKey 后台 job 分布式锁，name 建议使用 hotrank/timeline/stat-sync 等。
-// 格式: fsz:job:lock:{name}
+// JobLockKey 后台 job 分布式锁。
+// 数据结构: STRING
+// key: fsz:job:lock:{name}  value: 持锁实例标识
+// 用途: 单实例执行的定时任务用它做互斥；name 建议使用 hotrank / timeline / stat-sync 等业务标识。
 func JobLockKey(name string) string {
 	name = strings.TrimSpace(name)
 	return fmt.Sprintf("%s:job:lock:%s", prefix, name)

@@ -17,52 +17,62 @@ const (
 	SocialListCacheBuildLockTTL = 5 * time.Second
 )
 
-// SocialFollowingStateKey 单向关注状态缓存，value=1/0。
-// 格式: fsz:social:following:{followerID}:{followingID}
+// SocialFollowingStateKey 单向关注状态缓存。
+// 数据结构: STRING
+// key: fsz:social:following:{followerID}:{followingID}  value: 1/0
+// 用途: IsFollowing / BatchIsFollowing 优先命中此 key；未关注状态也需缓存，防止穿透 MySQL。
 func SocialFollowingStateKey(followerID, followingID uint64) string {
 	return fmt.Sprintf("%s:social:following:%d:%d", prefix, followerID, followingID)
 }
 
 // SocialFollowersListVersionKey 用户粉丝列表版本号。
-// 关注/取关事务提交后，对被关注者 followingID 对应的版本执行 INCR。
-// 固定首页缓存 key 带上版本号，旧版本缓存不主动扫描删除，等待 TTL 自动淘汰。
-// 格式: fsz:social:user:{userID}:followers:list:version
+// 数据结构: STRING (int64)
+// key: fsz:social:user:{userID}:followers:list:version  value: 单调递增版本号
+// 用途: 关注/取关事务提交后，对被关注者 followingID 对应的版本 INCR；
+// 旧版本的首页缓存 key 无需扫描删除，随 TTL 自动淘汰。
 func SocialFollowersListVersionKey(userID uint64) string {
 	return fmt.Sprintf("%s:social:user:%d:followers:list:version", prefix, userID)
 }
 
-// SocialFollowersFirstPageCacheKey 用户粉丝列表固定首页窗口缓存，value=JSON。
-// 同一版本只保存一份最多 50 条的基础关系，不区分访问者和请求 page_size。
+// SocialFollowersFirstPageCacheKey 用户粉丝列表固定首页窗口缓存。
+// 数据结构: STRING (JSON)
+// key: fsz:social:user:{userID}:followers:first:{version}  value: 最多 50 条基础关系数组
+// 用途: 同一版本只保存一份基础数据，不区分访问者和请求 page_size；
 // viewer_is_following、响应游标和请求级 has_more 必须在读取后动态计算。
-// 格式: fsz:social:user:{userID}:followers:first:{version}
 func SocialFollowersFirstPageCacheKey(userID uint64, version int64) string {
 	return fmt.Sprintf("%s:social:user:%d:followers:first:%d", prefix, userID, version)
 }
 
-// SocialFollowersFirstPageCacheBuildLockKey 用户粉丝列表固定首页缓存构建锁。
-// 格式: fsz:social:followers:first:lock:{cacheKey}
+// SocialFollowersFirstPageCacheBuildLockKey 用户粉丝列表首页缓存构建锁。
+// 数据结构: STRING
+// key: fsz:social:followers:first:lock:{cacheKey}  value: 持锁实例标识
+// 用途: 缓存 miss 时多副本并发构建的削峰锁，防止缓存击穿。
 func SocialFollowersFirstPageCacheBuildLockKey(cacheKey string) string {
 	return fmt.Sprintf("%s:social:followers:first:lock:%s", prefix, cacheKey)
 }
 
 // SocialFollowingsListVersionKey 用户关注列表版本号。
-// 关注/取关事务提交后，对发起者 followerID 对应的版本执行 INCR。
-// 固定首页缓存 key 带上版本号，旧版本缓存不主动扫描删除，等待 TTL 自动淘汰。
-// 格式: fsz:social:user:{userID}:followings:list:version
+// 数据结构: STRING (int64)
+// key: fsz:social:user:{userID}:followings:list:version  value: 单调递增版本号
+// 用途: 关注/取关事务提交后，对发起者 followerID 对应的版本 INCR；
+// 旧版本的首页缓存 key 无需扫描删除，随 TTL 自动淘汰。
 func SocialFollowingsListVersionKey(userID uint64) string {
 	return fmt.Sprintf("%s:social:user:%d:followings:list:version", prefix, userID)
 }
 
-// SocialFollowingsFirstPageCacheKey 用户关注列表固定首页窗口缓存，value=JSON。
-// 同一版本只保存一份最多 50 条的基础关系，不区分访问者和请求 page_size。
+// SocialFollowingsFirstPageCacheKey 用户关注列表固定首页窗口缓存。
+// 数据结构: STRING (JSON)
+// key: fsz:social:user:{userID}:followings:first:{version}  value: 最多 50 条基础关系数组
+// 用途: 同一版本只保存一份基础数据，不区分访问者和请求 page_size；
 // viewer_is_following、响应游标和请求级 has_more 必须在读取后动态计算。
-// 格式: fsz:social:user:{userID}:followings:first:{version}
 func SocialFollowingsFirstPageCacheKey(userID uint64, version int64) string {
 	return fmt.Sprintf("%s:social:user:%d:followings:first:%d", prefix, userID, version)
 }
 
-// SocialFollowingsFirstPageCacheBuildLockKey 用户关注列表固定首页缓存构建锁。
-// 格式: fsz:social:followings:first:lock:{cacheKey}
+// SocialFollowingsFirstPageCacheBuildLockKey 用户关注列表首页缓存构建锁。
+// 数据结构: STRING
+// key: fsz:social:followings:first:lock:{cacheKey}  value: 持锁实例标识
+// 用途: 缓存 miss 时多副本并发构建的削峰锁，防止缓存击穿。
 func SocialFollowingsFirstPageCacheBuildLockKey(cacheKey string) string {
 	return fmt.Sprintf("%s:social:followings:first:lock:%s", prefix, cacheKey)
 }
