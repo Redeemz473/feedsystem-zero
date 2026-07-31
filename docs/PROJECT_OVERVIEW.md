@@ -576,6 +576,32 @@ stateDiagram-v2
 | `ListComments` | 游标分页（`created_at DESC, id DESC`） |
 | `BatchGetVideoStats` | Feed 卡片拉齐 likes_count / is_liked / comments_count |
 
+**点赞数读侧公式（前端看到的是什么）**：
+
+所有返回给前端的 `likes_count`（点赞、取消点赞、批量查询、详情）都走同一个函数 `realtimeLikesCount`：
+
+```
+likes_count = MySQL videos.likes_count（基准值） + HGET fsz:video:delta:like {video_id}（Redis 未落库增量）
+```
+
+即**基准值 + 全局实时增量**，`pending / acked` 只是"这个 eventID 有没有被算过 delta"的幂等标记，**不参与读侧求和**，作用是让 Redis 里的 `delta:like` 无论乱序 / 重试都恰好等于 "已在 Redis 记账、还没被 MySQL 聚合走" 的净增量。
+
+**⚠️ 前端点完赞返回的是"当前视频总点赞数"，不是"旧值 + 1"**。举例：
+
+| 时刻 | 事件 | DB 基准 | Redis delta | 请求返回 likes_count |
+|---|---|---|---|---|
+| t0 | 初始 | 100 | 0 | — |
+| t1 | 用户 A 点赞（同一秒无其他人操作） | 100 | 1 | **101** |
+| t2 | 同一瞬间 B、C 也点了赞（A 请求还没返回） | 100 | 3 | A 返回 **103** |
+| t3 | A 刷新详情页（BatchGetVideoStats） | 100 | 3 | **103** |
+| t4 | interaction_sync 把这批 event 聚合落库 | 103 | 0 | **103** |
+
+这样做的原因：
+- 如果只做"前端本地 +1"，A 看到 101，下次刷新突然跳到 103，会出现**闪跳/回退**；
+- 直接返回全局实时值，虽然可能一点就跳过 +1（因为并发别人也点了），但**保证单调递增、不闪跳**、且和后续任何一次读接口读到的值一致。
+
+**兜底**：若 MySQL 事务已提交但 Redis 写 delta 失败（Redis 抖动），走 `fallbackLikesCount = 提交前读到的值 + 1`，保证**永远不会返回一个比操作前更小的数字**（见 `LikeVideo` 第 120、244 行）。
+
 **点赞/取消点赞写路径（eventID 驱动的 pending/ack 双标记）**：
 
 1. RPC 事务：INSERT/UPDATE `likes` + INSERT `outbox_events(like.created/deleted)` + 生成 `eventID`。
@@ -675,6 +701,54 @@ sequenceDiagram
     Note over I,IS: 两侧无论谁先执行都不会重复计数：<br/>· 在线请求先：pending 建立 → consumer 抵消<br/>· consumer 先：acked 建立 → 在线请求整段跳过
 ```
 
+#### 8.3.1 点赞抗压分析：为什么单机 MySQL 也能扛住万级 QPS
+
+**问题场景**：热门视频瞬时 1 万人点赞，会不会击穿 MySQL？
+
+**朴素方案的瓶颈**：如果在 RPC 事务里直接 `UPDATE videos SET likes_count += 1 WHERE id = ?`，1 万个事务会**抢同一行的行锁**串行执行，TPS 立刻崩塌到几百。
+
+**当前方案的四层缓冲**：
+
+```mermaid
+flowchart TD
+    A[用户点赞洪流 10000 QPS] --> B{Redis 前置锁<br/>fsz:like:lock:v:u SETNX 3s}
+    B -->|同用户 3s 重放| X1[直接拒绝]
+    B -->|通过| C{Redis 状态预判<br/>loadLikeStateFromRedis}
+    C -->|已经点赞过| X2[幂等返回<br/>不进 MySQL]
+    C -->|未点赞| D[MySQL 事务<br/>4 条 INSERT<br/>无行锁热点]
+    D --> E[applyRedisLikeState<br/>HINCRBY delta:like +1<br/>用户立即看到数字变化]
+    E --> F[返回前端]
+    D -.outbox.-> K[Kafka]
+    K --> J[interaction_sync 单消费者<br/>串行 UPDATE videos<br/>批量消化热点行锁]
+    J -.HINCRBY -1.-> R[Redis delta 抵消]
+```
+
+**为什么能扛住**：
+
+| 缓冲层 | 挡掉什么 | 效果 |
+|---|---|---|
+| **①** `fsz:like:lock:{v}:{u}` SETNX 3s | 同用户 3 秒内的连点、脚本刷 | 脏流量被挡在 MySQL 之前 |
+| **②** `fsz:like:state:{v}:{u}` 状态预判 | 已经点过赞的重复请求 | 直接从 Redis 返回，不进事务 |
+| **③** RPC 事务里**只有 INSERT** | 行锁抢占 | 4 条 INSERT 主键各不相同，天然并发，无热点行 |
+| **④** `UPDATE videos +=1` 推迟到 Kafka 消费者 | 热点行锁 | 从"1 万事务抢同一行"变成"1 个 consumer 顺序 UPDATE"，行锁竞争天然消失 |
+
+**核心巧思：`videos.likes_count` 的 UPDATE 完全不在 RPC 事务里做**
+
+查阅 `LikeVideo` 事务代码可以看到，事务里**只有 4 条 INSERT**（likes / interaction_events / outbox 领域事件 / outbox 通知事件），**没有** `UPDATE videos SET likes_count += 1`。真正的 UPDATE 被推迟到 `interaction_sync` job 里做 —— 而这个 job 是**单消费者按 Kafka partition 顺序处理**，天然把行锁竞争串行化。
+
+**读侧不受写侧堆积影响**：即使 consumer 落库慢了 5 秒，前端读到的点赞数依然是 `MySQL 基准 + Redis delta`，delta 由 Redis HINCRBY 承接（单机 10w+ QPS）、用户完全无感。
+
+**当前架构能扛的量级估算**：
+
+| 环节 | 单机瓶颈 | 备注 |
+|---|---|---|
+| Redis SETNX + HINCRBY | 10w+ QPS | 单 key 不热的话 |
+| MySQL 4 条 INSERT/事务 | 5000~10000 QPS | SSD + binlog fsync 允许 |
+| Kafka Producer | 万级 QPS | 分区并发 |
+| interaction_sync UPDATE videos | 单视频串行 | 若单视频过热需按分区隔离 |
+
+**结论**：**单机 MySQL 也能扛住万级点赞 QPS**，真正的百万级瞬时热点（春晚点赞）需要额外做 likes 分库分表 / Redis delta HASH 分片 / 热点 partition 隔离。
+
 ---
 
 ### 8.4 Social 社交模块
@@ -732,6 +806,55 @@ sequenceDiagram
 ```
 
 **大 V 判定详解**：见 [8.6 Feed 推拉分离](#86-feed-推拉分离模块)。
+
+#### 8.4.1 设计取舍与并发保护
+
+**为什么 accounts 双行 `FOR UPDATE` 要按 ID 升序？**
+
+经典死锁场景：A 关注 B 的同时 B 关注 A：
+- 事务 X（A→B）：先锁 A 行，再锁 B 行
+- 事务 Y（B→A）：先锁 B 行，再锁 A 行
+- 两个事务互等对方持有的锁 → **死锁**
+
+`lockFollowAccounts` 强制按 `MIN(followerID, followingID) → MAX(...)` 顺序上锁，任何两个并发事务的加锁序列都相同，从根本上消除锁序反转。
+
+**为什么 `is_big_v` 是"只升不降"的标志位，而不是按实时 follower_count 判断？**
+
+如果按实时粉丝数判断大 V：
+- 大 V 掉粉一瞬间被判为小 V → feed_timeline 会把他的新视频**写扩散到所有粉丝 inbox**
+- 粉丝一多，一次写扩散几百万条 ZADD → **瞬间打爆 Redis**
+- 而且此时如果他又涨粉回到大 V，历史视频依然留在粉丝 inbox 里，读侧再去 outbox 合并会**重复出现**
+
+采用 `WHERE is_big_v=0 → SET is_big_v=1` 的幂等升级，且**永不回退**，从根源消除"抖动型写扩散"。
+
+**为什么 Follow 事务里同时写"业务 outbox"+"通知 outbox"？**
+
+同一次 Follow 触发的下游包括：
+- 关注关系缓存 `social_sync`
+- 关注流写扩散 `feed_timeline`
+- 关注通知落库 `notification`
+
+如果只发一条通用事件让所有消费者共享，每个消费者都要判断"这条事件跟我有没有关系"，**耦合度高、演进困难**。
+
+拆成两条 outbox 之后：
+- `social.follow.events` → social_sync + feed_timeline 消费（业务事件）
+- `notification.events` → notification-job 消费（通知事件）
+- 两条 outbox 都在**同一个 MySQL 事务里**写入，天然一致
+
+**Follow 抗压分析**：
+
+| 环节 | 是否是瓶颈 | 说明 |
+|---|---|---|
+| accounts 双行 FOR UPDATE | ⚠️ **关注同一大 V 时会抢同一被关注者行** | 头部大 V（千万粉级）新增关注每秒上百可能会有排队，但 MySQL 行锁的等待/唤醒非常快，通常不构成问题 |
+| follows INSERT ON DUPLICATE KEY | 不是 | 唯一键 `(follower, following)` 每对都不同 |
+| outbox_events INSERT × 2 | 不是 | 自增主键 |
+| 双向 profile 版本号 INCR | 不是 | Redis 原子操作 |
+
+**为什么 ListFollowers/ListFollowings 首页缓存需要构建锁？**
+
+粉丝/关注列表首页缓存 miss 时要 `SELECT` 拉一批（几百条）+ 组装 JSON，如果一位大 V 首页缓存刚失效，几百个粉丝同时刷新会**并发触发几百次 MySQL 查询** → 缓存击穿。
+
+`fsz:social:followers:build_lock:{user}` SETNX 5s 保证同一时刻**只有一个请求去回源 MySQL**，其他请求短暂等待并重读缓存。
 
 ---
 
@@ -815,6 +938,40 @@ sequenceDiagram
     J->>R: bumpReceiverID>0 → Lua INCR+DEL 旧 version key
 ```
 
+#### 8.5.1 设计取舍：为什么用"版本号 + 惰性重算"方案 B？
+
+**朴素方案 A**：读一次 → SETEX 缓存，写一次 → DEL 缓存
+
+- 问题 1：**并发写导致缓存穿透** —— 大量写事件同时 DEL 后，读会集中回源到 MySQL COUNT
+- 问题 2：**缓存与 MySQL 之间的不一致窗口** —— DEL 之后、下一次读回填之前，会短暂读到旧值
+- 问题 3：**Redis 宕机重启后所有缓存丢失** —— 大量用户同时 miss → 打爆 MySQL
+
+**方案 B**：版本号 + 惰性重算
+
+- 写路径不 DEL 缓存，只 **INCR version + 一次性 DEL 旧版本 key**（Lua 原子）
+- 读路径 `GET version → GET count:v:{version}` 组合 key，miss 时 SELECT COUNT
+- **Redis 挂了**：`LoadUnreadCount` 直接降级 `SELECT COUNT WHERE status=1`，业务不中断
+- **写扩散**：只写一个 version key，一次 INCR 是原子的，即使 1000 个并发 bump 也只是最后 version 变化，**不会产生缓存击穿**
+
+**核心不变式**：
+- 任一次 `MarkRead` / `INSERT notifications` 之后，version 必然递增
+- 下一次读用最新 version 组合 key，一定是 miss → **强制回源** MySQL，读到最新值
+- 旧 version 的 count key 用 5 分钟 TTL + Lua DEL 兜底，不会长期占内存
+
+**为什么 6 种情况的 bump 判定要精确？**
+
+如果无脑 bump（不管事件是否真影响未读数），会导致：
+- 幂等重放的旧事件 → 缓存 miss → 触发 SELECT COUNT → **性能浪费**
+- "已撤回通知的重复 delete"这种无效事件也 bump → 频繁失效缓存
+
+`applyNotificationEvent` 返回 `bumpReceiverID uint64`（0 表示不 bump），配合 6 种情况精确判定，只在**真的可能影响 status=1 计数**时才 INCR version，最大化缓存命中率。
+
+**为什么 `BumpUnreadVersion` 在事务 COMMIT 后调用而不是事务内？**
+
+- **在事务内调用 Redis 违反了"事务边界内不应有外部副作用"** —— 事务回滚时 Redis 已经改了，回不去
+- **事务 COMMIT 失败** → 事件会重试 → 重试成功时才 bump，Redis 状态和 MySQL 一致
+- **Redis bump 失败** → 只 log 不重试；下一次读会因为**版本号不匹配（读到的还是旧版本 key）** miss 回源，天然自愈
+
 ---
 
 ### 8.6 Feed 推拉分离模块
@@ -878,6 +1035,41 @@ flowchart TD
 - Member 格式：`{publishedAt:19位}:{videoID:20位}`，前 0 补齐，保证 lex 排序等价于数值排序。
 - 使用 `ZREVRANGEBYLEX` 分页，游标格式 `(member` 实现排他上界，无重复无遗漏。
 
+#### 8.6.5 设计取舍与抗压分析
+
+**为什么用推拉分离而不是纯推 / 纯拉？**
+
+| 方案 | 写路径 | 读路径 | 致命缺陷 |
+|---|---|---|---|
+| **纯推（写扩散）** | 发视频 → 写到所有粉丝 inbox | 直接 ZREVRANGE | 大 V 一次写扩散上千万条 ZADD → **打爆 Redis** |
+| **纯拉（读扩散）** | 发视频 → 只写作者 outbox | 拉关注列表 N 个 outbox 归并 | 关注了几千人的用户每次拉 Feed 都要拉几千个 ZSet → **读放大灾难** |
+| **推拉分离**（当前） | 小 V 写扩散 / 大 V 只写自己 outbox | inbox（小 V 已扇入）+ 关注的大 V outbox 合并 | 兼顾读写，大 V 数量有限 → 读侧合并可控 |
+
+**读侧成本估算**：假设用户关注 500 人，其中大 V 20 人（`is_big_v=1`）：
+- 480 个小 V 的最近视频**已经在 inbox**里（feed_timeline 写扩散过） → 1 次 ZREVRANGEBYLEX
+- 20 个大 V 分别拉 outbox → 20 次 ZREVRANGEBYLEX（可以 pipeline 并发）
+- 合并归并 → O(K log K)，K 是 pagesize 200
+
+**写侧成本估算**：
+- 小 V 发视频（假设 1000 粉丝）→ 1000 次 ZADD，几十毫秒，可接受
+- 大 V 发视频（假设 100 万粉丝）→ **1 次 ZADD**（只写自己 outbox） → 常数时间
+
+**Timeline 冷启动的三层保护**：
+
+1. **build_lock 分布式锁**：`fsz:feed:timeline:build_lock:{viewer}` SETNX 10s，同一用户多个并发请求只让**一个**去回源 MySQL
+2. **7 天 TTL**：不活跃用户的 inbox 自动淘汰，避免亿级用户全量常驻 Redis
+3. **懒加载**：冷用户第一次拉 Feed 才触发构建（`SELECT follows` + 拉每个关注对象最近 200 视频）
+
+**Global Timeline ready 自愈**：`fsz:feed:global_timeline` 需要 `ready` 标记才允许写入，防止半初始化状态。旧方案在 `errGlobalTimelineNotReady` 时靠 Kafka 无限重试等人恢复。新方案：consumer 层捕获后调用 `BootstrapGlobalTimeline`（内部分布式锁，避免多实例重复重建）完成一次重建，再重试当前事件，**自愈无人工介入**。
+
+**为什么 feed_timeline job 用回读 MySQL 事实状态而不是靠事件 OccurredAt 排序？**
+
+事件流可能存在：
+- Kafka 重试导致乱序（例如先收到 delete 再收到 create）
+- 消费者宕机重启后重放（重复处理旧事件）
+
+如果单纯靠 `OccurredAt.Before(existing)` 跳过旧事件，任何一次 ZSet 数据丢失都无法通过重放恢复。改成**每次都回读 MySQL 的 status/is_big_v 事实状态**决定 add/remove，**天然幂等**、天然自愈。代价是每个事件多一次 SELECT，但比数据错乱强得多。
+
 ---
 
 ### 8.7 HotRank 热榜模块
@@ -908,6 +1100,54 @@ flowchart LR
 ```
 
 Feed.GetHotFeed 直接 `ZREVRANGE hot:window:{scope}` 获取 top 视频，Gateway 再聚合 video / account 信息。
+
+#### 8.7.1 设计取舍：为什么不实时算 top？
+
+**朴素方案**：`SELECT videos ORDER BY (likes*w1 + comments*w2 + plays*w3) DESC LIMIT 100`
+
+**问题**：
+- 全表排序 → 视频量涨到百万级直接跑不动
+- 权重公式变化要重扫全表
+- 无法做时间衰减 / 滚动窗口
+
+**当前方案**：**基于事件流的增量维护 ZSet**
+
+- 所有点赞/评论/播放事件通过 `video.stat.delta.events` 汇入 hotrank
+- Job 端只做一件事：`ZINCRBY hot:window:60m {videoID} delta_score`
+- 读时 `ZREVRANGE 0 99`，**O(log N + 100)** 就返回 top100
+
+**多窗口的意义**：
+
+| 窗口 | 用途 |
+|---|---|
+| 60min | "实时热榜"，反映当下爆点 |
+| 6h | "半日热榜"，抹平短时刷分 |
+| 24h | "日榜"，稳定长热视频 |
+
+**滚动窗口的实现**：不采用"每次事件都判断视频是否过期"这种昂贵方案，而是：
+
+- 事件到达时 `ZINCRBY` 无脑加分（不检查视频是否在窗口内）
+- Job 定时扫描（例如每分钟一次）删除窗口外的 member：`ZREM hot:window:60m {expired_videoIDs}`
+- 读时 `ZREVRANGE 0 99`，即使窗口外的视频还没被清也没关系，因为**它们分数会随时间衰减到接近 0**
+
+**热度衰减**：`score = w1*likes + w2*comments + w3*plays + time_decay`。`time_decay` 用发布时间到当前的负指数计算，越老的视频权重越低，即使新增互动也很难冲到榜前。
+
+**为什么不把热度算在 videos 表的 `popularity` 列，用 `ORDER BY popularity DESC`？**
+
+- `popularity` 是**累计值**（没有时间衰减），一个几年前的爆款视频会永远霸榜
+- MySQL `ORDER BY popularity DESC LIMIT 100` 在百万级视频量下 sort 成本很高
+- Redis ZSet 的 skiplist 是**天然的有序结构**，`ZREVRANGE 0 99` 就是 O(log N + 100)，比 MySQL 快几个数量级
+
+**HotRank 抗压分析**：
+
+| 环节 | QPS 能力 | 说明 |
+|---|---|---|
+| Kafka `video.stat.delta.events` 消费 | 万级 | 事件量 ≈ 点赞+评论+播放事件之和 |
+| Redis ZINCRBY × 3 窗口 | 10w+ QPS | 单 key 热点问题存在但 60min/6h/24h 是 3 个 key，压力有分摊 |
+| Feed.GetHotFeed 读取 | 10w+ QPS | ZREVRANGE 是纯读，可以多副本水平扩展 |
+| Job 定时扫窗口外元素 | 无压力 | 每分钟一次 ZREM 少量元素 |
+
+**极端热点情况**：如果单个视频每秒被点赞几万次，`ZINCRBY hot:window:60m` 单 key 会成为热点，可以按 `hash(videoID) % N` 分片成多个 ZSet，读时 `ZUNIONSTORE` 合并（当前项目未实现该分片，属于千万级 DAU 才需要的优化）。
 
 ---
 
