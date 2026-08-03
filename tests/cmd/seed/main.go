@@ -5,7 +5,7 @@
 //
 //	go run ./tests/cmd/seed              # 10000 users + 5000 videos (default)
 //	go run ./tests/cmd/seed -users 20000 -videos 8000
-//	go run ./tests/cmd/seed -reset       # drop previous seed data first
+//	go run ./tests/cmd/seed -reset -reset-redis # drop previous test data and derived Redis state first
 //
 // Seeded data is namespaced (seed_user_*, seed-video-*, /seed/*) so it never
 // touches real accounts or uploads.
@@ -30,6 +30,9 @@ func main() {
 	}
 	if flags.Users <= 0 || flags.Videos <= 0 {
 		log.Fatalf("-users and -videos must be positive; got users=%d videos=%d", flags.Users, flags.Videos)
+	}
+	if flags.ResetRedis && !flags.Reset {
+		log.Fatal("-reset-redis must be used together with -reset")
 	}
 
 	log.Printf("[seed] target: %d users, %d videos, span=%d days, buckets=%d",

@@ -2,8 +2,6 @@ package logic
 
 import (
 	"context"
-	"errors"
-	"time"
 
 	"feedsystem-zero/apps/interaction/interaction"
 	"feedsystem-zero/apps/interaction/internal/svc"
@@ -13,7 +11,6 @@ import (
 	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"gorm.io/gorm"
 )
 
 type FlushCommentEventsLogic struct {
@@ -41,27 +38,20 @@ func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommen
 		return &interaction.FlushCommentEventsResp{}, nil
 	}
 
-	if running, err := l.statsRebuildRunning(); err != nil {
-		l.Errorf("check rebuild stats lock failed before flushing comment events, error:%v", err)
-	} else if running {
+	if leaseKey, leaseToken, acquired, err := l.acquireFlushCommentEventsLease(); err != nil {
+		// Redis 不可用时仍可依赖 processed_events 唯一键和 MySQL 原子增量继续收敛。
+		l.Errorf("acquire flush comment events lease failed, fallback to db idempotency, error:%v", err)
+	} else if !acquired {
 		return nil, status.Error(codes.Aborted, "互动统计重建中，请稍后重试")
-	}
-
-	//拿锁
-	//Redis 分布式锁限制同一时间仅一个实例执行 DB 更新
-	if lockKey, lockToken, locked, err := l.acquireFlushCommentEventsLock(); err != nil {
-		// Redis 锁只是削峰保护；真正的跨实例幂等由 processed_events 唯一键保证。所以redis挂了可以继续跑
-		l.Errorf("acquire flush comment events lock failed, fallback to db idempotency, error:%v", err)
-	} else if !locked {
-		return nil, status.Error(codes.Aborted, "评论事件任务正在处理中")
 	} else {
-		defer l.releaseFlushCommentEventsLock(lockKey, lockToken)
+		defer l.releaseFlushCommentEventsLease(leaseKey, leaseToken)
 	}
 
 	resp := &interaction.FlushCommentEventsResp{
 		FailedEventIds: make([]string, 0),
 	}
 	acks := make([]interactionDeltaAck, 0, len(events))
+	dbEvents := make([]interactionFlushDBEvent, 0, len(events))
 
 	for index, event := range events {
 		eventID, delta, err := validateCommentFlushEvent(event, index)
@@ -71,12 +61,7 @@ func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommen
 			continue
 		}
 
-		_, err = l.applyCommentFlushEvent(event, delta)
-		if err != nil {
-			resp.FailedEventIds = append(resp.FailedEventIds, eventID)
-			l.Errorf("flush comment event failed, event_id:%s video_id:%d comment_id:%d error:%v", eventID, event.GetVideoId(), event.GetCommentId(), err)
-			continue
-		}
+		dbEvents = append(dbEvents, interactionFlushDBEvent{EventID: eventID, VideoID: event.GetVideoId(), Delta: delta})
 		// 重复事件仍要执行 Redis ack，修复“DB 已提交但 Redis 扣减失败”的中断窗口。
 		acks = append(acks, interactionDeltaAck{
 			EventID:         eventID,
@@ -84,6 +69,17 @@ func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommen
 			Delta:           delta,
 			InvalidationKey: rediskey.CommentListVersionKey(event.GetVideoId()),
 		})
+	}
+
+	if err := applyInteractionFlushBatch(
+		l.ctx,
+		l.svcCtx.GormDB,
+		dbEvents,
+		eventx.ConsumerCommentSync,
+		eventx.TopicInteractionCommentEvents,
+	); err != nil {
+		l.Errorf("flush comment event batch failed, size:%d error:%v", len(dbEvents), err)
+		return nil, status.Error(codes.Internal, "批量刷新评论统计失败")
 	}
 
 	l.ackCommentEventDeltas(resp, acks)
@@ -117,42 +113,6 @@ func validateCommentFlushEvent(event *interaction.CommentEvent, index int) (stri
 	}
 }
 
-// DB 事务执行幂等写入 + 视频统计更新
-func (l *FlushCommentEventsLogic) applyCommentFlushEvent(event *interaction.CommentEvent, delta videoStatDelta) (bool, error) {
-	now := time.Now()
-	applied := false
-
-	err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
-		inserted, err := insertProcessedEvent(
-			l.ctx,
-			tx,
-			event.GetEventId(),
-			eventx.ConsumerCommentSync,
-			eventx.TopicInteractionCommentEvents,
-			now,
-		)
-		if err != nil {
-			return err
-		}
-		if !inserted {
-			// 重复消费时直接跳过，不再更新聚合计数。
-			return nil
-		}
-
-		if err := applyVideoStatDelta(l.ctx, tx, event.GetVideoId(), delta); err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				// 视频已被删除时，这条历史评论统计已经没有用户可见价值。
-				// processed_events 仍然提交，避免 Kafka 对同一条无意义事件无限重试。
-				return nil
-			}
-			return err
-		}
-		applied = true
-		return nil
-	})
-	return applied, err
-}
-
 func (l *FlushCommentEventsLogic) ackCommentEventDeltas(resp *interaction.FlushCommentEventsResp, acks []interactionDeltaAck) {
 	if len(acks) == 0 {
 		return
@@ -172,23 +132,16 @@ func (l *FlushCommentEventsLogic) ackCommentEventDeltas(resp *interaction.FlushC
 	}
 }
 
-func (l *FlushCommentEventsLogic) acquireFlushCommentEventsLock() (string, string, bool, error) {
+func (l *FlushCommentEventsLogic) acquireFlushCommentEventsLease() (string, string, bool, error) {
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
 	defer cancel()
-	return tryAcquireInteractionJobLock(redisCtx, l.svcCtx.RedisCli, interactionFlushCommentEventsJob)
+	return acquireInteractionStatsMutationLease(redisCtx, l.svcCtx.RedisCli)
 }
 
-func (l *FlushCommentEventsLogic) releaseFlushCommentEventsLock(lockKey string, lockToken string) {
+func (l *FlushCommentEventsLogic) releaseFlushCommentEventsLease(leaseKey string, leaseToken string) {
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
 	defer cancel()
-	if err := releaseRedisLock(redisCtx, l.svcCtx.RedisCli, lockKey, lockToken); err != nil {
-		l.Errorf("release flush comment events lock failed, key:%s error:%v", lockKey, err)
+	if err := releaseInteractionStatsMutationLease(redisCtx, l.svcCtx.RedisCli, leaseKey, leaseToken); err != nil {
+		l.Errorf("release flush comment events lease failed, key:%s error:%v", leaseKey, err)
 	}
-}
-
-// 检查rebuild重建是否在运行，redis 存在重建标记 Key 时，直接终止本次同步，等待重建完成再执行
-func (l *FlushCommentEventsLogic) statsRebuildRunning() (bool, error) {
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	defer cancel()
-	return isStatsRebuildRunning(redisCtx, l.svcCtx.RedisCli)
 }

@@ -96,6 +96,15 @@ func InteractionDeltaAckKey(eventID string) string {
 	return fmt.Sprintf("%s:interaction:delta:acked:%s", prefix, eventID)
 }
 
+// InteractionDeltaPendingCountKey 记录某个视频尚未被 consumer 确认的实时增量事件数。
+// 数据结构: STRING (int64)
+// key: fsz:interaction:delta:pending_count:{videoID}
+// 用途: 最后一个 pending 事件完成时强制删除该视频的三类增量字段，作为逐事件
+// 加减之外的收敛不变量，避免高并发交错后留下没有 pending 所属关系的孤立增量。
+func InteractionDeltaPendingCountKey(videoID uint64) string {
+	return fmt.Sprintf("%s:interaction:delta:pending_count:%d", prefix, videoID)
+}
+
 // HotVideoRealtimeKey 实时热榜。
 // 数据结构: ZSET
 // key: fsz:hot:video:realtime  score=实时热度, member=videoID

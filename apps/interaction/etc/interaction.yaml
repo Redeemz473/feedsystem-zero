@@ -6,6 +6,12 @@ Etcd:
     - 127.0.0.1:23790
   Key: interaction.rpc
 
+Middlewares:
+  StatConf:
+    IgnoreContentMethods:
+      - /interaction.Interaction/FlushLikeEvents
+      - /interaction.Interaction/FlushCommentEvents
+
 Mysql:
   DataSource: root:123456@tcp(127.0.0.1:3308)/feedsystem_zero?charset=utf8mb4&parseTime=true&loc=Local
 

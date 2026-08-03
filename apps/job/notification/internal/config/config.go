@@ -33,6 +33,9 @@ type NotificationConf struct {
 	FlushMs                int   `json:",default=1000"`
 	WorkerCount            int   `json:",default=4"`
 	DBWriteTimeoutMs       int   `json:",default=5000"`
+	DBMaxRetries           int   `json:",default=3"`
+	DBRetryBaseMs          int   `json:",default=20"`
+	DBRetryMaxMs           int   `json:",default=200"`
 	ProcessedEventTTLDays  int   `json:",default=14"`
 	FutureToleranceSeconds int64 `json:",default=300"`
 }

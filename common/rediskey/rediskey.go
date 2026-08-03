@@ -63,3 +63,11 @@ func JobLockKey(name string) string {
 	name = strings.TrimSpace(name)
 	return fmt.Sprintf("%s:job:lock:%s", prefix, name)
 }
+
+// JobLeaseSetKey 后台任务的并发租约集合。
+// 数据结构: ZSET，member=租约 token，score=Redis 时间戳（毫秒）。
+// 用途: 允许多个普通任务并发执行，同时让维护任务以互斥方式等待所有普通任务结束。
+func JobLeaseSetKey(name string) string {
+	name = strings.TrimSpace(name)
+	return fmt.Sprintf("%s:job:leases:%s", prefix, name)
+}

@@ -4,18 +4,17 @@
 // hotspots rather than the upload pipeline.
 //
 // Behaviour:
-//   - Every row it produces is namespaced so `-reset` can wipe them cleanly:
-//     accounts.username LIKE 'seed_user_%', videos.request_id LIKE 'seed-video-%',
-//     file_assets.storage_path LIKE '/seed/%'.
+//   - Every row it produces is namespaced so `-reset` can wipe it and related
+//     load-test business rows cleanly without touching real accounts/uploads.
 //   - All users share one bcrypt hash of testconfig.SeedPassword.
 //   - Videos reference a small pool of placeholder file_assets rows (with
 //     realistic ref_count >= 1) to exercise the "instant-upload" dedup path.
 //   - created_at is spread over the past N days so cursor pagination and
 //     hot-rank recency scoring see real distribution.
 //
-// The seed tool intentionally does NOT touch Redis or Kafka: derived caches
-// and Feed timelines should be rebuilt by the job consumers, which is the
-// most realistic starting point for load tests.
+// Redis cleanup is opt-in through `-reset-redis`; Kafka offsets/topics are not
+// reset because existing consumer groups can safely continue from their
+// committed offsets when new test events are appended.
 package seed
 
 import (
@@ -27,6 +26,7 @@ import (
 
 	"feedsystem-zero/tests/internal/testconfig"
 
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -64,6 +64,11 @@ type FileAsset struct {
 }
 
 func (FileAsset) TableName() string { return "file_assets" }
+
+type seedAssetPair struct {
+	video FileAsset
+	cover FileAsset
+}
 
 // Video matches deploy/sql/001_schema.sql `videos` table.
 type Video struct {
@@ -112,6 +117,11 @@ func Open(f testconfig.SeedFlags) (*Runner, error) {
 // Run executes the full seed pipeline: reset (optional), users, file_assets, videos.
 func (r *Runner) Run(ctx context.Context) error {
 	if r.Flags.Reset {
+		if r.Flags.ResetRedis {
+			if err := r.resetRedis(ctx); err != nil {
+				return fmt.Errorf("reset redis: %w", err)
+			}
+		}
 		if err := r.reset(ctx); err != nil {
 			return fmt.Errorf("reset: %w", err)
 		}
@@ -119,39 +129,177 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.seedUsers(ctx); err != nil {
 		return fmt.Errorf("seed users: %w", err)
 	}
-	assetIDs, err := r.seedFileAssets(ctx)
+	assets, err := r.seedFileAssets(ctx)
 	if err != nil {
 		return fmt.Errorf("seed file_assets: %w", err)
 	}
-	if err := r.seedVideos(ctx, assetIDs); err != nil {
+	if err := r.seedVideos(ctx, assets); err != nil {
 		return fmt.Errorf("seed videos: %w", err)
+	}
+	if err := r.verifySeedData(ctx); err != nil {
+		return fmt.Errorf("verify seed data: %w", err)
 	}
 	return nil
 }
 
-// reset removes only rows that were produced by previous seed runs; real
-// accounts, videos or file uploads are untouched.
+// reset removes seed users and all business rows created by/for those users.
+// It also removes publish-loadtest videos because they reuse seed users and
+// seed file assets. Real accounts, videos and uploaded files are preserved.
 func (r *Runner) reset(ctx context.Context) error {
-	log.Println("[seed] reset: deleting previous seed_* rows...")
-	// Order matters: videos reference file_assets by URL uniqueness, but
-	// there is no FK, so we can just delete top-down.
-	tx := r.DB.WithContext(ctx).Exec("DELETE FROM videos WHERE request_id LIKE ?", testconfig.SeedRequestIDPrefix+"%")
-	if tx.Error != nil {
-		return tx.Error
-	}
-	log.Printf("[seed]   videos deleted: %d", tx.RowsAffected)
+	log.Println("[seed] reset: deleting previous seed/loadtest business data...")
+	seedUser := testconfig.SeedUserPrefix + "%"
+	seedVideo := testconfig.SeedRequestIDPrefix + "%"
+	loadVideo := "loadtest-%"
 
-	tx = r.DB.WithContext(ctx).Exec("DELETE FROM file_assets WHERE storage_path LIKE '/seed/%'")
-	if tx.Error != nil {
-		return tx.Error
-	}
-	log.Printf("[seed]   file_assets deleted: %d", tx.RowsAffected)
+	return r.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		steps := []struct {
+			name  string
+			query string
+			args  []any
+		}{
+			{
+				name: "notifications",
+				query: `DELETE n FROM notifications n
+					LEFT JOIN accounts receiver ON receiver.id = n.receiver_id
+					LEFT JOIN accounts actor ON actor.id = n.actor_id
+					LEFT JOIN videos v ON v.id = n.video_id
+					LEFT JOIN accounts author ON author.id = v.author_id
+					WHERE receiver.username LIKE ? OR actor.username LIKE ?
+					   OR v.request_id LIKE ? OR v.request_id LIKE ? OR author.username LIKE ?`,
+				args: []any{seedUser, seedUser, seedVideo, loadVideo, seedUser},
+			},
+			{
+				name: "interaction_events",
+				query: `DELETE ie FROM interaction_events ie
+					LEFT JOIN accounts actor ON actor.id = ie.user_id
+					LEFT JOIN videos v ON v.id = ie.video_id
+					LEFT JOIN accounts author ON author.id = v.author_id
+					WHERE actor.username LIKE ? OR v.request_id LIKE ?
+					   OR v.request_id LIKE ? OR author.username LIKE ?`,
+				args: []any{seedUser, seedVideo, loadVideo, seedUser},
+			},
+			{
+				name: "video_tags",
+				query: `DELETE vt FROM video_tags vt
+					JOIN videos v ON v.id = vt.video_id
+					LEFT JOIN accounts author ON author.id = v.author_id
+					WHERE v.request_id LIKE ? OR v.request_id LIKE ? OR author.username LIKE ?`,
+				args: []any{seedVideo, loadVideo, seedUser},
+			},
+			{
+				name: "likes",
+				query: `DELETE l FROM likes l
+					LEFT JOIN accounts actor ON actor.id = l.user_id
+					LEFT JOIN videos v ON v.id = l.video_id
+					LEFT JOIN accounts author ON author.id = v.author_id
+					WHERE actor.username LIKE ? OR v.request_id LIKE ?
+					   OR v.request_id LIKE ? OR author.username LIKE ?`,
+				args: []any{seedUser, seedVideo, loadVideo, seedUser},
+			},
+			{
+				name: "comments",
+				query: `DELETE c FROM comments c
+					LEFT JOIN accounts actor ON actor.id = c.user_id
+					LEFT JOIN videos v ON v.id = c.video_id
+					LEFT JOIN accounts author ON author.id = v.author_id
+					WHERE actor.username LIKE ? OR v.request_id LIKE ?
+					   OR v.request_id LIKE ? OR author.username LIKE ?`,
+				args: []any{seedUser, seedVideo, loadVideo, seedUser},
+			},
+			{
+				name: "follows",
+				query: `DELETE f FROM follows f
+					LEFT JOIN accounts follower ON follower.id = f.follower_id
+					LEFT JOIN accounts following ON following.id = f.following_id
+					WHERE follower.username LIKE ? OR following.username LIKE ?`,
+				args: []any{seedUser, seedUser},
+			},
+			{
+				name: "videos",
+				query: `DELETE v FROM videos v
+					LEFT JOIN accounts author ON author.id = v.author_id
+					WHERE v.request_id LIKE ? OR v.request_id LIKE ? OR author.username LIKE ?`,
+				args: []any{seedVideo, loadVideo, seedUser},
+			},
+			{
+				name:  "file_assets",
+				query: "DELETE FROM file_assets WHERE storage_path LIKE '/seed/%'",
+			},
+			{
+				name:  "accounts",
+				query: "DELETE FROM accounts WHERE username LIKE ?",
+				args:  []any{seedUser},
+			},
+			{
+				name:  "orphan_tags",
+				query: "DELETE t FROM tags t LEFT JOIN video_tags vt ON vt.tag_id = t.id WHERE vt.id IS NULL",
+			},
+		}
 
-	tx = r.DB.WithContext(ctx).Exec("DELETE FROM accounts WHERE username LIKE ?", testconfig.SeedUserPrefix+"%")
-	if tx.Error != nil {
-		return tx.Error
+		for _, step := range steps {
+			result := tx.Exec(step.query, step.args...)
+			if result.Error != nil {
+				return fmt.Errorf("delete %s: %w", step.name, result.Error)
+			}
+			log.Printf("[seed]   %s deleted: %d", step.name, result.RowsAffected)
+		}
+
+		// Test users may have followed real users (or vice versa). Rebuild the
+		// surviving accounts' counters after those relationships are removed.
+		if err := tx.Exec(`UPDATE accounts a
+			LEFT JOIN (
+				SELECT following_id AS user_id, COUNT(*) AS cnt
+				FROM follows WHERE status = 1 AND deleted_at IS NULL
+				GROUP BY following_id
+			) followers ON followers.user_id = a.id
+			LEFT JOIN (
+				SELECT follower_id AS user_id, COUNT(*) AS cnt
+				FROM follows WHERE status = 1 AND deleted_at IS NULL
+				GROUP BY follower_id
+			) followings ON followings.user_id = a.id
+			SET a.follower_count = COALESCE(followers.cnt, 0),
+				a.following_count = COALESCE(followings.cnt, 0),
+				a.is_big_v = CASE WHEN COALESCE(followers.cnt, 0) >= 5000 THEN 1 ELSE 0 END`).Error; err != nil {
+			return fmt.Errorf("rebuild surviving account counters: %w", err)
+		}
+		return nil
+	})
+}
+
+func (r *Runner) resetRedis(ctx context.Context) error {
+	client := redis.NewClient(&redis.Options{
+		Addr:     r.Flags.RedisAddr,
+		Password: r.Flags.RedisPass,
+		DB:       r.Flags.RedisDB,
+	})
+	defer client.Close()
+
+	redisCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := client.Ping(redisCtx).Err(); err != nil {
+		return err
 	}
-	log.Printf("[seed]   accounts deleted: %d", tx.RowsAffected)
+
+	var cursor uint64
+	var deleted int64
+	for {
+		keys, next, err := client.Scan(redisCtx, cursor, "fsz:*", 1000).Result()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			count, err := client.Unlink(redisCtx, keys...).Result()
+			if err != nil {
+				return err
+			}
+			deleted += count
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	log.Printf("[seed] reset redis: fsz:* keys deleted: %d", deleted)
 	return nil
 }
 
@@ -193,24 +341,15 @@ func (r *Runner) seedUsers(ctx context.Context) error {
 	return nil
 }
 
-// seedFileAssets creates a small pool of placeholder assets that many videos
-// will share (ref_count > 1) to mimic instant-upload behaviour.
-func (r *Runner) seedFileAssets(ctx context.Context) ([]uint64, error) {
+// seedFileAssets creates video/cover pairs shared by many videos. Both URLs
+// exist in file_assets, so seeded rows obey the same publish invariant as
+// videos created through video-rpc.
+func (r *Runner) seedFileAssets(ctx context.Context) ([]seedAssetPair, error) {
 	start := time.Now()
 	now := time.Now()
-	assets := make([]FileAsset, 0, r.Flags.FileAssetBuckets)
-	for i := 1; i <= r.Flags.FileAssetBuckets; i++ {
-		assets = append(assets, FileAsset{
-			FileHash:    fmt.Sprintf("seedhash-%08d", i),
-			FileType:    "video",
-			URL:         fmt.Sprintf(testconfig.SeedPlayURLTemplate, i),
-			StoragePath: fmt.Sprintf("/seed/video_%d.mp4", i),
-			Size:        1024 * 1024,
-			RefCount:    0, // updated after videos are inserted
-			Status:      1,
-			CreatedAt:   now,
-			UpdatedAt:   now,
-		})
+	assets := buildSeedAssets(r.Flags.FileAssetBuckets, now)
+	if len(assets) == 0 {
+		return nil, fmt.Errorf("file asset buckets must be positive")
 	}
 	if err := r.DB.WithContext(ctx).
 		Clauses(onConflictDoNothing("file_hash")).
@@ -218,7 +357,6 @@ func (r *Runner) seedFileAssets(ctx context.Context) ([]uint64, error) {
 		return nil, err
 	}
 
-	// Read back their IDs (rows we just inserted OR pre-existing rows with the same hash).
 	var reread []FileAsset
 	if err := r.DB.WithContext(ctx).
 		Where("storage_path LIKE '/seed/%'").
@@ -226,32 +364,71 @@ func (r *Runner) seedFileAssets(ctx context.Context) ([]uint64, error) {
 		Find(&reread).Error; err != nil {
 		return nil, err
 	}
-	ids := make([]uint64, 0, len(reread))
-	for _, a := range reread {
-		ids = append(ids, a.ID)
+	byURL := make(map[string]FileAsset, len(reread))
+	for _, asset := range reread {
+		byURL[asset.URL] = asset
 	}
-	log.Printf("[seed] file_assets done: %d rows in %s", len(ids), time.Since(start).Round(time.Millisecond))
-	return ids, nil
+	pairs := make([]seedAssetPair, 0, r.Flags.FileAssetBuckets)
+	for i := 1; i <= r.Flags.FileAssetBuckets; i++ {
+		videoURL := fmt.Sprintf(testconfig.SeedPlayURLTemplate, i)
+		coverURL := fmt.Sprintf(testconfig.SeedCoverURLTemplate, i)
+		videoAsset, videoOK := byURL[videoURL]
+		coverAsset, coverOK := byURL[coverURL]
+		if !videoOK || !coverOK {
+			return nil, fmt.Errorf("seed asset pair %d incomplete: video=%t cover=%t", i, videoOK, coverOK)
+		}
+		pairs = append(pairs, seedAssetPair{video: videoAsset, cover: coverAsset})
+	}
+	log.Printf("[seed] file_assets done: %d rows (%d pairs) in %s", len(reread), len(pairs), time.Since(start).Round(time.Millisecond))
+	return pairs, nil
+}
+
+func buildSeedAssets(bucketCount int, now time.Time) []FileAsset {
+	assets := make([]FileAsset, 0, bucketCount*2)
+	for i := 1; i <= bucketCount; i++ {
+		assets = append(assets,
+			FileAsset{
+				FileHash:    fmt.Sprintf("seed-video-hash-%08d", i),
+				FileType:    "video",
+				URL:         fmt.Sprintf(testconfig.SeedPlayURLTemplate, i),
+				StoragePath: fmt.Sprintf("/seed/video_%d.mp4", i),
+				Size:        1024 * 1024,
+				Status:      1,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			},
+			FileAsset{
+				FileHash:    fmt.Sprintf("seed-cover-hash-%08d", i),
+				FileType:    "cover",
+				URL:         fmt.Sprintf(testconfig.SeedCoverURLTemplate, i),
+				StoragePath: fmt.Sprintf("/seed/cover_%d.jpg", i),
+				Size:        256 * 1024,
+				Status:      1,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			},
+		)
+	}
+	return assets
 }
 
 // seedVideos inserts N videos with random authors and staggered created_at.
-// ref_count on the underlying file_assets is bumped afterwards to reflect
-// the number of videos pointing at each bucket.
-func (r *Runner) seedVideos(ctx context.Context, assetIDs []uint64) error {
-	if len(assetIDs) == 0 {
+// ref_count is recalculated from active videos afterwards, making reruns
+// idempotent even when some video inserts hit an existing request_id.
+func (r *Runner) seedVideos(ctx context.Context, assets []seedAssetPair) error {
+	if len(assets) == 0 {
 		return fmt.Errorf("no file_assets available")
 	}
 
-	// Grab the seed user id range so we can pick random authors.
-	var minID, maxID uint64
-	row := r.DB.WithContext(ctx).Raw(
-		"SELECT COALESCE(MIN(id),0), COALESCE(MAX(id),0) FROM accounts WHERE username LIKE ?",
-		testconfig.SeedUserPrefix+"%",
-	).Row()
-	if err := row.Scan(&minID, &maxID); err != nil {
-		return fmt.Errorf("scan seed user id range: %w", err)
+	var authors []Account
+	if err := r.DB.WithContext(ctx).
+		Select("id", "username").
+		Where("username LIKE ?", testconfig.SeedUserPrefix+"%").
+		Order("id ASC").
+		Find(&authors).Error; err != nil {
+		return fmt.Errorf("load seed users: %w", err)
 	}
-	if minID == 0 || maxID == 0 {
+	if len(authors) == 0 {
 		return fmt.Errorf("no seed users found; did you skip seedUsers?")
 	}
 
@@ -260,33 +437,21 @@ func (r *Runner) seedVideos(ctx context.Context, assetIDs []uint64) error {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	spanSeconds := int64(r.Flags.VideoTimeSpanDays) * 24 * 3600
 	rows := make([]Video, 0, batch)
-	usedURLs := make(map[string]struct{}, r.Flags.Videos)
-	assetRefs := make(map[uint64]int64, len(assetIDs))
 
 	for i := 1; i <= r.Flags.Videos; i++ {
-		// Author uniform in [minID, maxID]; note maxID-minID+1 may exceed r.Flags.Users if
-		// a partial rerun happened, but rand handles that fine.
-		author := minID + uint64(rng.Int63n(int64(maxID-minID+1)))
-		bucket := assetIDs[rng.Intn(len(assetIDs))]
-		assetRefs[bucket]++
-
-		// Video play_url must be unique per uk_url on file_assets, but the videos
-		// table has no such uniqueness — however we still want distinct URLs so
-		// that "GET /video/:id" pages don't accidentally collapse.
-		playURL := fmt.Sprintf("%s#v=%d", fmt.Sprintf(testconfig.SeedPlayURLTemplate, bucket), i)
-		coverURL := fmt.Sprintf(testconfig.SeedCoverURLTemplate, bucket)
-		usedURLs[playURL] = struct{}{}
+		author := authors[(i-1)%len(authors)]
+		asset := assets[(i-1)%len(assets)]
 
 		offset := time.Duration(rng.Int63n(spanSeconds)) * time.Second
 		createdAt := time.Now().Add(-offset)
 
 		rows = append(rows, Video{
-			AuthorID:       author,
-			AuthorUsername: fmt.Sprintf("%s%d", testconfig.SeedUserPrefix, author-minID+1),
+			AuthorID:       author.ID,
+			AuthorUsername: author.Username,
 			Title:          fmt.Sprintf("seed video %d", i),
 			Description:    "auto-generated by tests/seed",
-			PlayURL:        playURL,
-			CoverURL:       coverURL,
+			PlayURL:        asset.video.URL,
+			CoverURL:       asset.cover.URL,
 			RequestID:      fmt.Sprintf("%s%d", testconfig.SeedRequestIDPrefix, i),
 			Status:         1,
 			CreatedAt:      createdAt,
@@ -302,15 +467,101 @@ func (r *Runner) seedVideos(ctx context.Context, assetIDs []uint64) error {
 		}
 	}
 
-	// Bump ref_count on each bucket to match how many seed videos reference it.
-	for bucket, delta := range assetRefs {
-		if err := r.DB.WithContext(ctx).Exec(
-			"UPDATE file_assets SET ref_count = ref_count + ? WHERE id = ?",
-			delta, bucket,
-		).Error; err != nil {
-			return err
-		}
+	if err := r.rebuildSeedAssetRefs(ctx); err != nil {
+		return err
 	}
 	log.Printf("[seed] videos done: %d rows in %s", r.Flags.Videos, time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
+func (r *Runner) rebuildSeedAssetRefs(ctx context.Context) error {
+	return r.DB.WithContext(ctx).Exec(`UPDATE file_assets fa
+		LEFT JOIN (
+			SELECT url, COUNT(*) AS refs
+			FROM (
+				SELECT play_url AS url FROM videos WHERE status = 1 AND deleted_at IS NULL
+				UNION ALL
+				SELECT cover_url AS url FROM videos WHERE status = 1 AND deleted_at IS NULL
+			) active_refs
+			GROUP BY url
+		) actual ON actual.url = fa.url
+		SET fa.ref_count = COALESCE(actual.refs, 0),
+			fa.status = 1,
+			fa.deleted_at = NULL
+		WHERE fa.storage_path LIKE '/seed/%'`).Error
+}
+
+func (r *Runner) verifySeedData(ctx context.Context) error {
+	type verificationResult struct {
+		SeedUsers         int64 `gorm:"column:seed_users"`
+		SeedVideos        int64 `gorm:"column:seed_videos"`
+		SeedAssets        int64 `gorm:"column:seed_assets"`
+		AssetRefMismatch  int64 `gorm:"column:asset_ref_mismatch"`
+		OrphanAuthors     int64 `gorm:"column:orphan_authors"`
+		MissingAssetLinks int64 `gorm:"column:missing_asset_links"`
+	}
+
+	var result verificationResult
+	if err := r.DB.WithContext(ctx).Raw(`SELECT
+		(SELECT COUNT(*) FROM accounts WHERE username LIKE ?) AS seed_users,
+		(SELECT COUNT(*) FROM videos WHERE request_id LIKE ?) AS seed_videos,
+		(SELECT COUNT(*) FROM file_assets WHERE storage_path LIKE '/seed/%') AS seed_assets,
+		(SELECT COUNT(*)
+		 FROM file_assets fa
+		 LEFT JOIN (
+			 SELECT url, COUNT(*) AS refs
+			 FROM (
+				 SELECT play_url AS url FROM videos WHERE status = 1 AND deleted_at IS NULL
+				 UNION ALL
+				 SELECT cover_url AS url FROM videos WHERE status = 1 AND deleted_at IS NULL
+			 ) active_refs
+			 GROUP BY url
+		 ) actual ON actual.url = fa.url
+		 WHERE fa.storage_path LIKE '/seed/%'
+		   AND fa.ref_count <> COALESCE(actual.refs, 0)) AS asset_ref_mismatch,
+		(SELECT COUNT(*)
+		 FROM videos v
+		 LEFT JOIN accounts a ON a.id = v.author_id
+		 WHERE v.request_id LIKE ? AND a.id IS NULL) AS orphan_authors,
+		(SELECT COUNT(*)
+		 FROM videos v
+		 LEFT JOIN file_assets play_asset ON play_asset.url = v.play_url
+		 LEFT JOIN file_assets cover_asset ON cover_asset.url = v.cover_url
+		 WHERE v.request_id LIKE ?
+		   AND (play_asset.id IS NULL OR cover_asset.id IS NULL)) AS missing_asset_links`,
+		testconfig.SeedUserPrefix+"%",
+		testconfig.SeedRequestIDPrefix+"%",
+		testconfig.SeedRequestIDPrefix+"%",
+		testconfig.SeedRequestIDPrefix+"%",
+	).Scan(&result).Error; err != nil {
+		return err
+	}
+
+	expectedAssets := int64(r.Flags.FileAssetBuckets * 2)
+	if result.SeedUsers != int64(r.Flags.Users) ||
+		result.SeedVideos != int64(r.Flags.Videos) ||
+		result.SeedAssets != expectedAssets ||
+		result.AssetRefMismatch != 0 ||
+		result.OrphanAuthors != 0 ||
+		result.MissingAssetLinks != 0 {
+		return fmt.Errorf(
+			"unexpected counts: users=%d/%d videos=%d/%d assets=%d/%d ref_mismatch=%d orphan_authors=%d missing_assets=%d",
+			result.SeedUsers,
+			r.Flags.Users,
+			result.SeedVideos,
+			r.Flags.Videos,
+			result.SeedAssets,
+			expectedAssets,
+			result.AssetRefMismatch,
+			result.OrphanAuthors,
+			result.MissingAssetLinks,
+		)
+	}
+	log.Printf(
+		"[seed] verify: users=%d videos=%d assets=%d ref_mismatch=0 orphan_authors=0 missing_assets=0",
+		result.SeedUsers,
+		result.SeedVideos,
+		result.SeedAssets,
+	)
 	return nil
 }

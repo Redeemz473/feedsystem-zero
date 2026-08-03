@@ -4,7 +4,7 @@
 
 <p align="left">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.25-00ADD8?logo=go">
-  <img alt="go-zero" src="https://img.shields.io/badge/go--zero-api%20%2B%20rpc-3178c6">
+  <img alt="go-zero" src="https://img.shields.io/badge/go--zero-1.10.2-3178c6">
   <img alt="MySQL" src="https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql&logoColor=white">
   <img alt="Redis" src="https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white">
   <img alt="Kafka" src="https://img.shields.io/badge/Kafka-topics%3A6-231F20?logo=apachekafka">
@@ -18,9 +18,11 @@
 - 🧱 **单仓多服务**：`apps/{gateway, account, video, interaction, social, notification, feed}` + `apps/job/*`，同一个 Go module 内共享 `common/*` 与 `model/*`，避免多仓依赖同步的痛苦。
 - 🔗 **强一致写路径**：业务写入与派生事件在同一 MySQL 事务中落 `outbox_events`，由 outbox job 通过 `SKIP LOCKED` 抢占后发布到 Kafka，**禁止在业务代码里直接生产消息**。
 - 🌊 **最终一致派生数据**：Timeline / 未读数 / 视频计数 / 热榜等全部走 Kafka 事件驱动，消费者用 `processed_events` 唯一键保证幂等，失败进 `dead_letter_events` 旁路，不阻塞 partition。
+- ⚙️ **互动事件批量同步**：`interaction_sync` 按 topic+partition 组内保序、组间并发，每 500 条一个幂等事务；事件按视频聚合后升序更新，配合 Redis pending/acked/pending_count 保证最终收敛。
 - 🚀 **Feed 推拉分离**：小 V 走 fanout 写扩散到粉丝 inbox，大 V（`is_big_v` 只升不降）只写自己的 outbox，读侧懒加载合并 inbox 与关注的大 V outbox。
 - 🧠 **可控降级**：Redis 只作为加速层，Profile / Timeline / 未读数 / 评论首页均采用"版本号 + 惰性重算"，任何时刻 Redis 挂掉都能降级到 MySQL 直查。
 - 📦 **文件秒传 + 延迟清理**：分片上传 + 全局 file_hash 秒传，`file_assets.ref_count` 归零后由 asset_cleanup job 延迟物理删除，同时兜底"引用复活"场景。
+- 📊 **可复现压测**：内置造数、HTTP 压测和 E2E 工具，已完成 10000 用户、5000 视频规模验证，并对 Outbox、Kafka lag、Redis 增量和 MySQL 聚合做最终一致性验收。
 - 🎨 **配套前端**：`web/` 目录内是 Vite + React 18 + TS + Tailwind + TanStack Query 实现的完整前端，覆盖登录、上传、播放、点赞、评论、关注、通知全流程。
 
 ---
@@ -46,7 +48,7 @@ flowchart LR
     Jobs --> MySQL
 ```
 
-> 完整版架构图、ER 图、每个模块的时序图（共 16 张 mermaid）见 [`docs/PROJECT_OVERVIEW.md`](./docs/PROJECT_OVERVIEW.md)。
+> 完整版架构图、ER 图、每个模块的时序图（共 17 张 Mermaid）见 [`docs/PROJECT_OVERVIEW.md`](./docs/PROJECT_OVERVIEW.md)。
 
 ---
 
@@ -68,10 +70,10 @@ flowchart LR
 | Job | 消费 topic | 主要动作 |
 |---|---|---|
 | **outbox** | — | 扫描 `outbox_events`，SKIP LOCKED 抢占后投递到 Kafka |
-| **interaction_sync** | `interaction.like.events` / `interaction.comment.events` | 落库 → 按 event_id 对 Redis 增量 ack；生产 `video.stat.delta.events` |
+| **interaction_sync** | `interaction.like.events` / `interaction.comment.events` | topic+partition 并发；500 条批量幂等落库 → Redis eventID ack |
 | **social_sync** | `social.follow.events` | 关注状态缓存 & Profile 版本号 bump |
 | **feed_timeline** | `feed.video.events` / `social.follow.events` | 推拉分离扇出，ready 丢失时主动 bootstrap |
-| **hotrank** | `video.stat.delta.events` | 分钟级窗口滚动，生成 hot ZSet |
+| **hotrank** | `interaction.like.events` / `interaction.comment.events` | 独立维护 UTC 分钟窗口，Feed 按需构建衰减快照 |
 | **notification** | `notification.events` | 通知落库、未读数 version bump、死信旁路 |
 | **asset_cleanup** | 无（轮询扫库） | 延迟物理清理 file_assets，抢占超时兜底 + 引用复活 |
 
@@ -92,7 +94,7 @@ docker-compose up -d
 # Kafka localhost:9094
 ```
 
-建表 SQL 通过 `docker-entrypoint-initdb.d` 首次启动自动执行 `deploy/sql/001_*.sql ~ 015_*.sql`。
+建表 SQL 通过 `docker-entrypoint-initdb.d` 首次启动自动执行 `deploy/sql/001_*.sql ~ 016_*.sql`。
 
 ### 4.2 建 Kafka Topic
 
@@ -188,18 +190,48 @@ feedsystem-zero/
 │   └── emailx/             # 邮件（注册验证码）
 ├── deploy/
 │   ├── docker-compose.yml  # MySQL / Redis / etcd / Kafka 一键起
-│   ├── sql/                # 001 ~ 015 建表 & 迁移脚本
+│   ├── sql/                # 001 ~ 016 建表、索引与迁移脚本
 │   └── kafka/              # topic 创建脚本
 ├── model/                  # 事件与 GORM 表共享模型
 ├── docs/                   # 项目文档
 │   └── PROJECT_OVERVIEW.md # ⭐ 完整设计说明（架构 / ER / 流程图 / API 汇总）
+├── tests/                  # 造数、HTTP 压测、E2E 冒烟与并发测试
 ├── web/                    # React 前端
 └── README.md               # 就是本文件
 ```
 
 ---
 
-## 六、几个必须知道的约定
+## 六、测试与验证
+
+仓库内置 `seed` 和 `loadtest`，可直接通过 Gateway 压测完整后端链路。本轮使用 **10000 用户 + 5000 视频**，所有依赖与服务均运行在同一台本地开发机。
+
+```bash
+# 重置压测数据并生成正式规模数据
+go run ./tests/cmd/seed -reset -reset-redis -users 10000 -videos 5000
+
+# 点赞/取消点赞正式压测
+go run ./tests/cmd/loadtest \
+  -scenario like -c 50 -d 60s -warmup 5s \
+  -login-pool 500 -target-pool 2000 -v
+```
+
+| 场景 | 参数 | 成功率 | QPS | P99 |
+|---|---|---:|---:|---:|
+| 发布视频 | 5 并发 / 10s | 100% | 318.7 | 24ms |
+| 关注 | 10 并发 / 10s | 100% | 354.7 | 54ms |
+| 关注流 | 20 并发 / 30s | 100% | 1076.8 | 30ms |
+| 热榜缓存命中 | 50 并发 / 30s | 100% | 7503.4 | 16ms |
+| 热榜冷快照构建 | 50 并发 / 30s | 100% | 1428.1 | 54ms |
+| 点赞正式规模 | 50 并发 / 60s | 100% | 260.4 次循环/s | 374ms |
+
+> 点赞场景一次循环包含 Like + Unlike 两个写请求，`260.4 次循环/s` 约等于 `520.8 HTTP 写请求/s`。优化后的 Kafka 消息在压测结束约 7 秒后排空；最终未投递 Outbox、互动死信、Kafka lag、Redis delta/pending 和三类 MySQL 对账差异均为 0。
+
+关键包已通过 `go test -race`，`go vet` 无输出。完整命令、优化前后对照和一致性 SQL 见 [完整测试记录](./docs/PROJECT_OVERVIEW.md#146-测试压测与一致性验收2026-08-03)。E2E 冒烟目前唯一的环境限制是 `@loadtest.local` 虚构邮箱无法通过真实 163 SMTP 接收验证码。
+
+---
+
+## 七、几个必须知道的约定
 
 1. **身份识别**：所有需要 `user_id` 的 RPC 入参**必须**由 Gateway 从 JWT 中解析后填入，**不接收前端传值**。
 2. **幂等键**：视频发布 `(author_id, request_id)`；评论 `(user_id, request_id)`；事件处理 `(event_id, consumer_name)`；通知去重 `business_key`。
@@ -211,10 +243,10 @@ feedsystem-zero/
 
 ---
 
-## 七、深入阅读
+## 八、深入阅读
 
 - 📘 **一次读懂整个系统** → [`docs/PROJECT_OVERVIEW.md`](./docs/PROJECT_OVERVIEW.md)
-  - 总体架构 / ER 图 / 事件契约 / Outbox 模式 / 各模块时序图（共 16 张 mermaid）
+  - 总体架构 / ER 图 / 事件契约 / Outbox 模式 / 各模块时序图（共 17 张 Mermaid）
   - Redis Key 命名空间 / 一致性 · 并发 · 幂等设计原则
   - Gateway HTTP API 汇总 / 常见问题排查
 - 🎨 **前端指南** → [`web/README.md`](./web/README.md)
@@ -223,7 +255,7 @@ feedsystem-zero/
 
 ---
 
-## 八、常用命令
+## 九、常用命令
 
 ```bash
 go build ./...       # 全量编译

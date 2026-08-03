@@ -19,7 +19,7 @@ type MysqlConf struct {
 }
 
 type SyncConf struct {
-	BatchSize         int `json:",default=100"`
+	BatchSize         int `json:",default=500"`
 	FlushMs           int `json:",default=1000"`
 	FlushBatchSize    int `json:",default=500"`
 	RpcTimeoutMs      int `json:",default=10000"`

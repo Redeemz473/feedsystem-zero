@@ -45,6 +45,13 @@ func (s *LikeScenario) Setup(ctx context.Context, f testconfig.LoadTestFlags) er
 	if err != nil {
 		return err
 	}
+	if len(tokens.tokens) < f.Concurrency {
+		return fmt.Errorf(
+			"like scenario requires at least one login user per worker: users=%d concurrency=%d; increase -login-pool or seed users",
+			len(tokens.tokens),
+			f.Concurrency,
+		)
+	}
 	s.tokens = tokens
 
 	videos, err := sampleVideos(ctx, db, f.TargetPoolSize)
@@ -54,11 +61,8 @@ func (s *LikeScenario) Setup(ctx context.Context, f testconfig.LoadTestFlags) er
 	s.videos = videos
 	log.Printf("[like] sampled %d target videos", len(videos.ids))
 
-	// Workers do not share a single Client's token field, so we build one
-	// per request via short-lived clients. Reusing the transport pool is
-	// still important, so we keep one long-lived transport via New() — but
-	// each Op invocation creates a lightweight Client copy with its own
-	// bearer token to avoid data races.
+	// Bearer token 通过请求 context 传递，共享 Client 不保存可变 token 状态，
+	// 因而可以安全复用底层 HTTP Transport 和连接池。
 	s.client = httpclient.New(f.BaseURL, f.Timeout)
 	return nil
 }
@@ -66,7 +70,10 @@ func (s *LikeScenario) Setup(ctx context.Context, f testconfig.LoadTestFlags) er
 func (s *LikeScenario) Op() loadgen.Op {
 	return func(ctx context.Context, workerID int) error {
 		rng := perWorkerRand(workerID)
-		token, _ := s.tokens.pick(rng.Int())
+		// 每个 worker 固定使用独立用户，避免普通吞吐测试随机制造
+		// “同一用户同时操作同一视频”的 409 业务冲突。
+		// 视频仍随机选择，因此仍能覆盖热点视频上的多用户并发点赞。
+		token, _ := s.tokens.pick(workerID)
 		videoID, _ := s.videos.pickRand(rng)
 
 		// Per-request bearer token via context; the shared Client stays goroutine-safe.

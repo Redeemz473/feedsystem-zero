@@ -146,7 +146,8 @@ CREATE TABLE IF NOT EXISTS outbox_events (
   KEY idx_status_next_retry (status, next_retry_at, id),
   KEY idx_status_locked (status, locked_at, id),
   KEY idx_topic_status (topic, status, id),
-  KEY idx_aggregate (aggregate_type, aggregate_id, id)
+  KEY idx_aggregate (aggregate_type, aggregate_id, id),
+  KEY idx_aggregate_status_id (aggregate_type, aggregate_id, status, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS processed_events (

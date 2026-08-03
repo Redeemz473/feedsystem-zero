@@ -48,13 +48,10 @@ func (l *RebuildVideoInteractionStatsLogic) RebuildVideoInteractionStats(in *int
 		return nil, status.Error(codes.Aborted, "互动统计重建任务正在处理中")
 	}
 	defer l.releaseRebuildStatsLock(rebuildLockKey, rebuildLockToken)
-
-	flushLockKeys, flushLockTokens, err := l.acquireFlushLocksForRebuild()
-	if err != nil {
-		l.Errorf("acquire flush locks for rebuild failed, error:%v", err)
-		return nil, err
+	if err := l.waitForStatsMutationsDrained(); err != nil {
+		l.Errorf("wait for interaction stats mutations drained failed, error:%v", err)
+		return nil, status.Error(codes.Aborted, "等待互动写入结束超时，请稍后重试")
 	}
-	defer l.releaseFlushLocksForRebuild(flushLockKeys, flushLockTokens)
 
 	existingVideoIDs, err := l.loadExistingNormalVideoIDs(videoIDs)
 	if err != nil {
@@ -117,7 +114,7 @@ func (l *RebuildVideoInteractionStatsLogic) RebuildVideoInteractionStats(in *int
 func (l *RebuildVideoInteractionStatsLogic) acquireRebuildStatsLock() (string, string, bool, error) {
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
 	defer cancel()
-	return tryAcquireInteractionJobLock(redisCtx, l.svcCtx.RedisCli, interactionRebuildStatsJob)
+	return tryAcquireInteractionRebuildLock(redisCtx, l.svcCtx.RedisCli)
 }
 
 func (l *RebuildVideoInteractionStatsLogic) releaseRebuildStatsLock(lockKey string, lockToken string) {
@@ -128,44 +125,8 @@ func (l *RebuildVideoInteractionStatsLogic) releaseRebuildStatsLock(lockKey stri
 	}
 }
 
-func (l *RebuildVideoInteractionStatsLogic) acquireFlushLocksForRebuild() ([]string, []string, error) {
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	defer cancel()
-
-	names := []string{interactionFlushLikeEventsJob, interactionFlushCommentEventsJob}
-	lockKeys := make([]string, 0, len(names))
-	lockTokens := make([]string, 0, len(names))
-	for _, name := range names {
-		lockKey, lockToken, locked, err := tryAcquireInteractionJobLock(redisCtx, l.svcCtx.RedisCli, name)
-		if err != nil {
-			l.releaseFlushLocksForRebuild(lockKeys, lockTokens)
-			return nil, nil, status.Error(codes.Internal, "获取 flush 任务锁失败")
-		}
-		if !locked {
-			l.releaseFlushLocksForRebuild(lockKeys, lockTokens)
-			return nil, nil, status.Error(codes.Aborted, "互动事件刷库任务正在处理中")
-		}
-		lockKeys = append(lockKeys, lockKey)
-		lockTokens = append(lockTokens, lockToken)
-	}
-	return lockKeys, lockTokens, nil
-}
-
-func (l *RebuildVideoInteractionStatsLogic) releaseFlushLocksForRebuild(lockKeys []string, lockTokens []string) {
-	if len(lockKeys) == 0 {
-		return
-	}
-
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	defer cancel()
-	for i, lockKey := range lockKeys {
-		if i >= len(lockTokens) {
-			return
-		}
-		if err := releaseRedisLock(redisCtx, l.svcCtx.RedisCli, lockKey, lockTokens[i]); err != nil {
-			l.Errorf("release flush lock for rebuild failed, key:%s error:%v", lockKey, err)
-		}
-	}
+func (l *RebuildVideoInteractionStatsLogic) waitForStatsMutationsDrained() error {
+	return waitForInteractionStatsMutationsDrained(l.ctx, l.svcCtx.RedisCli)
 }
 
 func normalizeRebuildVideoIDs(rawVideoIDs []uint64) ([]uint64, error) {

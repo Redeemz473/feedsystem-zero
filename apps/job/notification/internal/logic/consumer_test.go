@@ -2,6 +2,8 @@ package logic
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -10,6 +12,8 @@ import (
 	"feedsystem-zero/apps/job/notification/internal/svc"
 	"feedsystem-zero/common/eventx"
 	"feedsystem-zero/common/kafkax"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 func TestDecodeNotificationEvents(t *testing.T) {
@@ -105,6 +109,48 @@ func TestGroupNotificationMessagesKeepsPartitionOrder(t *testing.T) {
 	}
 	if groups[0].Messages[0].Offset != 10 || groups[0].Messages[1].Offset != 11 {
 		t.Fatalf("partition order changed: %+v", groups[0].Messages)
+	}
+}
+
+func TestIsRetryableNotificationDBError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "deadlock", err: &mysql.MySQLError{Number: 1213}, want: true},
+		{name: "lock wait timeout", err: fmt.Errorf("wrapped: %w", &mysql.MySQLError{Number: 1205}), want: true},
+		{name: "duplicate key", err: &mysql.MySQLError{Number: 1062}, want: false},
+		{name: "generic", err: errors.New("boom"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRetryableNotificationDBError(tt.err); got != tt.want {
+				t.Fatalf("isRetryableNotificationDBError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNotificationDBRetryDelayIsBounded(t *testing.T) {
+	consumer := newTestNotificationConsumer(time.Unix(0, 0))
+	consumer.svcCtx.Config.Notification.DBRetryBaseMs = 10
+	consumer.svcCtx.Config.Notification.DBRetryMaxMs = 25
+
+	tests := []struct {
+		retry int
+		min   time.Duration
+		max   time.Duration
+	}{
+		{retry: 1, min: 10 * time.Millisecond, max: 15 * time.Millisecond},
+		{retry: 2, min: 20 * time.Millisecond, max: 25 * time.Millisecond},
+		{retry: 3, min: 25 * time.Millisecond, max: 25 * time.Millisecond},
+	}
+	for _, tt := range tests {
+		delay := consumer.dbRetryDelay(tt.retry)
+		if delay < tt.min || delay > tt.max {
+			t.Fatalf("dbRetryDelay(%d) = %s, want [%s, %s]", tt.retry, delay, tt.min, tt.max)
+		}
 	}
 }
 

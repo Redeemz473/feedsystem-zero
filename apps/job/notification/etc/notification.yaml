@@ -26,5 +26,8 @@ Notification:
   FlushMs: 1000
   WorkerCount: 4
   DBWriteTimeoutMs: 5000
+  DBMaxRetries: 3
+  DBRetryBaseMs: 20
+  DBRetryMaxMs: 200
   ProcessedEventTTLDays: 14
   FutureToleranceSeconds: 300

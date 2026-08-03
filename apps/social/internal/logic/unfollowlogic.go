@@ -5,7 +5,6 @@ import (
 	"errors"
 	"time"
 
-	"feedsystem-zero/apps/account/accountclient"
 	"feedsystem-zero/apps/social/internal/model"
 	"feedsystem-zero/apps/social/internal/svc"
 	"feedsystem-zero/apps/social/social"
@@ -15,7 +14,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type UnfollowLogic struct {
@@ -48,24 +46,19 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 		return nil, status.Error(codes.InvalidArgument, "用户不能取消关注自己")
 	}
 
-	if _, err := l.svcCtx.AccountRpc.GetProfile(l.ctx, &accountclient.GetProfileReq{UserId: followingID}); err != nil {
-		if status.Code(err) == codes.NotFound {
-			return nil, status.Error(codes.NotFound, "目标用户不存在")
-		}
-		l.Errorf("get following profile failed, following_id: %d, error: %v", followingID, err)
-		return nil, status.Error(codes.Internal, "校验目标用户失败")
-	}
-
-	now := time.Now()
+	var now time.Time
 	stateChanged := false
-	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+	if err := runSocialWriteTransaction(l.ctx, l.svcCtx.GormDB, func(tx *gorm.DB) error {
+		now = time.Now()
+		stateChanged = false
 		if err := lockFollowAccounts(l.ctx, tx, followerID, followingID); err != nil {
 			return err
 		}
 
 		var follow model.Follow
-		//加锁查询关注关系
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		// 同一关系的写入已经被双方账户行串行化，普通查询即可；对不存在关系
+		// 执行 FOR UPDATE 会持有 gap lock，并阻塞并发 Follow 的 INSERT。
+		err := tx.
 			Where("follower_id = ? AND following_id = ?", followerID, followingID).
 			Take(&follow).Error
 
@@ -140,6 +133,9 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 		}
 		return tx.Create(notificationOutbox).Error
 	}); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, status.Error(codes.NotFound, "目标用户不存在")
+		}
 		l.Errorf("unfollow transaction failed, follower_id: %d, following_id: %d, error: %v", followerID, followingID, err)
 		return nil, status.Error(codes.Internal, "取消关注失败")
 	}

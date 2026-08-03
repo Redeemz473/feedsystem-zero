@@ -5,7 +5,6 @@ import (
 	"errors"
 	"time"
 
-	"feedsystem-zero/apps/account/accountclient"
 	"feedsystem-zero/apps/social/internal/model"
 	"feedsystem-zero/apps/social/internal/svc"
 	"feedsystem-zero/apps/social/social"
@@ -49,24 +48,20 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 		return nil, status.Error(codes.InvalidArgument, "用户不能关注自己")
 	}
 
-	if _, err := l.svcCtx.AccountRpc.GetProfile(l.ctx, &accountclient.GetProfileReq{UserId: followingID}); err != nil {
-		if status.Code(err) == codes.NotFound {
-			return nil, status.Error(codes.NotFound, "目标用户不存在")
-		}
-		l.Errorf("get following profile failed, following_id: %d, error: %v", followingID, err)
-		return nil, status.Error(codes.Internal, "校验目标用户失败")
-	}
-
-	now := time.Now()
+	var now time.Time
 	stateChanged := false
-	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+	if err := runSocialWriteTransaction(l.ctx, l.svcCtx.GormDB, func(tx *gorm.DB) error {
+		// 重试必须丢弃上一轮已回滚事务的局部状态。
+		now = time.Now()
+		stateChanged = false
 		if err := lockFollowAccounts(l.ctx, tx, followerID, followingID); err != nil {
 			return err
 		}
 
 		var follow model.Follow
-		//加悲观行锁查询关注关系，防止并发出现问题导致粉丝数被刷双倍
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		// 双方账户行已经充当该关注关系的事务互斥锁。这里使用普通查询，避免
+		// 对不存在的联合唯一键加 gap lock，随后 INSERT 时形成插入意向死锁。
+		err := tx.
 			Where("follower_id = ? AND following_id = ?", followerID, followingID).
 			Take(&follow).Error
 
@@ -199,6 +194,9 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 		}
 		return tx.Create(notificationOutbox).Error
 	}); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, status.Error(codes.NotFound, "目标用户不存在")
+		}
 		l.Errorf("follow transaction failed, follower_id: %d, following_id: %d, error: %v", followerID, followingID, err)
 		return nil, status.Error(codes.Internal, "关注失败")
 	}

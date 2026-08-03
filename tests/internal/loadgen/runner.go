@@ -38,19 +38,21 @@ type Runner struct {
 // Run blocks until warmup + duration elapse (or ctx cancelled).
 func (r *Runner) Run(ctx context.Context) {
 	if r.Warmup > 0 {
-		warmCtx, cancel := context.WithTimeout(ctx, r.Warmup)
-		r.runPhase(warmCtx, false)
-		cancel()
+		r.runPhase(ctx, r.Warmup, false)
 	}
 
 	r.Recorder.Start()
-	runCtx, cancel := context.WithTimeout(ctx, r.Duration)
-	defer cancel()
-	r.runPhase(runCtx, true)
+	r.runPhase(ctx, r.Duration, true)
 	r.Recorder.Stop()
 }
 
-func (r *Runner) runPhase(ctx context.Context, record bool) {
+func (r *Runner) runPhase(ctx context.Context, duration time.Duration, record bool) {
+	// phaseCtx 只负责停止派发新请求。已经开始的请求继续使用父 ctx，
+	// 由 HTTP 客户端自己的请求超时控制，避免在压测窗口结束时把每个 worker
+	// 正在执行的最后一个请求误记为 timeout 或下游 cancellation 500。
+	phaseCtx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+
 	var wg sync.WaitGroup
 	wg.Add(r.Concurrency)
 	for i := 0; i < r.Concurrency; i++ {
@@ -60,7 +62,7 @@ func (r *Runner) runPhase(ctx context.Context, record bool) {
 			errsLogged := 0
 			for {
 				select {
-				case <-ctx.Done():
+				case <-phaseCtx.Done():
 					return
 				default:
 				}

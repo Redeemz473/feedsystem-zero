@@ -17,6 +17,7 @@ import (
 	"feedsystem-zero/common/kafkax"
 	"feedsystem-zero/common/notificationcache"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/zeromicro/go-zero/core/logx"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -29,6 +30,10 @@ const (
 	maxNotificationWorkerCount           = 16
 	defaultNotificationFlushInterval     = time.Second
 	defaultNotificationDBWriteTimeout    = 5 * time.Second
+	defaultNotificationDBMaxRetries      = 3
+	maxNotificationDBMaxRetries          = 8
+	defaultNotificationDBRetryBase       = 20 * time.Millisecond
+	defaultNotificationDBRetryMax        = 200 * time.Millisecond
 	defaultNotificationProcessedEventTTL = 14 * 24 * time.Hour
 	defaultNotificationFutureTolerance   = 5 * time.Minute
 	notificationProcessChunkSize         = 100
@@ -278,30 +283,56 @@ func (c *NotificationConsumer) processChunk(ctx context.Context, events []decode
 	now := c.currentTime()
 	expireAt := now.Add(c.processedEventTTL())
 
-	// 事务内收集需要 bump version 的 receiver。提交成功前不写 Redis，防止事务回滚后
-	// 缓存已被清空、下一次读又把“会被回滚”的中间值 COUNT 进来。
-	bumpReceivers := make(map[uint64]struct{})
-	txErr := c.svcCtx.GormDB.WithContext(dbCtx).Transaction(func(tx *gorm.DB) error {
-		for _, decoded := range events {
-			inserted, err := insertNotificationProcessedEvent(tx, decoded, now, expireAt)
-			if err != nil {
-				return err
+	// 多个 partition 会并发写 processed_events。InnoDB 在高并发插入同一索引末页时
+	// 仍可能选择其中一个事务作为 1213 死锁牺牲者。事务已完整回滚，因此只对
+	// 1213/1205 做有限重试；其他错误立即返回，避免掩盖数据或配置问题。
+	var bumpReceivers map[uint64]struct{}
+	maxRetries := c.dbMaxRetries()
+	for attempt := 0; ; attempt++ {
+		// 每次尝试使用独立集合。失败事务中收集的 receiver 不能在后续提交后 bump。
+		attemptBumpReceivers := make(map[uint64]struct{})
+		txErr := c.svcCtx.GormDB.WithContext(dbCtx).Transaction(func(tx *gorm.DB) error {
+			for _, decoded := range events {
+				inserted, err := insertNotificationProcessedEvent(tx, decoded, now, expireAt)
+				if err != nil {
+					return err
+				}
+				if !inserted {
+					continue
+				}
+				bumpReceiverID, err := applyNotificationEvent(tx, decoded, now)
+				if err != nil {
+					return err
+				}
+				if bumpReceiverID != 0 {
+					attemptBumpReceivers[bumpReceiverID] = struct{}{}
+				}
 			}
-			if !inserted {
-				continue
-			}
-			bumpReceiverID, err := applyNotificationEvent(tx, decoded, now)
-			if err != nil {
-				return err
-			}
-			if bumpReceiverID != 0 {
-				bumpReceivers[bumpReceiverID] = struct{}{}
-			}
+			return nil
+		})
+		if txErr == nil {
+			bumpReceivers = attemptBumpReceivers
+			break
 		}
-		return nil
-	})
-	if txErr != nil {
-		return txErr
+		if !isRetryableNotificationDBError(txErr) {
+			return txErr
+		}
+		if attempt >= maxRetries {
+			return fmt.Errorf("notification事务重试耗尽, retries:%d: %w", maxRetries, txErr)
+		}
+
+		retryNumber := attempt + 1
+		delay := c.dbRetryDelay(retryNumber)
+		logx.WithContext(ctx).Infof(
+			"notification事务发生可重试锁冲突, retry:%d/%d delay:%s error:%v",
+			retryNumber,
+			maxRetries,
+			delay,
+			txErr,
+		)
+		if err := waitNotificationDBRetry(dbCtx, delay); err != nil {
+			return err
+		}
 	}
 
 	// 事务已经提交，MySQL 状态是最终值；即便 Redis 全部失败，下一次读走 MySQL COUNT 也仍然正确。
@@ -593,6 +624,73 @@ func (c *NotificationConsumer) dbWriteTimeout() time.Duration {
 		return defaultNotificationDBWriteTimeout
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+func (c *NotificationConsumer) dbMaxRetries() int {
+	retries := c.svcCtx.Config.Notification.DBMaxRetries
+	if retries <= 0 {
+		return defaultNotificationDBMaxRetries
+	}
+	if retries > maxNotificationDBMaxRetries {
+		return maxNotificationDBMaxRetries
+	}
+	return retries
+}
+
+func (c *NotificationConsumer) dbRetryDelay(retryNumber int) time.Duration {
+	base := time.Duration(c.svcCtx.Config.Notification.DBRetryBaseMs) * time.Millisecond
+	if base <= 0 {
+		base = defaultNotificationDBRetryBase
+	}
+	maximum := time.Duration(c.svcCtx.Config.Notification.DBRetryMaxMs) * time.Millisecond
+	if maximum <= 0 {
+		maximum = defaultNotificationDBRetryMax
+	}
+	if maximum < base {
+		maximum = base
+	}
+
+	delay := base
+	for i := 1; i < retryNumber && delay < maximum; i++ {
+		if delay >= maximum/2 {
+			delay = maximum
+			break
+		}
+		delay *= 2
+	}
+	if delay > maximum {
+		delay = maximum
+	}
+
+	// 添加最多 50% 抖动，让同时被回滚的 partition 不会再次同步争锁。
+	jitterWindow := delay / 2
+	if jitterWindow <= 0 || delay >= maximum {
+		return delay
+	}
+	jitter := time.Duration(c.currentTime().UnixNano() % int64(jitterWindow+1))
+	if delay+jitter > maximum {
+		return maximum
+	}
+	return delay + jitter
+}
+
+func isRetryableNotificationDBError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1213 || mysqlErr.Number == 1205
+}
+
+func waitNotificationDBRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (c *NotificationConsumer) processedEventTTL() time.Duration {

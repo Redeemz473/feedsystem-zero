@@ -18,11 +18,13 @@ import (
 	"feedsystem-zero/common/kafkax"
 
 	"github.com/zeromicro/go-zero/core/logx"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"gorm.io/gorm/clause"
 )
 
 const (
-	defaultSyncBatchSize      = 100
+	defaultSyncBatchSize      = 500
 	maxSyncBatchSize          = 500
 	defaultFlushBatchSize     = 500
 	maxFlushBatchSize         = 500
@@ -292,11 +294,17 @@ func (c *SyncConsumer) flushLikeEventsOnce(ctx context.Context, events []decoded
 		end := min(start+batchSize, len(events))
 		chunk := events[start:end]
 
-		rpcCtx, cancel := context.WithTimeout(ctx, syncRPCTimeout(c.svcCtx.Config.Sync))
-		resp, err := c.svcCtx.InteractionRpc.FlushLikeEvents(rpcCtx, &interactionclient.FlushLikeEventsReq{
-			Events: protoLikeEvents(chunk),
-		})
-		cancel()
+		resp, err := callFlushRPCWithRetry(
+			ctx,
+			c.svcCtx.Config.Sync,
+			"like",
+			len(chunk),
+			func(rpcCtx context.Context) (*interactionclient.FlushLikeEventsResp, error) {
+				return c.svcCtx.InteractionRpc.FlushLikeEvents(rpcCtx, &interactionclient.FlushLikeEventsReq{
+					Events: protoLikeEvents(chunk),
+				})
+			},
+		)
 		if err != nil {
 			return nil, fmt.Errorf("flush like events failed, range:%d-%d size:%d: %w", start, end, len(chunk), err)
 		}
@@ -357,11 +365,17 @@ func (c *SyncConsumer) flushCommentEventsOnce(ctx context.Context, events []deco
 		end := min(start+batchSize, len(events))
 		chunk := events[start:end]
 
-		rpcCtx, cancel := context.WithTimeout(ctx, syncRPCTimeout(c.svcCtx.Config.Sync))
-		resp, err := c.svcCtx.InteractionRpc.FlushCommentEvents(rpcCtx, &interactionclient.FlushCommentEventsReq{
-			Events: protoCommentEvents(chunk),
-		})
-		cancel()
+		resp, err := callFlushRPCWithRetry(
+			ctx,
+			c.svcCtx.Config.Sync,
+			"comment",
+			len(chunk),
+			func(rpcCtx context.Context) (*interactionclient.FlushCommentEventsResp, error) {
+				return c.svcCtx.InteractionRpc.FlushCommentEvents(rpcCtx, &interactionclient.FlushCommentEventsReq{
+					Events: protoCommentEvents(chunk),
+				})
+			},
+		)
 		if err != nil {
 			return nil, fmt.Errorf("flush comment events failed, range:%d-%d size:%d: %w", start, end, len(chunk), err)
 		}
@@ -383,6 +397,68 @@ func (c *SyncConsumer) flushCommentEventsOnce(ctx context.Context, events []deco
 		}
 	}
 	return failedEvents, nil
+}
+
+// callFlushRPCWithRetry 在当前 topic+partition worker 内吸收临时 RPC 错误。
+// Flush RPC 之间可以并发；只有统计重建持有互斥租约时才会返回 Aborted。
+// 这类错误若直接抛给 RunBatch，会让已经成功的分区跟着整批重放，offset 永远无法提交。
+// 因此基础设施类临时错误持续退避到恢复；业务错误仍由 FailedEventIds 有限重试并落死信。
+func callFlushRPCWithRetry[T any](
+	ctx context.Context,
+	conf config.SyncConf,
+	operation string,
+	eventCount int,
+	call func(context.Context) (T, error),
+) (T, error) {
+	var zero T
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+
+		rpcCtx, cancel := context.WithTimeout(ctx, syncRPCTimeout(conf))
+		resp, err := call(rpcCtx)
+		cancel()
+		if err == nil {
+			return resp, nil
+		}
+		if ctx.Err() != nil {
+			return zero, ctx.Err()
+		}
+		if !isRetryableFlushRPCError(err) {
+			return zero, err
+		}
+
+		if shouldLogFlushRPCRetry(attempt) {
+			logx.WithContext(ctx).Errorf(
+				"flush %s events rpc temporarily unavailable, attempt:%d size:%d error:%v",
+				operation,
+				attempt,
+				eventCount,
+				err,
+			)
+		}
+		if err := sleepBeforeRetry(ctx, conf, attempt); err != nil {
+			return zero, err
+		}
+	}
+}
+
+func isRetryableFlushRPCError(err error) bool {
+	switch status.Code(err) {
+	case codes.Aborted,
+		codes.Unavailable,
+		codes.DeadlineExceeded,
+		codes.ResourceExhausted:
+		return true
+	default:
+		return false
+	}
+}
+
+// 长时间故障只记录第一次和每十次重试，避免重复日志占满磁盘。
+func shouldLogFlushRPCRetry(attempt int) bool {
+	return attempt == 1 || attempt%10 == 0
 }
 
 func (c *SyncConsumer) recordDeadLetters(ctx context.Context, letters []model.DeadLetterEvent) error {

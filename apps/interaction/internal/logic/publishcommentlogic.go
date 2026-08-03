@@ -97,11 +97,17 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 		return nil, status.Error(codes.Internal, "查询视频失败")
 	}
 
-	if err := rejectIfStatsRebuildRunning(l.ctx, l.svcCtx.RedisCli); err != nil {
-		if status.Code(err) == codes.Aborted {
-			return nil, err
-		}
-		l.Errorf("check rebuild stats lock failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+	leaseKey, leaseToken, leaseAcquired, err := acquireInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli)
+	if err != nil {
+		l.Errorf("acquire interaction mutation lease failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+	} else if !leaseAcquired {
+		return nil, status.Error(codes.Aborted, "互动统计重建中，请稍后重试")
+	} else {
+		defer func() {
+			if err := releaseInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli, leaseKey, leaseToken); err != nil {
+				l.Errorf("release interaction mutation lease failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+			}
+		}()
 	}
 
 	// 4. 对真正的新评论做短 TTL 限流。

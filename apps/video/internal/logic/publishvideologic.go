@@ -131,21 +131,20 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 			return nil
 		}
 
-		// 1. 先在事务内 reserve 视频与封面的引用计数
-		//    资源不存在时记录到 assetErr，事务返回错误自动回滚
-		if rerr := reserveFileAssetRefByURL(l.ctx, tx, playURL); rerr != nil {
-			if errors.Is(rerr, gorm.ErrRecordNotFound) {
-				assetErr = status.Error(codes.InvalidArgument, "视频资源不存在或已失效，请重新上传")
+		// 1. 在事务内 reserve 视频与封面的引用计数。
+		//    所有请求都按 URL 排序后加锁，避免并发请求分别按 A->B、B->A
+		//    获取 file_assets 行锁形成死锁。
+		for _, assetURL := range orderedFileAssetURLs(playURL, coverURL) {
+			if rerr := reserveFileAssetRefByURL(l.ctx, tx, assetURL); rerr != nil {
+				if errors.Is(rerr, gorm.ErrRecordNotFound) {
+					if assetURL == playURL {
+						assetErr = status.Error(codes.InvalidArgument, "视频资源不存在或已失效，请重新上传")
+					} else {
+						assetErr = status.Error(codes.InvalidArgument, "封面资源不存在或已失效，请重新上传")
+					}
+				}
 				return rerr
 			}
-			return rerr
-		}
-		if rerr := reserveFileAssetRefByURL(l.ctx, tx, coverURL); rerr != nil {
-			if errors.Is(rerr, gorm.ErrRecordNotFound) {
-				assetErr = status.Error(codes.InvalidArgument, "封面资源不存在或已失效，请重新上传")
-				return rerr
-			}
-			return rerr
 		}
 
 		// 2. video写入mysql

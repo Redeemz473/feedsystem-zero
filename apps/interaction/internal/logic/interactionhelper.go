@@ -42,6 +42,12 @@ func newEventID(prefix string) (string, error) {
 	return fmt.Sprintf("%s_%d_%s", prefix, time.Now().UnixNano(), token), nil
 }
 
+func likeAggregateID(videoID, userID uint64) string {
+	// 点赞关系才是 like 聚合：同一用户对同一视频的 like/unlike 必须有序，
+	// 不同用户之间可以并发投递。该值也同时作为 Kafka partition key。
+	return fmt.Sprintf("%d:%d", videoID, userID)
+}
+
 // buildInteractionNotificationOutbox 构造专用通知事件。
 // sourceEventID 指向同一事务里的点赞/评论领域事件，notificationEventID 则作为
 // notification-job 的独立消费幂等 ID，二者不能复用。
@@ -278,7 +284,9 @@ end
 if ARGV[4] ~= "0" then
 	redis.call("HINCRBY", KEYS[5], ARGV[1], ARGV[4])
 end
-redis.call("DEL", KEYS[6])
+redis.call("INCR", KEYS[6])
+redis.call("EXPIRE", KEYS[6], ARGV[5])
+redis.call("DEL", KEYS[7])
 return 1
 `
 
@@ -295,6 +303,7 @@ func applyInteractionDelta(ctx context.Context, redisCli *redis.Client, eventID 
 			rediskey.VideoLikeDeltaKey(),
 			rediskey.VideoCommentDeltaKey(),
 			rediskey.VideoPopularityDeltaKey(),
+			rediskey.InteractionDeltaPendingCountKey(videoID),
 			rediskey.VideoStatsCacheKey(videoID),
 		},
 		field,

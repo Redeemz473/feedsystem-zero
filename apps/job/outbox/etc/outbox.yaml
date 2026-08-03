@@ -9,13 +9,14 @@ Kafka:
   RequiredAcks: 1
   BatchSize: 100
   BatchBytes: 1048576
-  FlushMs: 100
+  FlushMs: 20
   RetryMax: 3
 
 Outbox:
-  BatchSize: 100
-  WorkerCount: 4
-  PollIntervalMs: 1000
+  # 批量 claim、批量发布和批量回写共同降低高峰期的 DB/Kafka 往返次数。
+  BatchSize: 500
+  WorkerCount: 16
+  PollIntervalMs: 100
   MaxRetry: 10
   RetryBaseMs: 1000
   RetryMaxMs: 60000

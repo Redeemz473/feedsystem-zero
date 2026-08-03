@@ -1,7 +1,7 @@
 # feedsystem-zero 项目说明文档
 
-> 生成时间：2026-07-30  
-> 适用版本：main 分支（含 015_account_big_v_flag.sql；对应 commit 687d0ab 完善后端一致性与文件资产清理）  
+> 更新时间：2026-08-03
+> 适用版本：main 分支当前工作区（基于 commit `d62bebe`，含 `016_outbox_aggregate_status_index.sql`、互动事件批量同步与正式规模压测）
 > 说明：本文档基于当前仓库真实代码生成，作为项目结构、数据模型、事件流转、一致性策略、缓存闭环、并发保护的完整索引。**外部读者读完这一份文档即可理解整个系统**。
 
 ---
@@ -30,6 +30,7 @@
 12. [一致性 / 并发 / 幂等设计原则](#十二一致性--并发--幂等设计原则)
 13. [Gateway HTTP API 汇总](#十三gateway-http-api-汇总)
 14. [开发与部署](#十四开发与部署)
+   - 14.6 [测试、压测与一致性验收](#146-测试压测与一致性验收2026-08-03)
 15. [约定与最佳实践](#十五约定与最佳实践)
 16. [附录：核心代码文件索引](#十六附录核心代码文件索引)
 17. [最近更新（Changelog）](#十七最近更新changelog)
@@ -44,7 +45,7 @@
 - **异步侧**：Kafka + 七个 Job Worker，负责派生数据（Timeline、计数、通知、热榜、文件资产清理）的最终一致维护。
 - **网关侧**：go-zero API 网关承担鉴权、参数校验、跨模块聚合，前端不直连 RPC。
 
-技术栈：`Go 1.25` + `go-zero (api+rpc)` + `GORM` + `MySQL 8.0` + `Redis 7` + `Kafka` + `etcd`。
+技术栈：`Go 1.25` + `go-zero 1.10.2 (api+rpc)` + `gRPC 1.82.0` + `GORM 1.31.2` + `MySQL 8.0` + `Redis 7` + `Kafka` + `etcd`。
 
 **核心设计目标**：
 
@@ -88,7 +89,7 @@ flowchart LR
     MySQL -.outbox_events.-> Outbox["Outbox Job<br/>扫描 & 投递"]
     Outbox -->|Publish| Kafka[("Kafka<br/>6 topics")]
 
-    Kafka --> InteractionSync["interaction_sync Job<br/>点赞/评论落库 + eventID ack"]
+    Kafka --> InteractionSync["interaction_sync Job<br/>按 partition 并发<br/>批量幂等落库 + eventID ack"]
     Kafka --> SocialSync["social_sync Job<br/>关注缓存 & 版本号"]
     Kafka --> FeedTimeline["feed_timeline Job<br/>推拉分离扇出 + global ready 自愈"]
     Kafka --> HotRank["hotrank Job<br/>热度增量聚合"]
@@ -149,10 +150,11 @@ feedsystem-zero/
 │   └── emailx/               # 邮件（注册验证码）
 ├── deploy/
 │   ├── docker-compose.yml    # MySQL/Redis/etcd/Kafka 一键起
-│   ├── sql/001~015_*.sql     # 建表 & 迁移
+│   ├── sql/001~016_*.sql     # 建表、索引与增量迁移
 │   └── kafka/create_topics.sh
 ├── model/                    # 事件模型和 GORM 共享表模型
 ├── docs/                     # 本文档所在目录
+├── tests/                    # 造数、HTTP 压测、E2E 冒烟与并发测试
 └── web/                      # React 前端（Vite + TS + Tailwind）
 ```
 
@@ -176,10 +178,10 @@ feedsystem-zero/
 | Job | 消费 topic | 主要动作 | 状态 |
 |---|---|---|---|
 | **outbox** | — | 扫描 `outbox_events`，SKIP LOCKED 抢占，投递到 Kafka | ✅ |
-| **interaction_sync** | `interaction.like.events` / `interaction.comment.events` | 消费 → 落库 → 按 event_id 对 Redis 增量 ack；生产 `video.stat.delta.events` | ✅ |
+| **interaction_sync** | `interaction.like.events` / `interaction.comment.events` | topic+partition 分组并发；500 条批量幂等事务 → 按 event_id 对 Redis 增量 ack | ✅ |
 | **social_sync** | `social.follow.events` | 关注状态缓存 & Profile 版本号 bump | ✅ |
 | **feed_timeline** | `feed.video.events` / `social.follow.events` | 推拉分离：小 V 写扩散、大 V author outbox；ready 丢失时主动 bootstrap | ✅ |
-| **hotrank** | `video.stat.delta.events` | 分钟级窗口滚动、生成 hot ZSet | ✅ |
+| **hotrank** | `interaction.like.events` / `interaction.comment.events` | 独立消费互动事件，维护 UTC 分钟窗口；Feed 按需构建衰减快照 | ✅ |
 | **notification** | `notification.events` | 通知落库、未读数 version bump、死信旁路 | ✅ |
 | **asset_cleanup** | 无（轮询扫库） | 延迟物理清理 `file_assets`；抢占超时兜底 + 引用复活；DEL 秒传全局缓存 | ✅ |
 
@@ -306,6 +308,7 @@ erDiagram
 | `013_account_follow_counters.sql` | accounts 增加 follower_count / following_count 冗余字段 |
 | `014_notifications.sql` | `notifications` 表（含 `uk_notification_business` 唯一键 + `(receiver_id, occurred_at, id)` 复合索引） |
 | `015_account_big_v_flag.sql` | accounts.is_big_v 大 V 标志位 + 存量数据回填 |
+| `016_outbox_aggregate_status_index.sql` | Outbox 按 topic/status 聚合检查与待投递扫描索引 |
 
 ---
 
@@ -317,9 +320,9 @@ erDiagram
 
 | Topic | Producer | Consumer | 用途 |
 |---|---|---|---|
-| `interaction.like.events` | interaction rpc (outbox) | interaction_sync | 点赞/取消点赞落 Redis 计数 |
-| `interaction.comment.events` | interaction rpc (outbox) | interaction_sync | 评论创建/删除计数 |
-| `video.stat.delta.events` | interaction_sync | **hotrank** | 视频热度增量聚合 |
+| `interaction.like.events` | interaction rpc (outbox) | interaction_sync + hotrank | 点赞/取消点赞聚合落库；独立热榜窗口计分 |
+| `interaction.comment.events` | interaction rpc (outbox) | interaction_sync + hotrank | 评论创建/删除聚合落库；独立热榜窗口计分 |
+| `video.stat.delta.events` | 当前仅保留契约 | 当前无在线 Producer/Consumer | 预留的视频统计增量 Topic，不属于当前运行主链路 |
 | `feed.video.events` | video rpc (outbox) | feed_timeline | 视频发布/删除 → Timeline 扇出 |
 | `social.follow.events` | social rpc (outbox) | social_sync + feed_timeline | 关注/取关缓存 & Timeline 回填 |
 | `notification.events` | 多方 rpc (outbox) | **notification** | 系统通知（关注/点赞/评论） |
@@ -581,10 +584,10 @@ stateDiagram-v2
 所有返回给前端的 `likes_count`（点赞、取消点赞、批量查询、详情）都走同一个函数 `realtimeLikesCount`：
 
 ```
-likes_count = MySQL videos.likes_count（基准值） + HGET fsz:video:delta:like {video_id}（Redis 未落库增量）
+likes_count = MySQL videos.likes_count（基准值） + HGET fsz:video:like_delta {video_id}（Redis 未落库增量）
 ```
 
-即**基准值 + 全局实时增量**，`pending / acked` 只是"这个 eventID 有没有被算过 delta"的幂等标记，**不参与读侧求和**，作用是让 Redis 里的 `delta:like` 无论乱序 / 重试都恰好等于 "已在 Redis 记账、还没被 MySQL 聚合走" 的净增量。
+即**基准值 + 全局实时增量**，`pending / acked / pending_count` 不直接参与读侧求和，作用是让 Redis 里的 `like_delta` 无论乱序 / 重试都最终等于“已在 Redis 记账、还没被 MySQL 聚合走”的净增量。
 
 **⚠️ 前端点完赞返回的是"当前视频总点赞数"，不是"旧值 + 1"**。举例：
 
@@ -598,7 +601,7 @@ likes_count = MySQL videos.likes_count（基准值） + HGET fsz:video:delta:lik
 
 这样做的原因：
 - 如果只做"前端本地 +1"，A 看到 101，下次刷新突然跳到 103，会出现**闪跳/回退**；
-- 直接返回全局实时值，虽然可能一点就跳过 +1（因为并发别人也点了），但**保证单调递增、不闪跳**、且和后续任何一次读接口读到的值一致。
+- 直接返回全局实时值，虽然可能一次跳过 +1（因为同时有其他互动），但它和后续详情/列表接口使用同一套“基准 + delta”公式，不会因切换接口而重复加算。
 
 **兜底**：若 MySQL 事务已提交但 Redis 写 delta 失败（Redis 抖动），走 `fallbackLikesCount = 提交前读到的值 + 1`，保证**永远不会返回一个比操作前更小的数字**（见 `LikeVideo` 第 120、244 行）。
 
@@ -608,9 +611,16 @@ likes_count = MySQL videos.likes_count（基准值） + HGET fsz:video:delta:lik
 2. 事务提交后，调用 `applyRedisLikeState(eventID, ...)`：
    - Lua 脚本 `applyInteractionDeltaScript` 一次性 SET `fsz:interaction:delta:pending:{eventID} NX EX`；若已存在 pending / ack 则跳过（自然幂等）。
    - 同一个 Lua 内 HINCRBY `video.like_delta / comment_delta / popularity_delta`，并 DEL `VideoStatsCacheKey`。
-3. Kafka Consumer 消费到同一 eventID：先 UPSERT MySQL 基准计数。
-4. `FlushLikeEvents` / `FlushCommentEvents` 在 MySQL COMMIT 后按 eventID 批量 ack：
+3. Kafka Consumer 按 `topic+partition` 分组，组内保序、组间最多 4 个 worker 并发；默认每 500 条调用一次 Flush RPC。
+4. `FlushLikeEvents` / `FlushCommentEvents` 把一个 RPC 批次放进同一个 MySQL 事务：
+   - 按 `event_id` 排序写 `processed_events`，唯一键保证 at-least-once 消费幂等；
+   - 只累计首次插入的事件，按 `video_id` 合并净增量；
+   - 按 `video_id` 升序更新 `videos`，减少多事务锁序反转和死锁；
+   - 视频已经删除时仍提交 `processed_events`，避免无意义历史消息永久重试。
+5. MySQL COMMIT 后按 eventID 批量 ack Redis：
    - Lua 脚本 `acknowledgeInteractionDeltaScript` ：若 ack 已存在→不重复；否则→若 pending 存在则 HINCRBY 回写 delta、DEL pending；SET ack EX、DEL `VideoStatsCacheKey`、INCR `LikeUserVideosListVersionKey` 或 `CommentListVersionKey`。
+
+**Flush 与统计重建的并发关系**：普通在线互动写入和多个 Flush 批次使用 Redis ZSET 共享租约，可以并发执行；`RebuildVideoInteractionStats` 先取得独占重建锁，阻止新租约进入，再等待已有租约排空后重建。这样既消除了旧版 Flush 全局串行锁，又避免重建快照覆盖并发增量。
 
 **为什么需要 pending/ack**？旧方案采用 “Job 参照 processed_events 判算重复，只对首次成功事件 ‘减回’ Redis delta”，一旦遇到 “DB 提交了但 Redis 减回失败” 的小概率中断窗口，重试时会因 processed_events 已存在而直接跳过 Redis，造成 delta 永久多算。pending/ack 双标记把“写进实时增量”与“确认实时增量已入库”拆成两步，无论在线请求与 Consumer 谁先 谁后、重试多少次，都能在 Lua 层自然幂等。
 
@@ -624,7 +634,7 @@ sequenceDiagram
     participant DB as MySQL
     participant J as interaction_sync Job<br/>(Kafka consumer)
 
-    Note over R: Key 说明<br/>· pending:{eventID}  在线已写、尚未落库<br/>· acked:{eventID}    事件已完成 MySQL 聚合<br/>· delta:like / delta:comment / delta:popularity  实时增量
+    Note over R: Key 说明<br/>· pending:{eventID}  在线已写、尚未落库<br/>· acked:{eventID}    事件已完成 MySQL 聚合<br/>· video:like_delta / comment_delta / popularity_delta  实时增量
 
     rect rgba(100, 149, 237, 0.15)
       Note over O,R: 场景 A：在线请求先，consumer 后（正常时序）
@@ -669,7 +679,7 @@ sequenceDiagram
     participant K as Kafka
     participant IS as interaction_sync Job
 
-    U->>G: POST /interaction/like { video_id }
+    U->>G: POST /interaction/video/{video_id}/like
     G->>I: LikeVideo(user_id=JWT.uid, video_id)
     I->>R: SETNX fsz:like:lock:{u}:{v}  (3s，防重复点击)
     I->>DB: BEGIN
@@ -679,20 +689,19 @@ sequenceDiagram
     I->>DB: COMMIT
 
     Note over I,R: Lua applyInteractionDeltaScript（原子）
-    I->>R: 若 fsz:interaction:delta:acked:{eventID} 存在 → 跳过<br/>否则 SET pending:{eventID} NX EX 7d<br/>HINCRBY delta:like/popularity<br/>SADD LikeVideoUsers / LikeUserVideos<br/>DEL fsz:video:stats:{v}
+    I->>R: 若 fsz:interaction:delta:acked:{eventID} 存在 → 跳过<br/>否则 SET pending:{eventID} NX EX 7d<br/>INCR pending_count:{videoID}<br/>HINCRBY like_delta/popularity_delta<br/>写点赞状态并 DEL stats cache
     I-->>G: { liked:true, likes_count = DB基准 + Redis delta }
     G-->>U: 200 OK
 
     Note over OB,K: 异步链路
     OB->>K: like.created (event_id=eventID)
-    K->>IS: LikeEvent
+    K->>IS: LikeEvent（按 topic+partition 分组）
 
+    Note over IS,DB: 默认 500 条组成一个 Flush RPC / MySQL 事务
     IS->>DB: BEGIN
-    IS->>DB: INSERT processed_events(eventID, consumer=like_sync) 幂等
-    alt 首次消费
-        IS->>DB: UPDATE videos SET likes_count+=1,<br/>popularity=GREATEST(pop+w,0)
-        IS->>DB: INSERT outbox(video.stat.delta.events)  // 供 hotrank
-    end
+    IS->>DB: 按 event_id 排序 INSERT processed_events（幂等）
+    IS->>DB: 首次事件按 video_id 聚合净增量
+    IS->>DB: 按 video_id 升序 UPDATE videos
     IS->>DB: COMMIT
 
     Note over IS,R: Lua acknowledgeInteractionDeltaScript（原子）
@@ -701,53 +710,35 @@ sequenceDiagram
     Note over I,IS: 两侧无论谁先执行都不会重复计数：<br/>· 在线请求先：pending 建立 → consumer 抵消<br/>· consumer 先：acked 建立 → 在线请求整段跳过
 ```
 
-#### 8.3.1 点赞抗压分析：为什么单机 MySQL 也能扛住万级 QPS
+#### 8.3.1 点赞抗压分析：削峰、批量聚合与可持续吞吐
 
-**问题场景**：热门视频瞬时 1 万人点赞，会不会击穿 MySQL？
-
-**朴素方案的瓶颈**：如果在 RPC 事务里直接 `UPDATE videos SET likes_count += 1 WHERE id = ?`，1 万个事务会**抢同一行的行锁**串行执行，TPS 立刻崩塌到几百。
-
-**当前方案的四层缓冲**：
+朴素方案在每次点赞请求中直接更新 `videos.likes_count`，热门视频会形成单行锁热点。当前实现把用户关系事实与派生计数拆开：在线事务只完成 `likes / interaction_events / outbox_events` 等事实写入，Redis 立即维护用户可见增量；Kafka 消费端再批量更新 `videos` 聚合字段。
 
 ```mermaid
 flowchart TD
-    A[用户点赞洪流 10000 QPS] --> B{Redis 前置锁<br/>fsz:like:lock:v:u SETNX 3s}
-    B -->|同用户 3s 重放| X1[直接拒绝]
-    B -->|通过| C{Redis 状态预判<br/>loadLikeStateFromRedis}
-    C -->|已经点赞过| X2[幂等返回<br/>不进 MySQL]
-    C -->|未点赞| D[MySQL 事务<br/>4 条 INSERT<br/>无行锁热点]
-    D --> E[applyRedisLikeState<br/>HINCRBY delta:like +1<br/>用户立即看到数字变化]
-    E --> F[返回前端]
-    D -.outbox.-> K[Kafka]
-    K --> J[interaction_sync 单消费者<br/>串行 UPDATE videos<br/>批量消化热点行锁]
-    J -.HINCRBY -1.-> R[Redis delta 抵消]
+    A[点赞/取消点赞请求] --> B[Redis 短锁与状态预判]
+    B -->|重复状态| C[幂等返回]
+    B -->|真实变化| D[MySQL 事务<br/>关系事实 + interaction_event + outbox]
+    D --> E[Redis Lua<br/>pending_count + 实时 delta]
+    E --> F[返回 MySQL 基准 + Redis delta]
+    D -.Outbox.-> K[Kafka 多 partition]
+    K --> G[interaction_sync<br/>topic+partition 组内保序、组间并发]
+    G --> H[每 500 条一个批量事务]
+    H --> I[processed_events 幂等<br/>按 video 聚合净增量<br/>按 video_id 升序更新]
+    I --> J[提交后按 eventID ack Redis]
 ```
 
-**为什么能扛住**：
-
-| 缓冲层 | 挡掉什么 | 效果 |
+| 层次 | 机制 | 解决的问题 |
 |---|---|---|
-| **①** `fsz:like:lock:{v}:{u}` SETNX 3s | 同用户 3 秒内的连点、脚本刷 | 脏流量被挡在 MySQL 之前 |
-| **②** `fsz:like:state:{v}:{u}` 状态预判 | 已经点过赞的重复请求 | 直接从 Redis 返回，不进事务 |
-| **③** RPC 事务里**只有 INSERT** | 行锁抢占 | 4 条 INSERT 主键各不相同，天然并发，无热点行 |
-| **④** `UPDATE videos +=1` 推迟到 Kafka 消费者 | 热点行锁 | 从"1 万事务抢同一行"变成"1 个 consumer 顺序 UPDATE"，行锁竞争天然消失 |
+| 请求入口 | 用户+视频短锁、Redis 状态缓存 | 连点与重复状态不进入 MySQL |
+| 在线事务 | 关系事实与 Outbox 同事务 | 不丢事件，避免直接争抢视频计数行 |
+| 实时读侧 | MySQL 基准 + Redis 未落库净增量 | Consumer 有延迟时计数仍实时 |
+| Kafka | 6 partition、at-least-once | 削峰、重放、横向扩展 |
+| Consumer | partition 内保序、最多 4 worker 并发 | 保序与吞吐兼顾 |
+| Flush RPC | 500 事件/事务、按视频聚合 | 显著减少事务提交和热点行 UPDATE 次数 |
+| 幂等与恢复 | `processed_events` + pending/acked/pending_count | 重复消费与 DB 提交后 Redis ack 中断可恢复 |
 
-**核心巧思：`videos.likes_count` 的 UPDATE 完全不在 RPC 事务里做**
-
-查阅 `LikeVideo` 事务代码可以看到，事务里**只有 4 条 INSERT**（likes / interaction_events / outbox 领域事件 / outbox 通知事件），**没有** `UPDATE videos SET likes_count += 1`。真正的 UPDATE 被推迟到 `interaction_sync` job 里做 —— 而这个 job 是**单消费者按 Kafka partition 顺序处理**，天然把行锁竞争串行化。
-
-**读侧不受写侧堆积影响**：即使 consumer 落库慢了 5 秒，前端读到的点赞数依然是 `MySQL 基准 + Redis delta`，delta 由 Redis HINCRBY 承接（单机 10w+ QPS）、用户完全无感。
-
-**当前架构能扛的量级估算**：
-
-| 环节 | 单机瓶颈 | 备注 |
-|---|---|---|
-| Redis SETNX + HINCRBY | 10w+ QPS | 单 key 不热的话 |
-| MySQL 4 条 INSERT/事务 | 5000~10000 QPS | SSD + binlog fsync 允许 |
-| Kafka Producer | 万级 QPS | 分区并发 |
-| interaction_sync UPDATE videos | 单视频串行 | 若单视频过热需按分区隔离 |
-
-**结论**：**单机 MySQL 也能扛住万级点赞 QPS**，真正的百万级瞬时热点（春晚点赞）需要额外做 likes 分库分表 / Redis delta HASH 分片 / 热点 partition 隔离。
+**不要宣称“单机已经支持万级 QPS”**。本项目的可信结论来自 §14.6 的本机压测：正式数据集为 10000 用户、5000 视频；点赞场景最终达到约 `260.4 次业务循环/s`，每个循环包含 Like+Unlike 两个写请求，即约 `520.8 HTTP 写请求/s`，并在压测结束约 7 秒后把 Kafka lag 完全排空。该结果证明的是当前单机开发环境下约 500 事件/s 的可持续闭环，而不是生产集群上限。
 
 ---
 
@@ -1074,80 +1065,40 @@ flowchart TD
 
 ### 8.7 HotRank 热榜模块
 
-**职责**：消费 `video.stat.delta.events`（点赞增量、评论增量、播放增量），维护滚动窗口的热度 ZSet。
+**职责**：以独立 Consumer Group 直接消费 `interaction.like.events` 和 `interaction.comment.events`，将每条互动按发生时间写入 UTC 单分钟热度窗口；Feed 读侧把最近 N 个窗口按时间衰减合并成稳定分页快照。
 
 **核心机制**：
 
-- **多窗口**：60min / 6h / 24h 三个滑动窗口的 ZSet（不同 key）。
-- **原子操作**：`ZINCRBY hot:window:60m {videoID} delta_score`。
-- **窗口滚动**：定时删除窗口外的数据（Redis 惰性淘汰 + Job 兜底扫描）。
-- **热度公式**：`score = w1*likes + w2*comments + w3*plays + time_decay`。
+- 点赞权重为 `3`，评论权重为 `5`；取消点赞/删除评论写入对应负分。
+- 每分钟一个 ZSET：`fsz:hot:window:{yyyyMMddHHmm}`，member=videoID，score=该分钟净热度。
+- Redis Lua 在同一原子块中写 `ProcessedEventKey(eventID, hotrank)` 与 `ZINCRBY`，Kafka 重放不会重复计分。
+- 消息按 `topic+partition` 分组，组内保序、组间默认 4 worker 并发；坏消息进入 `dead_letter_events`。
+- 分钟窗口默认保留 2 小时；超过保留期的旧消息只写幂等标记，不复活过期窗口。
+- `GetHotFeed` 默认聚合最近 60 个分钟窗口，按 30 分钟半衰期加权，通过临时 ZSET + Lua 校验锁 + `RENAME` 原子发布快照。
+- 快照 key 为 `fsz:hot:merge:{asOf}`，`ready` key 即使值为 0 也表示“已成功构建空榜”，避免缓存穿透。
 
 ```mermaid
 flowchart LR
-    A[interaction_sync] -->|LikeEvent 落库后| B[Produce video.stat.delta.events]
-    B --> K[Kafka]
-    K --> H[hotrank Job]
-    H --> H1[计算 delta_score]
-    H --> R1[ZINCRBY hot:window:60m]
-    H --> R2[ZINCRBY hot:window:6h]
-    H --> R3[ZINCRBY hot:window:24h]
-    H --> D[INSERT processed_events]
+    I[Interaction RPC<br/>Outbox] --> K[Kafka<br/>like/comment events]
+    K --> H[hotrank Job<br/>独立 Consumer Group]
+    H --> L[Redis Lua<br/>事件幂等 + ZINCRBY]
+    L --> W[UTC 单分钟窗口 ZSET]
 
-    F[Feed.GetHotFeed] --> R1
-    F --> R2
-    F --> R3
+    F[Feed.GetHotFeed] --> C{snapshot ready?}
+    C -->|是| S[读取固定 merge 快照]
+    C -->|否| SF[本地 SingleFlight]
+    SF --> DL[Redis 分布式构建锁]
+    DL --> ZU[ZUNIONSTORE<br/>最近 60 分钟 + 衰减权重]
+    ZU --> TMP[临时 ZSET 只保留 Top K]
+    TMP --> P[Lua 校验锁并原子发布<br/>merge + ready]
+    P --> S
 ```
 
-Feed.GetHotFeed 直接 `ZREVRANGE hot:window:{scope}` 获取 top 视频，Gateway 再聚合 video / account 信息。
+#### 8.7.1 为什么使用分钟窗口 + 固定快照
 
-#### 8.7.1 设计取舍：为什么不实时算 top？
+直接按 `videos.popularity` 全表排序无法表达时间窗口，而且数据量增长后排序成本高。分钟窗口让写入只做一次 `ZINCRBY`，读侧再通过 `ZUNIONSTORE` 合并有限窗口；同一个 `snapshot_at` 只构建一次并缓存 30 分钟，后续分页始终读取同一份榜单，不会因新互动导致翻页重复或遗漏。
 
-**朴素方案**：`SELECT videos ORDER BY (likes*w1 + comments*w2 + plays*w3) DESC LIMIT 100`
-
-**问题**：
-- 全表排序 → 视频量涨到百万级直接跑不动
-- 权重公式变化要重扫全表
-- 无法做时间衰减 / 滚动窗口
-
-**当前方案**：**基于事件流的增量维护 ZSet**
-
-- 所有点赞/评论/播放事件通过 `video.stat.delta.events` 汇入 hotrank
-- Job 端只做一件事：`ZINCRBY hot:window:60m {videoID} delta_score`
-- 读时 `ZREVRANGE 0 99`，**O(log N + 100)** 就返回 top100
-
-**多窗口的意义**：
-
-| 窗口 | 用途 |
-|---|---|
-| 60min | "实时热榜"，反映当下爆点 |
-| 6h | "半日热榜"，抹平短时刷分 |
-| 24h | "日榜"，稳定长热视频 |
-
-**滚动窗口的实现**：不采用"每次事件都判断视频是否过期"这种昂贵方案，而是：
-
-- 事件到达时 `ZINCRBY` 无脑加分（不检查视频是否在窗口内）
-- Job 定时扫描（例如每分钟一次）删除窗口外的 member：`ZREM hot:window:60m {expired_videoIDs}`
-- 读时 `ZREVRANGE 0 99`，即使窗口外的视频还没被清也没关系，因为**它们分数会随时间衰减到接近 0**
-
-**热度衰减**：`score = w1*likes + w2*comments + w3*plays + time_decay`。`time_decay` 用发布时间到当前的负指数计算，越老的视频权重越低，即使新增互动也很难冲到榜前。
-
-**为什么不把热度算在 videos 表的 `popularity` 列，用 `ORDER BY popularity DESC`？**
-
-- `popularity` 是**累计值**（没有时间衰减），一个几年前的爆款视频会永远霸榜
-- MySQL `ORDER BY popularity DESC LIMIT 100` 在百万级视频量下 sort 成本很高
-- Redis ZSet 的 skiplist 是**天然的有序结构**，`ZREVRANGE 0 99` 就是 O(log N + 100)，比 MySQL 快几个数量级
-
-**HotRank 抗压分析**：
-
-| 环节 | QPS 能力 | 说明 |
-|---|---|---|
-| Kafka `video.stat.delta.events` 消费 | 万级 | 事件量 ≈ 点赞+评论+播放事件之和 |
-| Redis ZINCRBY × 3 窗口 | 10w+ QPS | 单 key 热点问题存在但 60min/6h/24h 是 3 个 key，压力有分摊 |
-| Feed.GetHotFeed 读取 | 10w+ QPS | ZREVRANGE 是纯读，可以多副本水平扩展 |
-| Job 定时扫窗口外元素 | 无压力 | 每分钟一次 ZREM 少量元素 |
-
-**极端热点情况**：如果单个视频每秒被点赞几万次，`ZINCRBY hot:window:60m` 单 key 会成为热点，可以按 `hash(videoID) % N` 分片成多个 ZSet，读时 `ZUNIONSTORE` 合并（当前项目未实现该分片，属于千万级 DAU 才需要的优化）。
+缓存命中与冷构建的本机实测见 §14.6：50 并发下，已构建快照约 7503.4 QPS；删除 merge 快照后触发构建约 1428.1 QPS，构建结束 `ready=50` 且 `ZCARD=50`。这说明热榜读性能来自预聚合快照，同时冷启动路径也能正确闭环。
 
 ---
 
@@ -1201,6 +1152,14 @@ flowchart TD
     L -->|是| M[事务后副作用:<br/>Redis / 二次 Produce]
     L -->|失败| N[retry_count++ → 死信旁路]
 ```
+
+`interaction_sync` 在此通用模型上做了专门的吞吐优化：
+
+1. 一批 Kafka 消息先按 `topic+partition` 分组；同一组内严格顺序执行，不同组最多由 4 个 worker 并发。
+2. 默认收集 500 条事件后调用 Flush RPC；Flush RPC 不是逐事件开事务，而是一个批次一个事务。
+3. 事务内按 `event_id` 固定幂等表加锁顺序，再按 `video_id` 聚合净增量并升序更新视频行。
+4. `Aborted / Unavailable / DeadlineExceeded / ResourceExhausted` 属于基础设施临时错误，在当前 partition worker 内退避重试；格式错误和业务坏消息有限重试后进入死信。
+5. Flush RPC 的批量请求体不写入普通访问日志，避免数百条事件反复序列化并占满日志磁盘；统计、慢调用和错误日志仍保留。
 
 ### 9.3 feed_timeline Job 特殊设计
 
@@ -1355,6 +1314,8 @@ sequenceDiagram
 | | `fsz:video:like_delta` / `comment_delta` / `popularity_delta` | 互动增量 HASH，field=videoID | 长期 |
 | | `fsz:interaction:delta:pending:{eventID}` | 实时增量已写 Redis、尚未确认落库 | 7 天 |
 | | `fsz:interaction:delta:acked:{eventID}` | 事件已完成 MySQL 聚合并处理过 delta | 7 天 |
+| | `fsz:interaction:delta:pending_count:{videoID}` | 该视频尚未被 Consumer ack 的事件数；归零时清理残留 delta | 随 pending 收敛删除 |
+| | `fsz:job:leases:interaction:stats_mutations` | 在线互动与 Flush 的共享租约 ZSET，和统计重建独占锁互斥 | 单租约 30 秒 |
 | | `fsz:comment:list:version:{videoID}` | 评论列表版本号 | 长期 |
 | | `fsz:comment:first:{videoID}:{version}` | 评论首页固定窗口缓存 | 短 |
 | | `fsz:comment:idempotency:{userID}:{requestID}` | 评论发布幂等键，value=commentID | 24 小时 |
@@ -1362,8 +1323,9 @@ sequenceDiagram
 | | `fsz:feed:author_outbox:{authorID}` | 大 V outbox ZSet | 30 天 |
 | | `fsz:feed:global_timeline` | 全局最新视频 ZSet | 长期 |
 | | `fsz:feed:timeline:build_lock:{userID}` | 冷启动构建锁 | 10 秒 |
-| **HotRank** | `fsz:hot:video:realtime` | 实时热榜 ZSet | 长期 |
-| | `fsz:hotrank:window:60m` / `6h` / `24h` | 三个滚动窗口 ZSet | 各自窗口长 |
+| **HotRank** | `fsz:hot:video:realtime` | Interaction 在线路径维护的累计实时热度 | 长期 |
+| | `fsz:hot:window:{yyyyMMddHHmm}` | HotRank Consumer 维护的 UTC 单分钟净热度 ZSet | 默认 2 小时 |
+| | `fsz:hot:merge:{asOf}` / `:ready` | Feed 合并最近窗口得到的固定分页快照及完成标记 | 默认 30 分钟 |
 | **Notification** | `fsz:notification:unread:version:{userID}` | 未读数缓存版本号 | 永久 |
 | | `fsz:notification:unread:count:{userID}:v:{version}` | 未读数值缓存 | 5 分钟±抖动 |
 | **ChunkUpload** | `fsz:chunkupload:meta:{uploadID}` / `set:{uploadID}` | 分片会话元数据/已上传分片集合 | 24 小时 |
@@ -1408,17 +1370,16 @@ flowchart TD
 | 并发 profile 更新 | `INCR version` 原子 |
 | 并发未读数 bump | Lua 脚本 `INCR + DEL 旧 v key` 原子 |
 | 并发互动 delta 与 Job 同时写 | Lua `applyInteractionDeltaScript` 判 pending/ack，同一 eventID 只入算一次 |
+| 在线互动 / 多 Flush 与统计重建 | 普通写入登记共享 ZSET 租约；重建先关闭入口再等待租约排空，避免全局串行和快照覆盖 |
 | 并发 asset_cleanup 与秒传 | `Cleaning` 状态 + 行锁、Gateway 遇 Cleaning 必须等待，不允许直接回改 |
 | 并发 asset_cleanup 实例运行 | `ClaimTimeoutSeconds` + 事务内 `SELECT FOR UPDATE`，旧抢占者崩溃后自动释放 |
 | MySQL 连接风暴 | `common/gormx` 默认 `MaxIdle=5 / MaxOpen=10`，可通过 `FSZ_MYSQL_*` 环境变量覆盖 |
 
-### 12.4 计数字段防负
+### 12.4 计数更新与非负展示
 
-所有减一场景使用 `GREATEST(x-1, 0)` 保护，避免竞态导致负值：
-
-```sql
-UPDATE accounts SET follower_count = GREATEST(follower_count - 1, 0) WHERE id = ?
-```
+- 关注数等强同步计数仍使用 `GREATEST(x-1, 0)`，避免重复取关把字段减成负数。
+- 点赞数、评论数、热度的 Kafka 聚合必须保留**有符号增量**，使用普通 `column + delta`。原因是不同 partition、重试或人工重放可能让 `-1` 先于 `+1` 到达；若每一步都截断为 0，最终会错误收敛到 1。
+- 用户读侧统一通过 `nonNegative` 截断展示值；定期/人工 `RebuildVideoInteractionStats` 从 `likes/comments` 事实表重建聚合字段，作为最终校准手段。
 
 ---
 
@@ -1480,9 +1441,9 @@ docker-compose up -d
 ### 14.2 建库与建表
 
 ```bash
-# SQL 通过 docker-entrypoint-initdb.d 首次启动自动执行 001~015
+# SQL 通过 docker-entrypoint-initdb.d 首次启动自动执行 001~016
 # 手动重跑单条：
-docker exec -i feedsystem-zero-mysql mysql -uroot -p123456 feedsystem_zero < deploy/sql/015_account_big_v_flag.sql
+docker exec -i feedsystem-zero-mysql mysql -uroot -p123456 feedsystem_zero < deploy/sql/016_outbox_aggregate_status_index.sql
 ```
 
 ### 14.3 建 Kafka Topic
@@ -1533,6 +1494,144 @@ cd apps/gateway
 goctl api go -api gateway.api -dir . --style=goZero
 ```
 
+### 14.6 测试、压测与一致性验收（2026-08-03）
+
+#### 14.6.1 验证范围与结论
+
+本轮验证覆盖 Gateway → RPC → MySQL/Redis → Outbox → Kafka → Job → MySQL/Redis 的后端闭环，包括：
+
+- 发布视频、点赞/取消点赞、关注、关注流、热榜五个 HTTP 压测场景；
+- Outbox 全部投递、四类 Kafka Consumer Group lag、互动 Redis 增量收敛；
+- 视频互动聚合、社交冗余计数、文件资产引用计数三类 MySQL 对账；
+- 互动同步批量事务、并发租约和临时 RPC 重试的单元测试、`-race` 与 `go vet`。
+
+**结论**：本次互动同步优化和现有后端压测集已经完成，最终没有未投递 Outbox、互动死信、Kafka lag、Redis 残留增量或 MySQL 聚合差异。严格意义上的全项目 E2E 尚有一个环境型例外：`tests/e2e/TestSmoke` 使用 `@loadtest.local` 虚构邮箱，真实 163 SMTP 会拒绝发送验证码；业务包测试不受影响。要让该用例全绿，需要给测试环境注入假邮件发送器，或使用可接收邮件的测试账号。
+
+#### 14.6.2 构造正式规模数据
+
+```bash
+# 只清理 seed/loadtest 数据和 fsz:* 派生缓存，不删除真实用户上传文件
+go run ./tests/cmd/seed \
+  -reset \
+  -reset-redis \
+  -users 10000 \
+  -videos 5000 \
+  -file-buckets 100
+```
+
+正式测试数据为 **10000 个用户 + 5000 个视频**。压测工具从这些数据中抽取登录池和目标池，不把造数耗时计入请求指标。
+
+#### 14.6.3 功能与读场景压测结果
+
+以下结果来自同一台本地开发机，所有依赖和服务都运行在单机，数据用于版本内回归和架构瓶颈分析，不能直接等同于生产集群容量。
+
+| 场景 | 参数 | 成功率 | QPS | P50 | P95 | P99 | Max |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 发布视频 | `c=5,d=10s,login=20` | 100% | 318.7 | 15ms | 20ms | 24ms | 53ms |
+| 点赞冒烟 | `c=10,d=10s,login=20,target=100` | 100% | 327.7 | 29ms | 40ms | 47ms | 60ms |
+| 关注 | `c=10,d=10s,login=20,target=100` | 100% | 354.7 | 26ms | 43ms | 54ms | 101ms |
+| 关注流 | `c=20,d=30s,login=50` | 100% | 1076.8 | 17ms | 25ms | 30ms | 49ms |
+| 热榜（缓存命中） | `c=50,d=30s` | 100% | 7503.4 | 5ms | 13ms | 16ms | 32ms |
+| 热榜（删除 merge 后重建） | `c=50,d=30s` | 100% | 1428.1 | 34ms | 46ms | 54ms | 82ms |
+
+热榜冷构建压测结束后，`fsz:hot:merge:{minute}:ready=50` 且对应 ZSET `ZCARD=50`，证明低 QPS 不是空缓存错误，而是请求触发聚合构建后的真实成本。
+
+#### 14.6.4 点赞链路正式规模优化前后对比
+
+复现命令：
+
+```bash
+go run ./tests/cmd/loadtest \
+  -scenario like \
+  -c 50 \
+  -d 60s \
+  -warmup 5s \
+  -login-pool 500 \
+  -target-pool 2000 \
+  -v
+```
+
+`like` 场景的一次统计循环包含一次 Like 和一次 Unlike，因此 `循环 QPS × 2` 才接近 HTTP 写请求数和互动事件生产速率。
+
+| 指标 | 优化前：逐事件事务 + Flush 全局串行 | 优化后：500 条批量事务 + partition 并发 |
+|---|---:|---:|
+| 总循环数 | 19955 | 15663 |
+| 成功率 | 100% | 100% |
+| 业务循环 QPS | 332.0 | 260.4 |
+| 约合 HTTP 写请求/事件生产速率 | 约 664/s | 约 520.8/s |
+| P50 / P95 / P99 | 143 / 236 / 291ms | 182 / 307 / 374ms |
+| Max | 443ms | 570ms |
+| 压测结束时 Kafka 表现 | 积压超过 3 万，需数分钟排空 | 约 7 秒排空 |
+| 最终 Kafka lag | 0 | 0 |
+
+不能只看“优化前 332 QPS 高于优化后 260.4 QPS”就判断退化。优化前的在线接口把大量未完成工作堆进 Kafka，属于**不可持续的生产速度**；优化后 Consumer 在压测期间同时争用本机 MySQL/Redis 并持续完成约 470～500 事件/s，尾部仅约 7 秒。后者反映的是更真实的端到端可持续吞吐。
+
+这次优化的关键点：
+
+1. 从每事件一个事务改为每 500 事件一个事务，大幅减少事务提交次数。
+2. `processed_events` 按 eventID 固定顺序写入，视频计数按 videoID 聚合并升序更新，降低死锁概率。
+3. 移除 Flush 全局串行锁，改为普通写共享租约 + 统计重建独占锁。
+4. Consumer 按 topic+partition 分组，组内保序、组间最多 4 worker 并发。
+5. DB 失败让整个 Kafka 批次重试；格式/业务坏消息有限重试后进死信；DB COMMIT 后才 ack Redis。
+
+#### 14.6.5 最终一致性检查
+
+压测停止并等待 Consumer 排空后，验收结果如下：
+
+| 检查项 | 最终值 | 判定 |
+|---|---:|---|
+| `outbox_events WHERE status <> 2` | 0 | 全部投递成功 |
+| interaction `dead_letter_events` | 0 | 无互动坏消息/永久失败 |
+| `interaction-sync-job` Kafka lag | 0 | 点赞事件全部消费 |
+| `feed-timeline-job` Kafka lag | 0 | Feed 事件全部消费 |
+| `hotrank-job` Kafka lag | 0 | 热榜事件全部消费 |
+| `notification-job` Kafka lag | 0 | 通知事件全部消费 |
+| Redis like/comment/popularity delta HLEN | 0 / 0 / 0 | 实时增量已全部落库并抵消 |
+| Redis pending / pending_count key 数 | 0 / 0 | 无未确认事件 |
+| `video_stats_mismatches` | 0 | videos 聚合值与 likes/comments 事实表一致 |
+| `social_counter_mismatches` | 0 | accounts 粉丝/关注冗余计数一致 |
+| `asset_ref_mismatches` | 0 | file_assets 引用计数一致 |
+| 活跃互动统计租约 | 0 | 无泄漏的并发租约 |
+
+常用运行态检查：
+
+```bash
+# Outbox 是否仍有未投递记录；无输出即通过
+sudo docker exec feedsystem-zero-mysql \
+  mysql -uroot -p123456 feedsystem_zero \
+  -e "SELECT topic,status,COUNT(*) count FROM outbox_events WHERE status<>2 GROUP BY topic,status;"
+
+# interaction_sync 各 partition 的 CURRENT-OFFSET 应等于 LOG-END-OFFSET，LAG=0
+sudo docker exec feedsystem-zero-kafka kafka-consumer-groups \
+  --bootstrap-server 127.0.0.1:9092 \
+  --group interaction-sync-job --describe
+
+# 三个 HLEN 和两类 SCAN 计数最终都应为 0
+sudo docker exec feedsystem-zero-redis redis-cli -a 123456 HLEN fsz:video:like_delta
+sudo docker exec feedsystem-zero-redis redis-cli -a 123456 HLEN fsz:video:comment_delta
+sudo docker exec feedsystem-zero-redis redis-cli -a 123456 HLEN fsz:video:popularity_delta
+```
+
+#### 14.6.6 代码质量验证
+
+```bash
+go test -race -count=1 \
+  ./apps/interaction/internal/logic \
+  ./apps/job/outbox/internal/logic \
+  ./apps/job/interaction_sync/internal/logic \
+  ./apps/job/hotrank/internal/logic \
+  ./apps/job/notification/internal/logic \
+  ./apps/job/feed_timeline/internal/logic \
+  ./apps/social/internal/logic \
+  ./apps/video/internal/logic \
+  ./apps/feed/internal/logic \
+  ./tests/internal/loadgen
+
+go vet ./apps/... ./common/... ./tests/...
+```
+
+上述 `-race` 包全部通过，静态检查无输出。针对本次改动的 interaction / interaction_sync / rediskey 测试也已单独重复执行并通过。
+
 ---
 
 ## 十五、约定与最佳实践
@@ -1578,6 +1677,7 @@ goctl api go -api gateway.api -dir . --style=goZero
 | **推拉分离扇出** | `apps/job/feed_timeline/internal/logic/timelinewriter.go` |
 | **feed_timeline Consumer** | `apps/job/feed_timeline/internal/logic/consumer.go` |
 | **互动同步 Consumer** | `apps/job/interaction_sync/internal/logic/syncconsumer.go` |
+| **互动批量刷库与并发租约** | `apps/interaction/internal/logic/jobhelper.go`、`flushlikeeventslogic.go`、`flushcommenteventslogic.go`、`rebuildvideointeractionstatslogic.go` |
 | **互动 delta pending/ack** | `apps/interaction/internal/logic/interactionhelper.go`、`apps/interaction/internal/logic/jobhelper.go`（`applyInteractionDeltaScript` / `acknowledgeInteractionDeltaScript`） |
 | **关注同步 Consumer** | `apps/job/social_sync/internal/logic/syncconsumer.go` |
 | **热榜 Consumer** | `apps/job/hotrank/internal/logic/consumer.go` |
@@ -1587,12 +1687,28 @@ goctl api go -api gateway.api -dir . --style=goZero
 | **Gateway 路由契约** | `apps/gateway/gateway.api` |
 | **Gateway JWT 中间件** | `apps/gateway/internal/middleware/tokenauthmiddleware.go` |
 | **Gateway 通知聚合** | `apps/gateway/internal/logic/notificationhelper.go` |
-
----
+| **造数与 HTTP 压测** | `tests/cmd/seed/main.go`、`tests/cmd/loadtest/main.go`、`tests/internal/{seed,scenario,loadgen}` |
 
 ---
 
 ## 十七、最近更新（Changelog）
+
+### 2026-08-03（互动同步吞吐优化与正式规模验收）
+
+**Interaction / interaction_sync**：
+
+- Flush 从“每事件一个事务”改为“最多 500 事件一个批量事务”；`processed_events` 按 eventID 排序，首次事件按 videoID 聚合净增量并升序更新。
+- Consumer 按 `topic+partition` 分组，组内保序、组间 4 worker 并发；临时 RPC 错误在分区 worker 内退避重试，避免成功分区被整批重复消费。
+- 删除点赞/评论 Flush 的全局串行锁，增加 `fsz:job:leases:interaction:stats_mutations` 共享租约；统计重建采用独占入口锁并等待已有租约排空。
+- `pending_count:{videoID}` 成为独立收敛不变量：最后一个事件 ack 后清理对应视频残留 delta，修复高并发交错或历史中断遗留字段。
+- Flush 批量 RPC 忽略普通请求体访问日志，保留指标、慢调用和错误日志，避免大批次日志放大。
+
+**测试与文档**：
+
+- 完成 10000 用户、5000 视频正式规模压测；优化后点赞链路 100% 成功，约 520.8 HTTP 写请求/s，Kafka 在压测结束约 7 秒后排空。
+- Outbox 未投递、互动死信、Kafka lag、Redis delta/pending、视频统计差异、社交计数差异、文件引用差异最终全部为 0。
+- 关键包通过 `go test -race`，静态检查无输出；新增批量边界、重试、租约脚本和 Redis 收敛不变量测试。
+- §8.3、§9.2、§11、§12、§14.6 已同步当前代码与实测结果，删除“单消费者逐条更新”和“单机万级 QPS”等无法由实测支持的旧结论。
 
 ### 2026-07-30（commit 687d0ab · 完善后端一致性与文件资产清理）
 

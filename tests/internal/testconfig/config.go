@@ -41,10 +41,16 @@ const (
 
 // SeedFlags collects every knob the seed tool exposes.
 type SeedFlags struct {
-	MysqlDSN string
-	Users    int
-	Videos   int
-	Reset    bool
+	MysqlDSN  string
+	RedisAddr string
+	RedisPass string
+	RedisDB   int
+	Users     int
+	Videos    int
+	Reset     bool
+	// ResetRedis removes only feedsystem-zero keys (fsz:*). It is intentionally
+	// opt-in because clearing token/cache state logs local test users out.
+	ResetRedis bool
 	// VideoTimeSpanDays spreads created_at over the past N days so cursor
 	// pagination and hot-rank recency weighting behave realistically.
 	VideoTimeSpanDays int
@@ -57,9 +63,13 @@ type SeedFlags struct {
 // RegisterSeedFlags binds SeedFlags fields to a flag.FlagSet.
 func RegisterSeedFlags(fs *flag.FlagSet, f *SeedFlags) {
 	fs.StringVar(&f.MysqlDSN, "mysql", DefaultMysqlDSN, "MySQL DSN")
+	fs.StringVar(&f.RedisAddr, "redis", DefaultRedisAddr, "Redis address")
+	fs.StringVar(&f.RedisPass, "redis-pass", DefaultRedisPass, "Redis password")
+	fs.IntVar(&f.RedisDB, "redis-db", DefaultRedisDB, "Redis database")
 	fs.IntVar(&f.Users, "users", 10000, "number of seed users to create")
 	fs.IntVar(&f.Videos, "videos", 5000, "number of seed videos to create")
-	fs.BoolVar(&f.Reset, "reset", false, "delete existing seed_* data before inserting new rows")
+	fs.BoolVar(&f.Reset, "reset", false, "delete existing seed/loadtest business data before inserting new rows")
+	fs.BoolVar(&f.ResetRedis, "reset-redis", false, "with -reset, delete feedsystem-zero Redis keys (fsz:*)")
 	fs.IntVar(&f.VideoTimeSpanDays, "video-span-days", 30, "distribute video created_at over the past N days")
 	fs.IntVar(&f.FileAssetBuckets, "file-buckets", 20, "how many distinct file_assets rows placeholder videos share")
 }

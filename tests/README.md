@@ -57,8 +57,9 @@ go run ./tests/cmd/seed
 # 自定义规模
 go run ./tests/cmd/seed -users 20000 -videos 8000
 
-# 清空历史 seed 数据后再造（只清 seed_ 前缀数据，业务真实数据不动）
-go run ./tests/cmd/seed -reset
+# 清空历史 seed/loadtest 业务数据及 fsz:* 派生缓存后再造
+# 真实账号、真实视频和真实上传文件不会被删除
+go run ./tests/cmd/seed -reset -reset-redis
 ```
 
 seed 做的事：
@@ -70,7 +71,8 @@ seed 做的事：
 3. 直接 `INSERT videos`，`author_id` 在用户中均匀分布，`created_at` 分布在过去 30 天，
    `likes_count / comments_count` 初始为 0（真实互动由压测阶段产生）。
 
-> ⚠️ seed **不写 Redis / Kafka**，一切派生状态由 job 消费者自然重建；这是最接近生产的初始态。
+> seed 不向 Redis / Kafka 写入派生业务数据；`-reset-redis` 只在重置时删除 `fsz:*` Key。
+> Kafka topic 和消费位点保持不变，新压测事件会从现有位点继续追加和消费。
 
 ---
 

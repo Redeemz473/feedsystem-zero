@@ -16,7 +16,9 @@ import (
 	"feedsystem-zero/common/eventx"
 	"feedsystem-zero/common/rediskey"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/redis/go-redis/v9"
+	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"gorm.io/gorm"
@@ -32,6 +34,9 @@ const (
 	socialListCacheRetryDelay    = 50 * time.Millisecond
 	socialListCacheRetryAttempts = 3
 	maxSocialCursorFutureSkew    = 5 * time.Minute
+	socialDBMaxRetries           = 3
+	socialDBRetryBase            = 20 * time.Millisecond
+	socialDBRetryMax             = 200 * time.Millisecond
 )
 
 const saveFollowListFirstPageCacheScript = `
@@ -64,6 +69,81 @@ func lockFollowAccounts(ctx context.Context, tx *gorm.DB, followerID, followingI
 		return gorm.ErrRecordNotFound
 	}
 	return nil
+}
+
+// runSocialWriteTransaction 对整个关注写事务做有限重试。MySQL 发生 1213 时
+// 已经完整回滚当前事务，因此重新执行关系、计数和 outbox 写入不会留下半状态。
+// 其他错误不重试，避免把约束错误或数据问题伪装成瞬时故障。
+func runSocialWriteTransaction(ctx context.Context, db *gorm.DB, fn func(tx *gorm.DB) error) error {
+	for attempt := 0; ; attempt++ {
+		err := db.WithContext(ctx).Transaction(fn)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableSocialDBError(err) {
+			return err
+		}
+		if attempt >= socialDBMaxRetries {
+			return fmt.Errorf("social事务重试耗尽, retries:%d: %w", socialDBMaxRetries, err)
+		}
+
+		retryNumber := attempt + 1
+		delay := socialDBRetryDelay(retryNumber)
+		logx.WithContext(ctx).Infof(
+			"social事务发生可重试锁冲突, retry:%d/%d delay:%s error:%v",
+			retryNumber,
+			socialDBMaxRetries,
+			delay,
+			err,
+		)
+		if err := waitSocialDBRetry(ctx, delay); err != nil {
+			return err
+		}
+	}
+}
+
+func isRetryableSocialDBError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1213 || mysqlErr.Number == 1205
+}
+
+func socialDBRetryDelay(retryNumber int) time.Duration {
+	delay := socialDBRetryBase
+	for i := 1; i < retryNumber && delay < socialDBRetryMax; i++ {
+		if delay >= socialDBRetryMax/2 {
+			delay = socialDBRetryMax
+			break
+		}
+		delay *= 2
+	}
+	if delay > socialDBRetryMax {
+		delay = socialDBRetryMax
+	}
+	if delay >= socialDBRetryMax {
+		return delay
+	}
+
+	// 最多增加 50% 抖动，避免同一批被回滚请求再次同步争锁。
+	jitterWindow := delay / 2
+	jitter := time.Duration(time.Now().UnixNano() % int64(jitterWindow+1))
+	if delay+jitter > socialDBRetryMax {
+		return socialDBRetryMax
+	}
+	return delay + jitter
+}
+
+func waitSocialDBRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 const releaseSocialCacheLockScript = `

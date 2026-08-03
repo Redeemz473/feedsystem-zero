@@ -3,6 +3,7 @@ package logic
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,6 +12,14 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// orderedFileAssetURLs 为同一事务涉及的资产 URL 提供稳定的加锁顺序。
+// 保留重复 URL，因为视频地址和封面地址即使相同，也代表两个逻辑引用。
+func orderedFileAssetURLs(urls ...string) []string {
+	ordered := append([]string(nil), urls...)
+	sort.Strings(ordered)
+	return ordered
+}
 
 // reserveFileAssetRefByURL 在给定的 db(可以是 *gorm.DB 事务句柄) 内，
 // 将 file_assets 表中 url 对应资产的 ref_count +1。

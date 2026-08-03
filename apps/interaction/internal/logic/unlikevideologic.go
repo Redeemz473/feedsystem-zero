@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strconv"
 	"time"
 
 	"feedsystem-zero/apps/interaction/interaction"
@@ -56,11 +55,17 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 		return nil, status.Error(codes.Internal, "查询视频失败")
 	}
 
-	if err := rejectIfStatsRebuildRunning(l.ctx, l.svcCtx.RedisCli); err != nil {
-		if status.Code(err) == codes.Aborted {
-			return nil, err
-		}
-		l.Errorf("check rebuild stats lock failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+	leaseKey, leaseToken, leaseAcquired, err := acquireInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli)
+	if err != nil {
+		l.Errorf("acquire interaction mutation lease failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+	} else if !leaseAcquired {
+		return nil, status.Error(codes.Aborted, "互动统计重建中，请稍后重试")
+	} else {
+		defer func() {
+			if err := releaseInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli, leaseKey, leaseToken); err != nil {
+				l.Errorf("release interaction mutation lease failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
+			}
+		}()
 	}
 
 	// 2. 使用 rediskey.LikeActionLockKey(video_id,user_id) 加短 TTL 锁，和 LikeVideo 共用同一把锁。
@@ -125,6 +130,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 	}
 	now := time.Now()
 	occurredAt := now.UnixMilli()
+	aggregateID := likeAggregateID(videoID, userID)
 
 	unlikeEvent := eventx.LikeEvent{
 		EventID:    eventID,
@@ -143,7 +149,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 		EventID:       eventID,
 		EventType:     eventx.EventTypeLikeDeleted,
 		AggregateType: eventx.AggregateLike,
-		AggregateID:   strconv.FormatUint(videoID, 10) + ":" + strconv.FormatUint(userID, 10),
+		AggregateID:   aggregateID,
 		Producer:      "interaction-rpc",
 		OccurredAt:    occurredAt,
 		Payload:       payloadBytes,
@@ -213,7 +219,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 			Topic:         eventx.TopicInteractionLikeEvents,
 			EventType:     eventx.EventTypeLikeDeleted,
 			AggregateType: eventx.AggregateLike,
-			AggregateID:   strconv.FormatUint(videoID, 10),
+			AggregateID:   aggregateID,
 			Payload:       string(envelopeBytes),
 			Status:        model.OutboxStatusPending,
 			CreatedAt:     now,

@@ -24,7 +24,7 @@ InteractionRpc:
     Key: interaction.rpc
 
 Sync:
-  BatchSize: 100
+  BatchSize: 500
   FlushMs: 1000
   FlushBatchSize: 500
   RpcTimeoutMs: 10000

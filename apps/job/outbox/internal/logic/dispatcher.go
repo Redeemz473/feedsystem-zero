@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -117,80 +116,42 @@ func (d *Dispatcher) claimDueOutboxEvents(ctx context.Context) ([]model.OutboxEv
 	limit := normalizeOutboxBatchSize(d.svcCtx.Config.Outbox.BatchSize)
 	now := time.Now()
 	staleBefore := now.Add(-outboxClaimTimeout(d.svcCtx.Config.Outbox))
-
-	// 先只查 id，控制单轮扫描量；真正抢占在 claimOneOutboxEvent 中完成。
-	// 多个 outbox job 实例同时运行时，靠行锁和 SKIP LOCKED 分摊事件。
-	ids := make([]uint64, 0, limit)
-	err := d.svcCtx.GormDB.WithContext(ctx).
-		Model(&model.OutboxEvent{}).
-		Select("id").
-		Scopes(dueOutboxScope(now, staleBefore)).
-		Order("id ASC").
-		Limit(limit).
-		Pluck("id", &ids).Error
+	token, err := randomHex(outboxLockTokenRandomBytes)
 	if err != nil {
 		return nil, err
 	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
 
-	events := make([]model.OutboxEvent, 0, len(ids))
-	var firstErr error
-	for _, id := range ids {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		event, ok, err := d.claimOneOutboxEvent(ctx, id, staleBefore)
-		if err != nil {
-			d.Errorf("claim outbox event failed, id: %d, error: %v", id, err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if ok {
-			events = append(events, event)
-		}
-	}
-
-	if len(events) == 0 && firstErr != nil {
-		return nil, firstErr
-	}
-	return events, nil
-}
-
-func (d *Dispatcher) claimOneOutboxEvent(ctx context.Context, id uint64, staleBefore time.Time) (model.OutboxEvent, bool, error) {
-	token, err := randomHex(outboxLockTokenRandomBytes)
-	if err != nil {
-		return model.OutboxEvent{}, false, err
-	}
-
-	now := time.Now()
-	var event model.OutboxEvent
-	claimed := false
-
+	// 一批事件共用本次 claim token；每次回写仍同时校验 id + token，
+	// 所以不会把其它实例或超时重领后的处理结果覆盖掉。
+	events := make([]model.OutboxEvent, 0, limit)
 	err = d.svcCtx.GormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 只在短事务里做 claim，不在事务里发 Kafka。
-		// 发 Kafka 可能慢或超时，如果放在 DB 事务里会长期占用行锁。
-		err := tx.WithContext(ctx).
+		// 在一个短事务中批量锁定并认领，避免旧实现为每条事件分别开启事务。
+		// dueOutboxScope 同时保证同一 aggregate 只能认领最早的未完成事件：
+		// 即使启用多个 dispatcher 实例或多个发布 worker，后续事件也必须等前序
+		// 状态变为 sent 后才能进入下一轮，避免 create/delete、like/unlike 反序。
+		// Kafka 发布仍在事务提交后执行，不会长期占用这些行锁。
+		if err := tx.WithContext(ctx).
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Scopes(dueOutboxScope(now, staleBefore)).
-			Where("id = ?", id).
-			First(&event).Error
-		if err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return nil
-			}
+			Order("id ASC").
+			Limit(limit).
+			Find(&events).Error; err != nil {
 			return err
+		}
+		if len(events) == 0 {
+			return nil
+		}
+
+		ids := make([]uint64, 0, len(events))
+		for _, event := range events {
+			ids = append(ids, event.ID)
 		}
 
 		result := tx.WithContext(ctx).
 			Model(&model.OutboxEvent{}).
-			Where("id = ?", event.ID).
+			Where("id IN ?", ids).
 			Updates(map[string]any{
-				// processing + lock_token 表示这条事件已被当前实例接管。
+				// processing + lock_token 表示这批事件已被当前实例接管。
 				// 如果进程崩溃，dueOutboxScope 会在 locked_at 超时后把它重新捞出来。
 				"status":        model.OutboxStatusProcessing,
 				"lock_token":    token,
@@ -204,24 +165,24 @@ func (d *Dispatcher) claimOneOutboxEvent(ctx context.Context, id uint64, staleBe
 		if result.Error != nil {
 			return result.Error
 		}
-		claimed = result.RowsAffected > 0
+		if result.RowsAffected != int64(len(events)) {
+			return fmt.Errorf("claim outbox batch affected %d rows, want %d", result.RowsAffected, len(events))
+		}
 		return nil
 	})
 	if err != nil {
-		return model.OutboxEvent{}, false, err
+		return nil, err
 	}
-	if !claimed {
-		return model.OutboxEvent{}, false, nil
+	for i := range events {
+		events[i].Status = model.OutboxStatusProcessing
+		events[i].LockToken = token
+		events[i].LockedBy = d.instanceID
+		events[i].LockedAt = &now
+		events[i].LastError = ""
+		events[i].SentAt = nil
+		events[i].NextRetryAt = nil
 	}
-
-	event.Status = model.OutboxStatusProcessing
-	event.LockToken = token
-	event.LockedBy = d.instanceID
-	event.LockedAt = &now
-	event.LastError = ""
-	event.SentAt = nil
-	event.NextRetryAt = nil
-	return event, true, nil
+	return events, nil
 }
 
 func (d *Dispatcher) dispatchClaimedEvents(ctx context.Context, events []model.OutboxEvent) error {
@@ -230,33 +191,36 @@ func (d *Dispatcher) dispatchClaimedEvents(ctx context.Context, events []model.O
 		return nil
 	}
 
-	jobs := make(chan model.OutboxEvent)
+	// 每个 claim 批次中，同一 aggregate 最多只有一个事件，因此可以将不同
+	// aggregate 分成若干批并发发送。每个批次只调用一次 WriteMessages，避免
+	// 每条事件都单独等待 Kafka BatchTimeout。
+	batches := splitOutboxBatches(events, workerCount)
+	jobs := make(chan []model.OutboxEvent)
 	var wg sync.WaitGroup
 
 	// 已经 claim 到本实例的事件可以并发投递；并发数受配置限制，避免瞬时打满 Kafka。
-	for i := 0; i < workerCount; i++ {
+	for i := 0; i < len(batches); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for event := range jobs {
+			for batch := range jobs {
 				if ctx.Err() != nil {
 					return
 				}
-				if err := d.dispatchClaimedEvent(ctx, event); err != nil {
-					// 单条失败不阻断整批，失败信息会写回 outbox_events，后续按 next_retry_at 重试。
-					d.Errorf("dispatch outbox event failed, id: %d, event_id: %s, error: %v", event.ID, event.EventID, err)
+				if err := d.dispatchClaimedBatch(ctx, batch); err != nil {
+					d.Errorf("dispatch outbox batch failed, size: %d, first_id: %d, error: %v", len(batch), batch[0].ID, err)
 				}
 			}
 		}()
 	}
 
-	for _, event := range events {
+	for _, batch := range batches {
 		select {
 		case <-ctx.Done():
 			close(jobs)
 			wg.Wait()
 			return ctx.Err()
-		case jobs <- event:
+		case jobs <- batch:
 		}
 	}
 	close(jobs)
@@ -268,11 +232,16 @@ func (d *Dispatcher) dispatchClaimedEvents(ctx context.Context, events []model.O
 	return nil
 }
 
-func (d *Dispatcher) dispatchClaimedEvent(ctx context.Context, event model.OutboxEvent) error {
-	// Kafka 投递在 DB 事务外执行；投递完成后再用 lock_token 回写状态。
-	// 因此这个 job 是 at-least-once 语义，consumer 侧必须用 processed_events 做幂等。
+func (d *Dispatcher) dispatchClaimedBatch(ctx context.Context, events []model.OutboxEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Kafka 投递在 DB 事务外执行；投递完成后再用 lock_token 批量回写状态。
+	// 若 Kafka 已收到消息但 DB 回写失败，事件会再次投递，因此 consumer 仍必须
+	// 使用 processed_events 保证 at-least-once 下的业务幂等。
 	eventCtx, cancel := context.WithTimeout(ctx, outboxEventTimeout(d.svcCtx.Config.Outbox))
-	publishErr := d.publishEvent(eventCtx, event)
+	publishErr := d.publishEvents(eventCtx, events)
 	cancel()
 
 	markCtx, markCancel := context.WithTimeout(ctx, outboxEventTimeout(d.svcCtx.Config.Outbox))
@@ -280,38 +249,63 @@ func (d *Dispatcher) dispatchClaimedEvent(ctx context.Context, event model.Outbo
 
 	now := time.Now()
 	if publishErr != nil {
-		if err := d.markFailed(markCtx, event, publishErr, now); err != nil {
-			return fmt.Errorf("publish outbox event failed: %v; mark failed: %w", publishErr, err)
+		// kafka-go 的同步批量写在超时或部分失败时可能已经写入部分消息。
+		// 整批进入重试会产生重复投递，但不会丢消息，consumer 幂等负责去重。
+		var firstMarkErr error
+		for _, event := range events {
+			if err := d.markFailed(markCtx, event, publishErr, now); err != nil && firstMarkErr == nil {
+				firstMarkErr = err
+			}
 		}
+		if firstMarkErr != nil {
+			return fmt.Errorf("publish outbox batch failed: %v; mark failed: %w", publishErr, firstMarkErr)
+		}
+		d.Errorf("publish outbox batch failed and scheduled retry, size: %d, first_id: %d, error: %v", len(events), events[0].ID, publishErr)
 		return nil
 	}
 
-	return d.markSent(markCtx, event, now)
+	return d.markSentBatch(markCtx, events, now)
 }
 
-func (d *Dispatcher) publishEvent(ctx context.Context, event model.OutboxEvent) error {
+func (d *Dispatcher) publishEvents(ctx context.Context, events []model.OutboxEvent) error {
 	publishCtx, cancel := context.WithTimeout(ctx, outboxPublishTimeout(d.svcCtx.Config.Outbox))
 	defer cancel()
 
-	return d.svcCtx.Producer.Publish(publishCtx,
-		event.Topic,
-		[]byte(event.AggregateID),
-		[]byte(event.Payload),
-		kafkax.Header{Key: "event_id", Value: []byte(event.EventID)},
-		kafkax.Header{Key: "event_type", Value: []byte(event.EventType)},
-		kafkax.Header{Key: "aggregate_type", Value: []byte(event.AggregateType)},
-		kafkax.Header{Key: "aggregate_id", Value: []byte(event.AggregateID)},
-	)
+	messages := make([]kafkax.Message, 0, len(events))
+	for _, event := range events {
+		messages = append(messages, kafkax.Message{
+			Topic: event.Topic,
+			Key:   []byte(event.AggregateID),
+			Value: []byte(event.Payload),
+			Headers: []kafkax.Header{
+				{Key: "event_id", Value: []byte(event.EventID)},
+				{Key: "event_type", Value: []byte(event.EventType)},
+				{Key: "aggregate_type", Value: []byte(event.AggregateType)},
+				{Key: "aggregate_id", Value: []byte(event.AggregateID)},
+			},
+		})
+	}
+	return d.svcCtx.Producer.PublishBatch(publishCtx, messages)
 }
 
-func (d *Dispatcher) markSent(ctx context.Context, event model.OutboxEvent, now time.Time) error {
-	// 必须带上 lock_token 更新，避免旧 worker 超时后又回写，覆盖新 worker 的处理结果。
+func (d *Dispatcher) markSentBatch(ctx context.Context, events []model.OutboxEvent, now time.Time) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	ids := make([]uint64, 0, len(events))
+	for _, event := range events {
+		ids = append(ids, event.ID)
+	}
+
+	// 同一 claim 批次共用 lock_token。批量回写减少每条消息一次 UPDATE，
+	// 同时仍避免旧 worker 覆盖超时后被新实例重新认领的结果。
 	result := d.svcCtx.GormDB.WithContext(ctx).
 		Model(&model.OutboxEvent{}).
-		Where("id = ? AND status = ? AND lock_token = ?",
-			event.ID,
+		Where("id IN ? AND status = ? AND lock_token = ?",
+			ids,
 			model.OutboxStatusProcessing,
-			event.LockToken,
+			events[0].LockToken,
 		).
 		Updates(map[string]any{
 			"status":        model.OutboxStatusSent,
@@ -326,8 +320,14 @@ func (d *Dispatcher) markSent(ctx context.Context, event model.OutboxEvent, now 
 	if result.Error != nil {
 		return result.Error
 	}
-	if result.RowsAffected == 0 {
-		d.Errorf("mark sent skipped, reason: %s, id: %d, event_id: %s", outboxClaimLostLogErrorLevel, event.ID, event.EventID)
+	if result.RowsAffected != int64(len(events)) {
+		return fmt.Errorf(
+			"mark sent affected %d rows, want %d, reason: %s, first_id: %d",
+			result.RowsAffected,
+			len(events),
+			outboxClaimLostLogErrorLevel,
+			events[0].ID,
+		)
 	}
 	return nil
 }
@@ -380,8 +380,47 @@ func dueOutboxScope(now, staleBefore time.Time) func(*gorm.DB) *gorm.DB {
 			now,
 			model.OutboxStatusProcessing,
 			staleBefore,
+		).Where(
+			// 同一聚合只允许最早的未完成事件被 claim。
+			// idx_aggregate_status_id 让子查询只扫描四种未完成状态，避免遍历
+			// 同一聚合已经发送的全部历史事件。
+			// dead 事件也会阻塞后续事件，要求先人工补偿，不能静默越过并破坏顺序。
+			`NOT EXISTS (
+				SELECT 1
+				FROM outbox_events AS predecessor
+				WHERE predecessor.aggregate_type = outbox_events.aggregate_type
+				  AND predecessor.aggregate_id = outbox_events.aggregate_id
+				  AND predecessor.id < outbox_events.id
+				  AND predecessor.status IN ?
+			)`,
+			[]int32{
+				model.OutboxStatusPending,
+				model.OutboxStatusFailed,
+				model.OutboxStatusDead,
+				model.OutboxStatusProcessing,
+			},
 		)
 	}
+}
+
+func splitOutboxBatches(events []model.OutboxEvent, batchCount int) [][]model.OutboxEvent {
+	if len(events) == 0 || batchCount <= 0 {
+		return nil
+	}
+	if batchCount > len(events) {
+		batchCount = len(events)
+	}
+
+	batchSize := (len(events) + batchCount - 1) / batchCount
+	batches := make([][]model.OutboxEvent, 0, batchCount)
+	for start := 0; start < len(events); start += batchSize {
+		end := start + batchSize
+		if end > len(events) {
+			end = len(events)
+		}
+		batches = append(batches, events[start:end])
+	}
+	return batches
 }
 
 func nextRetryDelay(conf config.OutboxConf, retryCount int32) time.Duration {

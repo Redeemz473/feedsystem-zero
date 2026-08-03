@@ -44,6 +44,13 @@ func (s *FollowScenario) Setup(ctx context.Context, f testconfig.LoadTestFlags) 
 	if err != nil {
 		return err
 	}
+	if len(tokens.tokens) < f.Concurrency {
+		return fmt.Errorf(
+			"follow scenario requires at least one login user per worker: users=%d concurrency=%d; increase -login-pool or seed users",
+			len(tokens.tokens),
+			f.Concurrency,
+		)
+	}
 	s.tokens = tokens
 
 	// Sample target user IDs; overlap with token pool is fine — we filter
@@ -66,7 +73,9 @@ func (s *FollowScenario) Setup(ctx context.Context, f testconfig.LoadTestFlags) 
 func (s *FollowScenario) Op() loadgen.Op {
 	return func(ctx context.Context, workerID int) error {
 		rng := perWorkerRand(workerID)
-		token, actorID := s.tokens.pick(rng.Int())
+		// 每个 worker 固定使用独立操作用户；目标用户仍然随机，既避免
+		// 同一账号的异常并发，又保留多个用户竞争热点被关注者账户行的压力。
+		token, actorID := s.tokens.pick(workerID)
 		// Pick a target != actor with a small retry budget.
 		var target uint64
 		for i := 0; i < 5; i++ {
