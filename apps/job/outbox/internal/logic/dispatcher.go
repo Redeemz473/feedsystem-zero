@@ -51,32 +51,35 @@ func NewDispatcher(svcCtx *svc.ServiceContext) *Dispatcher {
 // Run 是 outbox job 的主循环：
 // 业务服务只负责在本地事务里写 outbox_events，真正投递 Kafka 由这里异步完成。
 func (d *Dispatcher) Run(ctx context.Context) error {
+	//读取配置里设置的轮询间隔，目前是1秒扫一次outbox_events表
 	interval := time.Duration(d.svcCtx.Config.Outbox.PollIntervalMs) * time.Millisecond
 	if interval <= 0 {
 		interval = defaultOutboxPollInterval
 	}
 
+	//心跳发生器：每 1 秒钟通道里就多一个可读消息
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// 调度循环不直接阻塞在 DispatchOnce 上；同时用 1 个令牌限制批次并发，避免堆积时无限创建 goroutine。
-	inFlight := make(chan struct{}, 1)
-	var wg sync.WaitGroup
+	// 调度循环不直接阻塞在 DispatchOnce 上；同时用 1 个令牌限制批次并发，避免堆积时无限创建 goroutine
+	// 解决上一轮还没跑完，下一次心跳又到了的问题
+	inFlight := make(chan struct{}, 1) //作为信号量，看看有没有dispatch在跑，有的话这一轮心跳就先跳过
+	var wg sync.WaitGroup              //等待那一个运行的DispatchOnce goroutine完成
 	startDispatch := func() {
 		select {
 		case inFlight <- struct{}{}:
 			wg.Add(1)
 			go func() {
-				defer wg.Done()
+				defer wg.Done() //通知Run主循环完成了
 				defer func() {
-					<-inFlight
+					<-inFlight //释放令牌
 				}()
 
 				if err := d.DispatchOnce(ctx); err != nil {
 					if ctx.Err() != nil {
 						return
 					}
-					// outbox 是后台常驻任务，单轮失败只记录日志，下一轮继续重试。
+					// outbox 是后台常驻任务，单轮失败只记录日志，下一轮继续重试
 					d.Errorf("dispatch outbox once failed: %v", err)
 				}
 			}()
@@ -112,11 +115,12 @@ func (d *Dispatcher) DispatchOnce(ctx context.Context) error {
 	return d.dispatchClaimedEvents(ctx, events)
 }
 
+// 进行 claim（认领）或 lease（租约），即从共享待办池里领一批任务，并把任务标记为'我来处理'
 func (d *Dispatcher) claimDueOutboxEvents(ctx context.Context) ([]model.OutboxEvent, error) {
-	limit := normalizeOutboxBatchSize(d.svcCtx.Config.Outbox.BatchSize)
-	now := time.Now()
-	staleBefore := now.Add(-outboxClaimTimeout(d.svcCtx.Config.Outbox))
-	token, err := randomHex(outboxLockTokenRandomBytes)
+	limit := normalizeOutboxBatchSize(d.svcCtx.Config.Outbox.BatchSize) //限制每次处理的事件数量
+	now := time.Now()                                                   //统一时间基准
+	staleBefore := now.Add(-outboxClaimTimeout(d.svcCtx.Config.Outbox)) //如果一条 processing 事件的 locked_at 早于这个时刻，认为它已经过期了，可以重新认领
+	token, err := randomHex(outboxLockTokenRandomBytes)                 //用于在后续回写时检验 事件的锁是哪个实例的 防止冲突
 	if err != nil {
 		return nil, err
 	}
@@ -127,12 +131,11 @@ func (d *Dispatcher) claimDueOutboxEvents(ctx context.Context) ([]model.OutboxEv
 	err = d.svcCtx.GormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 在一个短事务中批量锁定并认领，避免旧实现为每条事件分别开启事务。
 		// dueOutboxScope 同时保证同一 aggregate 只能认领最早的未完成事件：
-		// 即使启用多个 dispatcher 实例或多个发布 worker，后续事件也必须等前序
-		// 状态变为 sent 后才能进入下一轮，避免 create/delete、like/unlike 反序。
+		// 即使启用多个 dispatcher 实例或多个发布 worker，后续事件也必须等前序状态变为 sent 后才能进入下一轮，避免 create/delete、like/unlike 反序。
 		// Kafka 发布仍在事务提交后执行，不会长期占用这些行锁。
 		if err := tx.WithContext(ctx).
-			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Scopes(dueOutboxScope(now, staleBefore)).
+			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}). //给命中的行加X锁，防止其他实例同时修改，并且通过SKIP LOCKED修饰，表示遇到被别的事务锁住的行直接跳过不阻塞
+			Scopes(dueOutboxScope(now, staleBefore)).                            //筛选可以被认领的事件，并且要注意同一个aggregate一次只能推进一条
 			Order("id ASC").
 			Limit(limit).
 			Find(&events).Error; err != nil {
@@ -147,6 +150,7 @@ func (d *Dispatcher) claimDueOutboxEvents(ctx context.Context) ([]model.OutboxEv
 			ids = append(ids, event.ID)
 		}
 
+		//对筛选出来的行进行处理
 		result := tx.WithContext(ctx).
 			Model(&model.OutboxEvent{}).
 			Where("id IN ?", ids).
@@ -185,17 +189,16 @@ func (d *Dispatcher) claimDueOutboxEvents(ctx context.Context) ([]model.OutboxEv
 	return events, nil
 }
 
+// 把已经从 DB 认领到本实例的一批事件，用多个 goroutine 并发地投递到 Kafka
 func (d *Dispatcher) dispatchClaimedEvents(ctx context.Context, events []model.OutboxEvent) error {
 	workerCount := normalizeOutboxWorkerCount(d.svcCtx.Config.Outbox.WorkerCount, len(events))
 	if workerCount == 0 {
 		return nil
 	}
 
-	// 每个 claim 批次中，同一 aggregate 最多只有一个事件，因此可以将不同
-	// aggregate 分成若干批并发发送。每个批次只调用一次 WriteMessages，避免
-	// 每条事件都单独等待 Kafka BatchTimeout。
-	batches := splitOutboxBatches(events, workerCount)
-	jobs := make(chan []model.OutboxEvent)
+	// 每个 claim 批次中，同一 aggregate 最多只有一个事件，因此可以将不同aggregate 分成若干批并发发送。每个批次只调用一次 WriteMessages，避免每条事件都单独等待 Kafka BatchTimeout。
+	batches := splitOutboxBatches(events, workerCount) //把events大致均分成workerCount个段，每个段里包含多个events
+	jobs := make(chan []model.OutboxEvent)             //任务分发管道
 	var wg sync.WaitGroup
 
 	// 已经 claim 到本实例的事件可以并发投递；并发数受配置限制，避免瞬时打满 Kafka。
@@ -232,19 +235,19 @@ func (d *Dispatcher) dispatchClaimedEvents(ctx context.Context, events []model.O
 	return nil
 }
 
+// 将单个batch向Kafka投递
 func (d *Dispatcher) dispatchClaimedBatch(ctx context.Context, events []model.OutboxEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
 
 	// Kafka 投递在 DB 事务外执行；投递完成后再用 lock_token 批量回写状态。
-	// 若 Kafka 已收到消息但 DB 回写失败，事件会再次投递，因此 consumer 仍必须
-	// 使用 processed_events 保证 at-least-once 下的业务幂等。
-	eventCtx, cancel := context.WithTimeout(ctx, outboxEventTimeout(d.svcCtx.Config.Outbox))
+	// 若 Kafka 已收到消息但 DB 回写失败，事件会再次投递，因此 consumer 仍必须使用 processed_events 保证 at-least-once 下的业务幂等。
+	eventCtx, cancel := context.WithTimeout(ctx, outboxEventTimeout(d.svcCtx.Config.Outbox)) //为 Kafka 阶段单独开一个带超时的 ctx
 	publishErr := d.publishEvents(eventCtx, events)
 	cancel()
 
-	markCtx, markCancel := context.WithTimeout(ctx, outboxEventTimeout(d.svcCtx.Config.Outbox))
+	markCtx, markCancel := context.WithTimeout(ctx, outboxEventTimeout(d.svcCtx.Config.Outbox)) //为回写DB阶段准备ctx
 	defer markCancel()
 
 	now := time.Now()

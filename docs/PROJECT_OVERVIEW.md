@@ -1,7 +1,7 @@
 # feedsystem-zero 项目说明文档
 
-> 更新时间：2026-08-03
-> 适用版本：main 分支当前工作区（基于 commit `d62bebe`，含 `016_outbox_aggregate_status_index.sql`、互动事件批量同步与正式规模压测）
+> 更新时间：2026-08-04
+> 适用版本：main 分支当前工作区（基于 commit `04095cc`，含 outbox 分片并发投递 + `NOT EXISTS` 聚合保序、Social/Notification 事务级 1213/1205 死锁重试、Video 发布多资产 URL 升序加锁）
 > 说明：本文档基于当前仓库真实代码生成，作为项目结构、数据模型、事件流转、一致性策略、缓存闭环、并发保护的完整索引。**外部读者读完这一份文档即可理解整个系统**。
 
 ---
@@ -517,6 +517,15 @@ sequenceDiagram
 
 **关键点**：`ref_count` 调整与 `videos` 创建/软删除必须在 **video-rpc 同一事务内**。这样 file_assets 永远不会出现“孤儿引用”（视频删了但资产还在）或“悬空视频”（视频存在但资产没引用）。
 
+#### 8.2.1 PublishVideo 多资产加锁保序（防死锁）
+
+一条视频最多涉及两个 `file_assets` 行：`play_url` 与 `cover_url`。若两个并发的 `PublishVideo` 事务分别以 `A→B` 和 `B→A` 顺序对同两个资产 `SELECT ... FOR UPDATE`，会形成经典锁序反转死锁。
+
+`apps/video/internal/logic/fileassethelper.go` 的 `orderedFileAssetURLs` 会**先去重、再对非空 URL 升序排序**，`publishvideologic.go` 的事务体统一按这个稳定顺序调用 `reserveFileAssetRefByURL(tx, url)`。任何两个并发发布事务的加锁序列都相同，从根源消除资产维度的锁序反转，与 §8.4 的 accounts 双行锁思路一致。
+
+- 单元测试：`fileassethelper_test.go` 断言 `orderedFileAssetURLs` 对乱序、重复、空串的稳定输出。
+- 引用调整仍在事务内完成；即便 `reserveFileAssetRefByURL` 命中 `Cleaning` 状态也会直接返回错误让事务回滚，绝不复活已删资产。
+
 **file_assets 四状态机（commit 687d0ab 完善）**：
 
 | 状态 | 含义 | 可秒传 | 可被 asset_cleanup 抢占 |
@@ -847,6 +856,21 @@ sequenceDiagram
 
 `fsz:social:followers:build_lock:{user}` SETNX 5s 保证同一时刻**只有一个请求去回源 MySQL**，其他请求短暂等待并重读缓存。
 
+#### 8.4.2 Follow/Unfollow 事务级死锁重试与预检移除
+
+即便 accounts 双行 `FOR UPDATE` 已经消除了一部分锁序反转风险，在正式规模压测时仍发现 InnoDB 会在多个并发关注同一大 V 时偶发 1213 死锁（例如两个事务同时碰 outbox 自增主键末页上的插入意向锁）。针对这一点：
+
+- `runSocialWriteTransaction`（见 `apps/social/internal/logic/socialhelper.go`）将整个 Follow/Unfollow 事务包裹在重试循环里，仅对 `mysql.MySQLError.Number` 为 `1213 / 1205` 的错误进行有限重试，其余错误（包括唯一键、外键、业务参数错误）直接向上抛。
+- 默认重试 3 次（`socialDBMaxRetries`），退避基准 20ms，封顶 200ms，**附加最多 50% 拖抽**（`socialDBRetryDelay`），避免同一批被回滚事务同时重试再次同步争锁。
+- **重试安全前提**：事务体内部的局部变量（如 `now`、`stateChanged`）在每一轮重试开头重新赋值，**不使用上一轮已回滚的局部状态**。写入 accounts 双向计数、follows、业务 outbox、通知 outbox 的全部上下文都在同一事务内重新构造，保证重试不会遗留半状态。
+
+**同时移除了两个不必要的预检锁**：
+
+- 旧实现在事务中先调 `AccountRpc.GetProfile` 预检目标用户是否存在，既多一次 RPC 往返，又在事务完成前可能造成长时间持锁。当前实现已删除预检，直接在 INSERT 命中外键/唯一键错误时把错误归一到 `codes.NotFound`。
+- 旧实现一开始就 `SELECT ... FOR UPDATE` 拉 follows 行，对不存在的唯一键会产生 **gap lock**，后续 `INSERT` 又升级为插入意向锁，导致高并发下频发 1213。当前实现改为**普通 `Take`**（不加锁）预读已存在关系，依靠 accounts 双行 FOR UPDATE 充当构件互斥。若不存在，使用 `INSERT ... ON DUPLICATE KEY DO NOTHING`，并在并发冲突的反馈（`RowsAffected == 0`）后才回读加锁处理。
+
+**关于“目标用户不存在”的错误反馈**：尽管写事务不再预检 `GetProfile`，Follow 接口末端仍然能识别目标不存在——INSERT 时会命中 follows 表的外键约束（`follows.following_id → accounts.id`）而直接报错，`Follow` 把它归一为 `codes.NotFound` “目标用户不存在”返回给上游。
+
 ---
 
 ### 8.5 Notification 通知模块
@@ -949,7 +973,27 @@ sequenceDiagram
 - 下一次读用最新 version 组合 key，一定是 miss → **强制回源** MySQL，读到最新值
 - 旧 version 的 count key 用 5 分钟 TTL + Lua DEL 兜底，不会长期占内存
 
-**为什么 6 种情况的 bump 判定要精确？**
+**bump 时机的自愈机制（`attemptBumpReceivers` 每轮独立）**：
+
+`notification-job` 的事务体 `applyNotificationEvent` 会返回本条事件是否需要 bump 未读版本号。在 `apps/job/notification/internal/logic/consumer.go` 中，事务重试循环为**每一次尝试都新建一个 `attemptBumpReceivers` 局部集合**：
+
+```
+for attempt := 0; ; attempt++ {
+    attemptBumpReceivers := make(map[uint64]struct{})
+    txErr := c.svcCtx.GormDB.Transaction(func(tx *gorm.DB) error {
+        // ...accumulate bumpReceiverID into attemptBumpReceivers...
+    })
+    if txErr == nil { bumpReceivers = attemptBumpReceivers; break }
+    if !isRetryableNotificationDBError(txErr) { return txErr }
+    ...
+}
+```
+
+这样即使前一轮事务因 1213/1205 被完整回滚，也**不会**把已回滚事务里收集的 receiver 带到后续成功提交后去 bump——避免“数据库回滚了但未读版本号却乱 bump”的脏数据。`isRetryableNotificationDBError` 只对 MySQL 1213（死锁）/ 1205（锁等待超时）返回 true，其他错误直接上抛不重试，避免把约束错误伪装成瞬时故障。
+
+**重试参数可配置**（`Notification.DBMaxRetries / DBRetryBaseMs / DBRetryMaxMs`，默认 3/20/200 ms，上限 8），重试间隔指数退避 + 抵抗0.5 倍拖抽（`c.dbRetryDelay`），避免同一批被回滚事务同时重试再次撞锁。
+
+#### 8.5.2 为什么 6 种情况的 bump 判定要精确？
 
 如果无脑 bump（不管事件是否真影响未读数），会导致：
 - 幂等重放的旧事件 → 缓存 miss → 触发 SELECT COUNT → **性能浪费**
@@ -1128,9 +1172,369 @@ Feed / 通知列表 / 评论列表等场景，Gateway logic 层负责：
 
 ### 9.1 Outbox Dispatcher
 
-- **抢占策略**：`SELECT ... FOR UPDATE SKIP LOCKED` + `lock_token=uuid` 双保险，支持多实例并发。
-- **退避策略**：阶梯 backoff（1s → 5s → 30s → 5min → 1h），`retry_count` 超上限进死信。
-- **批处理**：每次抓 100 条，按 topic 分组批量 Produce。
+#### 9.1.0 通俗版：Outbox 到底在做什么？
+
+先抛开代码看**业务问题**。以点赞为例，一次成功的点赞要做两件事：
+
+1. 在 MySQL 的 `likes` 表插入一条记录（这是权威事实）。
+2. 通知下游：更新 `videos.likes_count`、刷新 Redis 缓存、给作者发通知、推热榜、进个人页流水……（这些是派生状态）
+
+如果直接在 RPC 里"先写 MySQL 再发 Kafka"，就会出现 4 类不一致：
+
+- MySQL 写成功、Kafka 发失败 → 派生状态永远追不上。
+- Kafka 发成功、MySQL 事务回滚 → 下游算了一次不存在的点赞。
+- Kafka 发成功、RPC 返回超时给客户端，客户端重试一次 → 下游算了两次。
+- 网络抖动导致 Kafka 消息发出去了但业务不知道 → 无法排障。
+
+**Outbox 事务发件箱模式**把"通知下游"变成"往同一个 MySQL 事务里插一行事件"。业务 RPC 只需保证 `likes 表 INSERT` 和 `outbox_events INSERT` 在**同一个本地事务**里成功，事务提交 = 消息一定会被投递（哪怕现在 Kafka 宕机也没关系，事件躺在 MySQL 里等着，稍后重投）。真正把消息发到 Kafka 的活儿，交给一个独立的后台任务 —— 也就是 `outbox-job` 的 `Dispatcher`：
+
+1. **定时轮询**：每 1 秒扫 `outbox_events` 表，捞出到期未投递的事件。
+2. **认领**：把这批事件从 `pending` 改成 `processing`，打上"我在处理"的标记。
+3. **投递**：把消息 `PublishBatch` 到对应 topic。
+4. **回写**：如果 Kafka 确认收到就改成 `sent`；如果失败就 `retry_count+1` 并安排下次重试；重试到上限就转 `dead` 等人工处理。
+
+Outbox Dispatcher 是非阻塞的定时拉取 + 分片并发投递。完整实现在 `apps/job/outbox/internal/logic/dispatcher.go`，涉及三个关键机制：**同业务聚合保序**、**分片并发投递**、**批量回写 lock_token 验证**。
+
+**主循环与并发限制**：
+
+- `Run` 按 `Outbox.PollIntervalMs`（默认 1s）制造 tick；每个 tick 尝试启动一轮 `DispatchOnce`。
+- 使用 `inFlight := make(chan struct{}, 1)` 令牌：**同时只会有 1 轮 `DispatchOnce` 运行**，上一轮未完时后续 tick 直接 skip 并记录 warn，避免堆积时无限创建 goroutine。
+- 单轮任何失败只记录日志，下一轮自然重试（后台常驻任务不能因一时错误退出）。
+
+**Claim 阶段（`claimDueOutboxEvents`）**：
+
+一个短事务内完成“拉一批 + 标记 processing + 写入 lock_token”：
+
+```sql
+-- 当前时间为 now，staleBefore = now - Outbox.ClaimTimeoutSeconds (默认 60s)
+SELECT * FROM outbox_events
+WHERE (
+    (status IN (pending, failed) AND (next_retry_at IS NULL OR next_retry_at <= now))
+    OR (status = processing AND locked_at IS NOT NULL AND locked_at <= staleBefore)
+) AND NOT EXISTS (
+    -- 关键保序约束：同聚合同时仅允许最早一条未完成事件被 claim
+    SELECT 1 FROM outbox_events AS predecessor
+    WHERE predecessor.aggregate_type = outbox_events.aggregate_type
+      AND predecessor.aggregate_id   = outbox_events.aggregate_id
+      AND predecessor.id             < outbox_events.id
+      AND predecessor.status IN (pending, failed, dead, processing)
+)
+ORDER BY id ASC LIMIT :batch
+FOR UPDATE SKIP LOCKED;
+```
+
+紧接着在**同一事务内**把选中行 UPDATE 为 `status=processing, lock_token=<本轮随机 32bit>, locked_by=<实例 ID>, locked_at=now`。
+
+关键设计：
+
+- **`FOR UPDATE SKIP LOCKED`**：多实例并发 claim 时互不阻塞，已被其他实例锁住的行直接跳过。
+
+  > **SKIP LOCKED 到底是什么锁？** 它**不是**一种"新的锁类型"，而是 InnoDB `SELECT ... FOR UPDATE` 语句的一个**修饰符**，控制"遇到已被别人锁住的行时的行为"。
+  >
+  > 三种可选行为对比（想象 outbox 表里有 100 条待投递事件，两个 dispatcher 实例同时来 claim）：
+  >
+  > | 修饰符 | 行为 | 用在 outbox 会怎么样 |
+  > |---|---|---|
+  > | 默认（不加） | 等待前面的锁释放，最多等 `innodb_lock_wait_timeout`（50s） | 实例 B 会阻塞 50 秒直到实例 A 提交，吞吐掉到冰点 |
+  > | `NOWAIT` | 立刻报错 `ER_LOCK_NOWAIT` | 实例 B 直接崩，需要业务层重试 |
+  > | **`SKIP LOCKED`** | **跳过已锁行，只返回没被锁的行** | 实例 A 拿走前 50 条并锁定，实例 B **一次查询就直接拿到剩下的 50 条**，两边完全并行 |
+  >
+  > 换句话说，`SKIP LOCKED` = "别人在处理的我不碰，我只拿空闲的"。这正好匹配"多个 dispatcher 实例并发消费队列"这种典型的**任务队列**场景：MySQL 从 8.0 开始原生支持，配合 `SELECT ... FOR UPDATE SKIP LOCKED` 可以把关系表当轻量级消息队列用，不需要引入 Redis Stream 或专门的 MQ 就能做到多实例安全并发。
+  >
+  > 此外，为什么 outbox 需要 FOR UPDATE 加锁而不是普通 SELECT？—— 因为紧接着还要在**同一事务里** UPDATE 这批行的 `status/lock_token/locked_by`；如果不加锁，另一个实例可能在中间也 SELECT 到同一批行然后一起 UPDATE，就会出现两个实例都以为自己"独占"了这批消息，从而重复投递。加了 `FOR UPDATE`，行级 X 锁会一直持有到事务提交，其他事务想读同一行时只能选择等待或 `SKIP LOCKED` 跳过。
+
+- **`NOT EXISTS` 前序子句**：同一 aggregate 必须等前序事件 `sent` 之后才能进入下一轮 claim，"同一视频先删后投递 create"、"同一用户先 unlike 后投递 like" 这类反序从根源不会发生。`dead` 事件也会阻塞后续，强迫人工补偿，不静默跨过。
+- **专用索引 `idx_aggregate_status_id(aggregate_type, aggregate_id, status, id)`**（`016_outbox_aggregate_status_index.sql`）让 NOT EXISTS 只扫四种未完成状态，不会回扫同聚合已 sent 的历史事件。
+- **本轮 `lock_token`**：同一批 claim 共享一个随机 token，后续投递失败 / 成功回写时都带 `WHERE id IN ... AND status = processing AND lock_token = :token`，因此“旧实例 claim 了一批 → 卡死→ 新实例 claim 同一批’’ 不会互相覆盖彼此的投递结果。
+
+**Dispatch 阶段（`dispatchClaimedEvents` + `dispatchClaimedBatch`）**：
+
+1. 认领到的一批事件通过 `splitOutboxBatches(events, workerCount)` 均匀分片；worker 上限默认 4（`normalizeOutboxWorkerCount`），上限 32，并且 worker 数不会超过事件总数。
+2. **同一批 claim 内同一 aggregate 最多只有 1 条事件**（NOT EXISTS 保证），因此不同分片内部无需保序，可以安全地并发发包。
+3. 每个分片一次性构造 `[]kafkax.Message` 调用 `Producer.PublishBatch`，只产生一次 Kafka 同步写往返（避免旧实现里“逐条发送”持续受到 `BatchTimeout` 影响）。消息 Header 携带 `event_id / event_type / aggregate_type / aggregate_id`，供 consumer 直接读取而不必反序列化 payload。
+
+**投递后回写（`markSentBatch` / `markFailed`）—— Kafka Publish 失败会发生什么？**
+
+先看正常路径：
+
+- **全部成功**：一条 UPDATE 把本分片 `id IN (…)` 同时改为 `status=sent, sent_at=now, lock_token=""`，并卡 `WHERE status=processing AND lock_token=:token`；影响行数不等于分片大小会以 `claim_lost` 日志报错（意味着锁超时后被其他实例重抢，无事无失）。事件到此彻底"离开发件箱"。
+
+再看失败路径。发布 Kafka 时可能出现：网络抖动 / broker 拒绝 / 请求超时 / broker 收到但 ack 丢失 / topic partition 不可用……代码统一走 `markFailed`：
+
+1. **`retry_count + 1`**：直接用 `gorm.Expr("retry_count + 1")` 累加，事务外并发场景也不会丢计数。
+2. **阶梯退避**：`nextRetryDelay(retryCount)` 走**指数退避**——第一次失败 `RetryBaseMs`（默认 1s），之后每失败一次翻倍，封顶 `RetryMaxMs`（默认 60s）。即 1s → 2s → 4s → 8s → 16s → 32s → 60s → 60s…… 避免瞬时抖动打满 Kafka；退避期间事件 `next_retry_at` 落在未来，`dueOutboxScope` 会自动跳过它。
+3. **`last_error` 写入原因**：截断到 1024 rune，防止某些 Kafka 客户端错误消息动辄几 KB 把 `last_error` 撑爆导致 `Row size too large`。这条错误信息可以直接 `SELECT` 出来排障，不需要翻日志。
+4. **`status = failed`**：让下一轮 `dueOutboxScope` 依然能扫到它（`status IN (pending, failed)`）。
+5. **`lock_token / locked_by / locked_at` 全部清空**：这批 claim 的租约已经释放，任何实例都能重新认领它。
+6. **超过 `MaxRetry` → `dead`**：默认最多重试到某个上限（配置项 `MaxRetry`）后，`status` 改为 `dead` 且 `next_retry_at=NULL`。**dead 事件不会再被自动重试**，需要人工干预（改代码修复 bug、清理坏数据、手动改回 `pending` 让它重投）——这是**故意的设计**，避免"坏事件"无限占用 Dispatcher 资源，同时因为 §9.1 里 `NOT EXISTS` 子查询把 `dead` 也算作"前序未完成"，它会**阻塞同一 aggregate 的后续事件**，逼迫运维必须处理，绝不静默跨越。
+
+一个容易被忽略的边界：**Kafka 已经收到消息，但 DB 回写失败**（比如网络分区、DB 短暂 unavailable）。这时事件仍是 `processing`，`locked_at` 超时后会被下一轮 `dueOutboxScope` 重新捞出——**会导致同一条消息被投递第二次**。这不是 bug，而是 Outbox 模式的**天然属性**：at-least-once。因此下游 consumer **必须**用 `processed_events` 做业务幂等，见下面 §9.1.5。
+
+**可观测性与配置**（`OutboxConf`）：`PollIntervalMs / BatchSize (上限 500) / WorkerCount (上限 32) / MaxRetry / RetryBaseMs / RetryMaxMs / PublishTimeoutMs / EventTimeoutMs / ClaimTimeoutSeconds`，均在 `dispatcher.go` 有默认值归一化。运维排障最常用的 SQL：
+
+```sql
+-- 卡在 pending/failed 太久的事件（可能上游一直失败）
+SELECT id, topic, event_type, retry_count, last_error, next_retry_at
+FROM outbox_events
+WHERE status IN (1, 2)  -- pending, failed
+  AND created_at < NOW() - INTERVAL 5 MINUTE
+ORDER BY id ASC LIMIT 50;
+
+-- 已经进入死信、等人工处理的事件
+SELECT id, topic, event_type, aggregate_type, aggregate_id, retry_count, last_error, updated_at
+FROM outbox_events WHERE status = 4  -- dead
+ORDER BY updated_at DESC LIMIT 50;
+
+-- 修复完 bug 后把 dead 事件复活重投
+UPDATE outbox_events
+SET status = 1, retry_count = 0, next_retry_at = NULL, last_error = ''
+WHERE id IN (:id_list);
+```
+
+#### 9.1.1 三层并发单位模型：集群 / 进程 / 单轮
+
+Outbox Dispatcher 在生产环境里其实存在**三层不同粒度的并发**，理解它们的边界是读懂 `dispatcher.go` 的前提：
+
+```text
+Kubernetes 集群
+  ├─ 实例 A (Pod / 进程)          ← 第 ① 层：多实例
+  │    └─ Run 主循环
+  │         └─ inFlight(cap=1)     ← 第 ② 层：进程内串行
+  │              └─ DispatchOnce
+  │                   └─ worker × N ← 第 ③ 层：单轮内并发发 Kafka
+  ├─ 实例 B ...同上...
+  └─ 实例 C ...同上...
+```
+
+| 层级 | 并发单位 | 数量控制 | 隔离机制 | 目的 |
+|---|---|---|---|---|
+| ① 集群层 | dispatcher 实例（Pod） | K8s 副本数 | MySQL `SELECT ... FOR UPDATE SKIP LOCKED` + `lock_token` | 横向扩展 + 高可用；一个实例挂了 60s 后其他实例接管 |
+| ② 进程层 | 单进程内的 `DispatchOnce` | `inFlight := make(chan struct{}, 1)`（信号量容量 1） | Go channel + `select default` 非阻塞尝试 | 避免同进程自我惊群、tick 堆积无限起 goroutine |
+| ③ 单轮层 | 发 Kafka 的 worker goroutine | `WorkerCount`（默认 4，上限 32） | `splitOutboxBatches` 按 aggregate 分片 | 利用 Kafka Producer 的 IO 并发提升吞吐 |
+
+**为什么第 ② 层限制为 1，第 ③ 层却允许多个？** 因为二者要解决的问题不同：
+
+- 第 ② 层"每个进程同时只跑一轮 DispatchOnce"：如果允许并发 DispatchOnce，两个 DispatchOnce 都会去 `SELECT ... FOR UPDATE SKIP LOCKED` 同一张表，虽然 SKIP LOCKED 不会真的冲突（会跳过对方锁住的行），但空转扫描完全没必要，还会让日志、指标、错误处理复杂化。加上 `inFlight` 容量 1，上一轮没跑完时 tick 直接 skip 记录 warn（"dispatch 跑不动了"），运维一眼能看出问题。
+- 第 ③ 层"单轮内多 worker 并发发 Kafka"：Kafka `PublishBatch` 的网络往返有几十毫秒延迟，如果串行发 100 条要几秒钟；用 4~8 个 worker 并发发就把耗时压到 1/N。**并发发不会乱序**，因为同一批 claim 内**每个 aggregate 最多只有 1 条事件**（`NOT EXISTS` 保证），任意分片方式都不会把同 aggregate 的多个事件拆到并发 worker 里。
+
+**为什么第 ① 层允许多实例？** 因为业务量增长时单机 Producer 会成瓶颈，加机器就能线性扩展；同时一台机器崩溃后其他机器 60s 内自动接管它留下的 `processing` 事件（详见 9.1.3），比"只有一个实例、崩了业务就阻塞"要健壮得多。
+
+**"skip" 日志的观测意义**：第 ② 层 skip 日志不是"丢消息"的表现——事件本身还静静躺在表里，下一轮 tick 依然会扫到。它的价值是**金丝雀信号**：一旦看到 skip 频繁出现，就说明 DispatchOnce 跑得比 `PollIntervalMs`（默认 1s）还慢，需要看是不是 Kafka broker 抖动、DB 变慢或者 batch 突然爆增。`time.Ticker` 天然会丢弃积压 tick 不排队，加上 `inFlight` 容量 1，两层防抖同时指向同一理念：**恢复期不惊群、跑不动就报警**。
+
+#### 9.1.2 生命周期同步：`inFlight` 与 `WaitGroup` 的分工
+
+`Run` 主循环里同时用了 `inFlight`（channel）和 `wg`（`sync.WaitGroup`），这两个东西**职责完全不同**：
+
+```go
+inFlight := make(chan struct{}, 1)   // 决定"能不能启动"
+var wg sync.WaitGroup                // 决定"能不能安全退出"
+startDispatch := func() {
+    select {
+    case inFlight <- struct{}{}:
+        wg.Add(1)                    // 只有真的启动 goroutine 才 Add
+        go func() {
+            defer wg.Done()           // goroutine 结束才 Done
+            defer func() { <-inFlight }()   // 释放令牌
+            _ = d.DispatchOnce(ctx)
+        }()
+    default:
+        d.Errorf("skip outbox dispatch tick: previous dispatch is still running")
+    }
+}
+for {
+    select {
+    case <-ctx.Done():
+        wg.Wait()                    // 等最后那 1 个 DispatchOnce 收尾
+        return ctx.Err()
+    case <-ticker.C:
+        startDispatch()
+    }
+}
+```
+
+| 组件 | 职责 | 何时增加 | 何时减少 |
+|---|---|---|---|
+| `inFlight`（cap=1） | 并发限制 —— 同一时刻最多允许 1 个 DispatchOnce | 每次成功启动 goroutine | goroutine 结束时（`defer <-inFlight`） |
+| `wg` | 生命周期同步 —— 确保关机时等 goroutine 收尾 | `wg.Add(1)` 与令牌配对 | goroutine 完全结束时 `wg.Done()` |
+
+**为什么最多只有 1 个 goroutine 还需要 `sync.WaitGroup`？** 因为 `DispatchOnce` 是 `go func(){...}()` 派生出的**子 goroutine**，跟 `Run` 主循环不是同一个 goroutine。当 K8s 发 SIGTERM 让 `ctx.Done()` 触发时，如果不 `wg.Wait()`：
+
+1. 主循环立刻 `return ctx.Err()`
+2. `Run` 函数返回，上层调用者关闭 GORM 连接池、Kafka Producer
+3. 那个 DispatchOnce 子 goroutine 可能正卡在"Kafka 发到一半"或"markSentBatch 回写到一半"，被强杀
+
+后果：
+- Kafka 已发但 DB 未回写 → 事件保留 `processing`，60s 后 `staleBefore` 重投（可容忍，靠 consumer 幂等去重）
+- DB 连接被拉走一半 → GORM 错误日志刷屏
+- 半开状态的 socket 让 Kafka broker 端出现"发了一半的消息"
+
+加上 `wg.Wait()` 后是**优雅关闭**：
+1. `ctx.Done()` 触发，主循环停派新一轮
+2. `wg.Wait()` 阻塞直到当前那一轮 DispatchOnce 内部所有 `WithContext(ctx)` 调用都返回（Kafka 请求会被 ctx 打断，DB 语句会被 ctx 打断）
+3. 该轮 goroutine `defer wg.Done()` 触发，主循环解除阻塞，正常返回 `ctx.Err()` 让上层放心回收连接池
+
+**关键区分**：`inFlight` 管"进程内不允许并发"，`wg` 管"关机时不允许强杀"。哪怕 wg 计数最多只到 1，"等 1 个"和"不等"仍然是**优雅收尾**与**强制中断**的本质区别。同一个进程里另一个 `wg` 是 `dispatchClaimedEvents` 内部的—— 等待 N 个 Kafka worker 全部发完，这两个 wg 变量同名但作用范围截然不同。
+
+#### 9.1.3 X 锁 vs 业务层租约：outbox 里的两种"独占"
+
+这是理解 Outbox 自愈机制的**最容易被混淆点**。`outbox_events` 表里的一行事件实际上被**两种完全独立的"锁"**保护：
+
+| | ① MySQL 行锁（X 锁） | ② 业务层租约 |
+|---|---|---|
+| 载体 | InnoDB 内存里的锁结构 | 表字段 `status / lock_token / locked_by / locked_at` |
+| 加锁时机 | `SELECT ... FOR UPDATE` 语句执行 | UPDATE 写入 `status=processing, lock_token=xxx` |
+| 释放时机 | **事务 COMMIT / ROLLBACK 那一瞬间**（几毫秒） | 直到 `markSent` / `markFailed` 改写，或 `locked_at` 超过 `staleBefore` 被其他实例覆盖 |
+| 谁能观察到 | 只有 MySQL 自己（通过 `performance_schema.data_locks`） | 任何进程 SELECT 出来都能看到这几个字段值 |
+| 谁能绕过 | 别的事务 `SELECT ... FOR UPDATE SKIP LOCKED` 能跳过 | 靠 `dueOutboxScope` 的 WHERE 条件识别与覆盖 |
+
+**时间轴还原**（一条事件从被 claim 到崩溃再到被其他实例接管）：
+
+```text
+时间 →
+
+t=0ms     ┌ claim 事务 BEGIN
+          │  SELECT ... FOR UPDATE SKIP LOCKED   ← 加 X 锁到 InnoDB 内存
+          │  UPDATE status=processing, lock_token=AAA, locked_at=t0
+t=5ms     └ COMMIT                                ← X 锁立刻释放！！
+
+          （此后行上没有任何 MySQL 锁保护）
+
+t=5ms     ┌ dispatchClaimedEvents 开始
+          │  Kafka PublishBatch 中……
+          │  💥 t=200ms 时进程 A 崩溃 / 断网 / 卡死
+          │  行的字段值凝固在：status=processing, lock_token=AAA, locked_at=t0
+
+t=60s     ┌ 实例 B tick，跑 claimDueOutboxEvents
+          │  now = t0+60s, staleBefore = t0
+          │  dueOutboxScope 第 2 个 OR 分支命中：
+          │    status=processing AND locked_at <= staleBefore
+          │  B 直接对这一行加 X 锁（此时没别人锁着，SKIP LOCKED 无需跳）
+          │  UPDATE lock_token=BBB, locked_at=t0+60s
+          └ COMMIT
+```
+
+**核心事实**：从 t=5ms 到 t=60s 这**整整一分钟**里，事件行**根本没有任何 MySQL 行锁**在保护。X 锁只在 claim 事务的几毫秒里存在，事务 COMMIT 后立刻消失。保护"这批事件不被其他实例乱抢"的，是 `dueOutboxScope` 里的 WHERE 条件 —— 只要 `status=processing` 且 `locked_at > staleBefore`（还在租约期内），别的实例的 `SELECT` 就压根不会把它选出来。
+
+**`lock_token` 到底防谁？** 它防的是"A 崩而未死"的诡异中间态。假设：
+
+```text
+t=0s     A claim 事件 42 → lock_token=AAA, locked_at=0s
+t=1s     A 发 Kafka 卡住（网络卡顿，但进程没死）
+t=60s    B 发现 locked_at 过期，抢过来 → lock_token=BBB, locked_at=60s
+t=61s    B 发 Kafka 成功，markSent：
+         UPDATE ... SET status=sent
+                    WHERE id=42 AND status=processing AND lock_token='BBB'
+         → RowsAffected=1 ✅
+t=62s    A 突然恢复了（网络通了、GC 停顿结束了）
+         A 以为自己还持有事件 42，尝试 markSent：
+         UPDATE ... SET status=sent
+                    WHERE id=42 AND status=processing AND lock_token='AAA'
+         → RowsAffected=0（status 已经是 sent，lock_token 也变了）
+         → A 日志打 "claim_lost"，放弃这条事件，不覆写 B 的成果
+```
+
+`lock_token` **不是锁，是"防伪印章"**：A 手里的章号 AAA，B 手里的 BBB，事件表里现在盖着 BBB 的章。A 想在事件上盖章，SQL WHERE 会说"这里已经不是你的章了"，A 就放弃。有了 `lock_token`，"实例 A 卡死复活 + 实例 B 已经接管"这种中间态里 A 绝不会覆写 B 的正确结果。
+
+**术语澄清**：outbox 里所谓的"独占"其实是**租约模型（lease）** 而不是**锁模型（lock）**。租约有明确的到期时间（`ClaimTimeoutSeconds`，默认 60s），到期后自动流转给下一个愿意接手的实例；锁则要求持有者显式释放，持有者崩溃后需要外部干预。租约是**为分布式系统里"节点可能随时挂"这个现实**而生的设计——你永远不能相信另一台机器一定还活着，只能相信它答应的租约到期时间。
+
+#### 9.1.4 两阶段独立 ctx 与失败路径的原子处理
+
+`dispatchClaimedBatch` 是单个 batch 的完整处理单元。它有两处精细设计值得记录：
+
+**设计 1：Kafka 阶段和 DB 回写阶段各自独立 timeout**
+
+```go
+// 第一段 ctx：只给 Kafka 用，10s 超时
+eventCtx, cancel := context.WithTimeout(ctx, outboxEventTimeout(...))
+publishErr := d.publishEvents(eventCtx, events)
+cancel()   // 用完立即回收，不用 defer
+
+// 第二段 ctx：只给 DB 回写用，10s 超时
+markCtx, markCancel := context.WithTimeout(ctx, outboxEventTimeout(...))
+defer markCancel()
+```
+
+如果两个阶段共用一个 ctx，Kafka 慢用掉 9.9s 后 markSent 只剩 0.1s → 大概率超时失败，事件白发了还得再重投。**独立预算**保证 Kafka 慢不吃 DB 的预算。同时第一段用 `cancel()` 而非 `defer cancel()`——Kafka 阶段结束立刻回收 eventCtx，避免它跟 markCtx 一起活到函数结束浪费 goroutine。父 ctx 被上层取消时（K8s SIGTERM），两个子 ctx 都会立刻被打断。
+
+**设计 2：Kafka 失败时"整批重试 + 逐条 markFailed + 只记首错"**
+
+```go
+if publishErr != nil {
+    var firstMarkErr error
+    for _, event := range events {
+        if err := d.markFailed(markCtx, event, publishErr, now); err != nil && firstMarkErr == nil {
+            firstMarkErr = err   // 只记第一个
+        }
+    }
+    if firstMarkErr != nil {
+        return fmt.Errorf("publish outbox batch failed: %v; mark failed: %w", publishErr, firstMarkErr)
+    }
+    d.Errorf("publish outbox batch failed and scheduled retry, size: %d, first_id: %d, error: %v",
+             len(events), events[0].ID, publishErr)
+    return nil   // 预期内失败，返回 nil 不打扰上层
+}
+```
+
+三个细节：
+
+- **为什么整批重试？** kafka-go 的批量写在超时或部分失败时**可能已经写入了一部分消息**（比如 13 条里前 7 条 broker 收下、后 6 条超时），但返回的 error 不告诉你哪些成了。保守做法：全部重试。会造成 7 条重复投递，但 consumer 用 `processed_events` 幂等去重能兜住 —— **宁可重投不可漏投**是 at-least-once 的底线。
+- **为什么逐条 `markFailed` 而不是批量？** 因为每条事件的 `retry_count` 可能不同，进而 `next_retry_at` 的退避时间也不同（1s / 2s / 4s / 8s…），甚至有些达到 `MaxRetry` 要转 `dead`。批量 UPDATE 无法表达"每行不同处理"。而成功路径 `markSentBatch` 所有字段值都一样（`sent + sent_at=now + lock_token=""`），才能一条 SQL 批量搞定。
+- **为什么错误只记第一个？** 循环不 break 是为了让能回写的都回写（最大化容错），但 13 条同时失败多半是同根因（DB 挂了/连接池爆了），列出 13 条错误纯属日志噪音。用 `firstMarkErr` 标志保证记的是**第一个**（更接近事发时刻）而不是最后一个。返回值也讲究：Kafka 失败 + 全部 markFailed 成功 = 返回 nil（预期内的重试，运转正常）；Kafka 失败 + markFailed 也失败 = 返回 wrapped error（双重故障，需要 Errorf 报警，事件靠 `staleBefore` 60s 后重领兜底自愈）。
+
+**设计 3：`dispatchClaimedEvents` 里无缓冲 channel + 双 case select**
+
+```go
+jobs := make(chan []model.OutboxEvent)   // 无缓冲
+// … 启 N 个 worker: for batch := range jobs { … } …
+for _, batch := range batches {
+    select {
+    case <-ctx.Done():
+        close(jobs)         // 通知 worker 立刻停止取新活
+        wg.Wait()           // 等已经拿到 batch 的 worker 收尾
+        return ctx.Err()
+    case jobs <- batch:     // 无缓冲 → 只有 worker 空闲时才能塞进去，天然背压
+    }
+}
+close(jobs)
+wg.Wait()
+```
+
+无缓冲 channel 是"天然背压"—— 主 goroutine 塞不进去时说明所有 worker 都在忙，主 goroutine 就阻塞，绝不会预分发一堆积压任务。ctx 取消时 `close(jobs)` 立刻通知所有 worker 停止取新 batch，剩余没塞进去的 batch **直接丢弃** —— 这些事件仍在 DB 里 `status=processing`，60s 后其他实例（或本实例重启后）通过 `staleBefore` 兜底重领，**不丢消息**。
+
+#### 9.1.5 消费者侧失败处理：消息消费不下去了怎么办？
+
+Outbox 只解决"上游一定发出去"，消息成功进入 Kafka 之后就归下游 consumer 管。所有 job（`interaction_sync / social_sync / notification / feed_timeline / hotrank`）都遵循**同一套失败处理骨架**，实现分散在各自的 `internal/logic/*consumer.go`：
+
+**第一层：解码失败 → 直接进死信，不重试**
+
+消息拉下来先做 `eventx.DecodeEnvelope + json.Unmarshal(payload)`。如果 envelope 缺字段、payload JSON 语法错、`aggregate_id` 不是合法数字，说明**这条消息本身是坏消息**，重试 100 次也是坏消息。代码路径是 `decodeGroupMessages → decodeMessage → 返回 (event, deadLetter, ok=false)`，然后累进 `deadLetters` 切片，一批结束后统一走 `recordDeadLetters` 落到 `dead_letter_events` 表（携带 `consumer_name / topic / partition / offset / payload / headers / reason` 全量证据），Kafka offset 正常前移，**不会卡分区**。
+
+**第二层：处理失败 → 有限重试**
+
+解码成功但业务处理失败（比如下游 RPC 短暂 unavailable、数据库死锁、CAS 冲突）分两种：
+
+- **临时基础设施错误**（grpc `Aborted / Unavailable / DeadlineExceeded / ResourceExhausted`）：这类错误重试就能恢复，代码用 `callFlushRPCWithRetry`（`interaction_sync/logic/syncconsumer.go`）在**当前 partition worker 内**做指数退避重试，`shouldLogFlushRPCRetry` 只在第 1 次和每第 10 次打日志避免刷屏。**关键**：这层重试是"进程内 goroutine sleep"，不涉及 Kafka offset，其他 partition 的 worker 不受影响；如果直接把错误抛给 `RunBatch`，已经成功的分区就会跟着整批被 Kafka 重发一遍，offset 永远无法前推。
+- **业务级失败**（比如 FlushRPC 返回 `FailedEventIds` 列表）：说明部分事件确实有问题（比如 CAS 版本号冲突、乐观锁失败）。走"有限重试子集"策略——在 `flushLikeEvents / flushCommentEvents` 里循环 `flushLikeEventsOnce`，成功的从下一轮剔除，失败子集再退避重试，最多重试 `Sync.MaxEventRetry` 次。
+
+**第三层：重试到上限 → 死信 + 继续推进 offset**
+
+处理若达到最大重试次数，代码走 `c.recordDeadLetters(ctx, c.deadLettersFromDecodedEvents(failed, reason))` 把仍然失败的事件写入 `dead_letter_events`，然后**当前批次视为处理完成**，Kafka offset 前移。这样做的原因是：**同一个 partition 里绝不能被一条坏事件卡死**，否则整个分区的所有后续消息都会积压，比"少处理一条"的代价大得多。死信表 `uk_consumer_message(consumer_name, topic, partition_no, offset_no)` 保证同一条 Kafka 消息即便被消费多次也只落一条死信记录。
+
+**第四层：业务幂等 → 兜住 at-least-once 的重复**
+
+即便前三层完全顺利，Kafka 本身也是 at-least-once（比如上面提到的 "Outbox 已投递但 DB 回写失败" 会重投）。因此每个 consumer 在**副作用完成的同一事务里**插入 `processed_events(event_id, consumer_name)` 唯一键：
+
+```sql
+UNIQUE KEY uk_event_consumer (event_id, consumer_name)
+```
+
+- 第一次消费成功：副作用 + INSERT processed_events 一起提交。
+- 第二次重复投递到同一个 consumer：INSERT 命中唯一键冲突 → 事务回滚 → 副作用相当于**天然幂等**。
+- 不同 consumer 消费同一个 event_id 互不影响（`consumer_name` 区分），点赞事件既可以进 `interaction_sync` 也可以进 `notification`。
+
+`processed_events` 会设置 `expire_at` 用来定期清理超过保留期的历史记录，避免表无限增长。
+
+**总结一句话**：Outbox 保证消息一定进 Kafka（可能重复），consumer 用 `processed_events` 兜住重复，遇到永远失败的坏消息用 `dead_letter_events` 隔离，任何分区都不会被单条消息卡死。整套机制之所以能做到高吞吐同时不丢不重，前提就是本节开头那一条：**RPC 里的业务写入和 outbox 事件写入必须在同一个本地事务内**。
 
 ### 9.2 Consumer 通用模式
 
@@ -1692,6 +2096,47 @@ go vet ./apps/... ./common/... ./tests/...
 ---
 
 ## 十七、最近更新（Changelog）
+
+### 2026-08-04（Outbox 保序 + 全链路死锁加固）
+
+**Outbox Dispatcher（`apps/job/outbox/internal/logic/dispatcher.go` + `deploy/sql/016_outbox_aggregate_status_index.sql`）**：
+
+- 认领 SQL 增加 `NOT EXISTS ... predecessor.status IN (pending, failed, dead, processing)` 子句：同一 aggregate 必须等前序事件 `sent` 后才允许下一条投递，从源头杜绝 `create/delete`、`like/unlike`、`follow/unfollow` 反序。
+- 认领改为短事务一次性拉一批 + 共享 `lock_token`；投递阶段用 `splitOutboxBatches` 按 worker 数（默认 4，上限 32）均匀分片，每分片一次性调用 `Producer.PublishBatch` 避免逐条投递耢同 BatchTimeout。
+- 主循环使用 `inFlight` 1-位令牌旺，匆匆 tick 时自动 skip 并报 warn，防止堆积时无限创建 goroutine。
+- 成功路径一条 `UPDATE ... WHERE id IN (...) AND status=processing AND lock_token=:token` 批量回写 `sent`，失败路径逐条 `markFailed` 阶梯退避，超 `MaxRetry` 后转 `dead` 需人工干预。日志错误文本上限 1024 rune 防止日志盘爆盘。
+
+**Social 事务（`apps/social/internal/logic/{followlogic,unfollowlogic,socialhelper}.go`）**：
+
+- Follow/Unfollow 整个事务包裹在 `runSocialWriteTransaction` 里，对 MySQL 1213/1205 有限重试（默认 3 次，指数退避 20ms→200ms 上限，附 50% 拖抽），其余错误不重试。
+- 移除 Follow 事务里的 `AccountRpc.GetProfile` 预检，直接依靠 follows 外键在 INSERT 时失败并映射为 `codes.NotFound`，减少一次 RPC + 一段长持锁时间。
+- 移除 follows 开头对不存在唯一键的 `SELECT ... FOR UPDATE`（旧实现会产生 gap lock 以至于 INSERT 时升级为插入意向锁并引发死锁），改为普通 `Take` 预读 + `ON DUPLICATE KEY DO NOTHING` + 冲突后回读加锁。
+
+**Notification Job（`apps/job/notification/internal/logic/consumer.go`）**：
+
+- 事务重试循环对 1213/1205 有限重试（默认 3，上限 8，依 `DBRetryBase/MaxMs` 退避）。
+- 每轮重试**新建 `attemptBumpReceivers` 局部集合**，已回滚事务里的 receiver 不会被带到后续成功提交后交 bump，涻除“MySQL 回滚但未读版本号已递增”的脏数据。
+
+**Video PublishVideo（`apps/video/internal/logic/{publishvideologic,fileassethelper}.go`）**：
+
+- `orderedFileAssetURLs` 对 `play_url / cover_url` **去重后升序**排列，事务内同顺序调用 `reserveFileAssetRefByURL`。任何两个并发发布事务的资产行加锁序一致，从根源消除资产维度锁序反转。
+
+**Interaction Sync（`apps/job/interaction_sync/internal/logic/syncconsumer.go`）**：
+
+- 提取 `callFlushRPCWithRetry` 泛型包裹 Flush RPC，对 `Aborted/Unavailable/DeadlineExceeded/ResourceExhausted` 在当前 partition worker 内退避重试。成功分区不会因其他分区报错而被重新消费，offset 仍可前推。
+- `shouldLogFlushRPCRetry` 只在首次与每 10 次重试时写 error 日志，避免长时下游故障后日志洪水。
+- 默认 batch 与 flush 均为 **500**（`syncconsumer.go` 常量 + `interaction_sync.yaml`），上限 500；`Kafka.BatchSize` 先于 `Sync.BatchSize` 只在 Sync 未配时作为兑底。
+
+**Interaction 域内**：
+
+- `videoStatDeltaUpdates` 不再以 `GREATEST(..., 0)` 封顶（防止 Kafka 乱序下“先处理 -1 再处理 +1”错误收敛为 0），仅在读路径 `realtimeLikesCount / batchGetVideoStats` 完成回带 delta 后才用 `nonNegative` 兑底。
+- `InteractionDeltaPendingCountKey(videoID)` 作为独立收敛不变量：最后一个 pending 事件 ack 后强制删除该视频三类增量字段，消除并发交错遗留的“孤立 delta”。
+
+**测试**：
+
+- 新增/更新单元测试：`dispatcher_test.go`（claim SQL 包含 NOT EXISTS 与 splitOutboxBatches）、`syncconsumer_test.go`（callFlushRPCWithRetry / shouldLogFlushRPCRetry / normalizeSyncBatchSize）、`consumer_test.go`（isRetryableNotificationDBError 覆盖 1213/1205 与 wrapped error）、`fileassethelper_test.go`（orderedFileAssetURLs 去重升序）、`jobhelper_test.go`（videoStatDeltaUpdates 去 GREATEST）。`go test ./...` / `go vet ./...` 均零告警零失败。
+
+**文档补充**（`docs/PROJECT_OVERVIEW.md` §9.1）：新增 4 个小节沉淀 Outbox 深度概念——`9.1.1 三层并发单位模型`（集群 / 进程 / 单轮）、`9.1.2 生命周期同步：inFlight 与 WaitGroup 的分工`（并发限制 vs 优雅关闭）、`9.1.3 X 锁 vs 业务层租约`（区分 MySQL 行锁 & lock_token 印章，明确 outbox 是租约模型）、`9.1.4 两阶段独立 ctx 与失败路径的原子处理`（Kafka/DB 各自超时预算、整批重试逐条 markFailed 首错记录、无缓冲 channel + 双 case select 优雅退出）。原 9.1.5 消费者失败处理小节保持不变。
 
 ### 2026-08-03（互动同步吞吐优化与正式规模验收）
 
