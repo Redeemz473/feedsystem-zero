@@ -75,7 +75,7 @@ flowchart LR
     Social --> MySQL
     Notification --> MySQL
 
-    Account --> Redis[("Redis<br/>Profile 版本号缓存<br/>点赞计数 / delta pending·acked<br/>Timeline ZSet / 热榜快照<br/>未读数 version / 秒传全局哈希"]
+    Account --> Redis[("Redis<br/>Profile 版本号缓存<br/>点赞计数 / delta pending·acked<br/>Timeline ZSet / 热榜快照<br/>未读数 version / 秒传全局哈希")]
     Video --> Redis
     Interaction --> Redis
     Social --> Redis
