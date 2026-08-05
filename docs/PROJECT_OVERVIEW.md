@@ -277,9 +277,8 @@ erDiagram
     }
     processed_events {
         BIGINT id PK
-        VARCHAR event_id
-        VARCHAR consumer_name
-        UK event_consumer "幂等键"
+        VARCHAR event_id UK "与 consumer_name 组成幂等键"
+        VARCHAR consumer_name UK
     }
     dead_letter_events {
         BIGINT id PK
