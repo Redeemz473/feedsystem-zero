@@ -93,7 +93,7 @@ func (l *UpdateProfileLogic) UpdateProfile(in *account.UpdateProfileReq) (*accou
 		return nil, status.Error(codes.Internal, "更新用户信息失败")
 	}
 
-	// 版本化缓存避免并发回源把更新前的旧资料重新写成有效缓存。
+	// 版本化缓存避免并发回源把更新前的旧资料重新写成Redis里的有效缓存。
 	// Redis 失败不回滚已经提交的 MySQL 更新，缓存会在 TTL 到期后自然恢复一致。
 	if err := l.svcCtx.RedisCli.Incr(l.ctx, rediskey.AccountPublicProfileVersionKey(userid)).Err(); err != nil {
 		l.Errorf("bump public profile cache version failed, userID: %d, error: %v", userid, err)

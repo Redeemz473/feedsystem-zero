@@ -66,7 +66,7 @@ func (l *RefreshTokenLogic) RefreshToken(in *account.RefreshTokenReq) (*account.
 
 	result := l.svcCtx.GormDB.WithContext(l.ctx).
 		Model(&model.Account{}).
-		Where("id = ? AND refresh_token = ?", user.ID, oldRefreshToken).
+		Where("id = ? AND refresh_token = ?", user.ID, oldRefreshToken). //乐观锁，保证并发情况下只有一个能够改变refresh_token
 		Update("refresh_token", newRefreshToken)
 	if result.Error != nil {
 		l.Errorf("save refresh token failed, userID: %d, error: %v", user.ID, result.Error)

@@ -196,7 +196,7 @@ func (d *Dispatcher) dispatchClaimedEvents(ctx context.Context, events []model.O
 		return nil
 	}
 
-	// 每个 claim 批次中，同一 aggregate 最多只有一个事件，因此可以将不同aggregate 分成若干批并发发送。每个批次只调用一次 WriteMessages，避免每条事件都单独等待 Kafka BatchTimeout。
+	// 每次的整个 claim 批次中，同一 aggregate 最多只有一个事件，因此可以将不同aggregate 分成若干批并发发送。每个批次只调用一次 WriteMessages，避免每条事件都单独等待 Kafka BatchTimeout。
 	batches := splitOutboxBatches(events, workerCount) //把events大致均分成workerCount个段，每个段里包含多个events
 	jobs := make(chan []model.OutboxEvent)             //任务分发管道
 	var wg sync.WaitGroup
@@ -253,7 +253,7 @@ func (d *Dispatcher) dispatchClaimedBatch(ctx context.Context, events []model.Ou
 	now := time.Now()
 	if publishErr != nil {
 		// kafka-go 的同步批量写在超时或部分失败时可能已经写入部分消息。
-		// 整批进入重试会产生重复投递，但不会丢消息，consumer 幂等负责去重。
+		// 这一个分片的整批进入重试会产生重复投递，但不会丢消息，consumer 幂等负责去重。
 		var firstMarkErr error
 		for _, event := range events {
 			if err := d.markFailed(markCtx, event, publishErr, now); err != nil && firstMarkErr == nil {
@@ -385,8 +385,7 @@ func dueOutboxScope(now, staleBefore time.Time) func(*gorm.DB) *gorm.DB {
 			staleBefore,
 		).Where(
 			// 同一聚合只允许最早的未完成事件被 claim。
-			// idx_aggregate_status_id 让子查询只扫描四种未完成状态，避免遍历
-			// 同一聚合已经发送的全部历史事件。
+			// idx_aggregate_status_id 让子查询只扫描四种未完成状态，避免遍历同一聚合已经发送的全部历史事件。
 			// dead 事件也会阻塞后续事件，要求先人工补偿，不能静默越过并破坏顺序。
 			`NOT EXISTS (
 				SELECT 1

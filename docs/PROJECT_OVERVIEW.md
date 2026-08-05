@@ -413,6 +413,27 @@ sequenceDiagram
 | `BatchGetProfiles` | Feed / 评论列表批量拉作者信息 |
 | `UpdateProfile` | 更新头像 / bio；事务内 INCR profile version |
 
+**双 Token 机制（access token + refresh token）**：
+
+在"安全性"与"用户体验"之间做折中，两个 token 各司其职：
+
+| 维度 | `access_token` | `refresh_token` |
+|---|---|---|
+| 本质 | JWT，自签名可自验证 | 随机字符串，本身不含信息 |
+| 有效期 | 短（`AccessExpire=900s`，15 分钟） | 长（可配 7~30 天） |
+| 用途 | 每个业务 API 请求都带，Gateway 层校验 | **仅** `/account/refresh` 时使用 |
+| 存放位置 | Redis `fsz:token:{userID}`（白名单，支持强制登出） | MySQL `accounts.refresh_token`（有状态） |
+| 服务端校验 | secret 本地验签 + Redis 白名单比对，不查 MySQL | 必须 `SELECT ... WHERE refresh_token=?` 查 MySQL |
+| 主动作废 | Logout 时 `DEL fsz:token:{userID}` | Logout 时 `UPDATE refresh_token=NULL`；每次刷新自动轮换 |
+
+**设计目标**：
+- **降低泄漏风险**：access token 每次请求都带，暴露面大，用 15 分钟短有效期把破坏窗口压到最小；refresh token 只在续期接口出现，暴露面小。
+- **用户体验无感续期**：前端拦 401 → 用 refresh token 悄悄换新 access token → 重放业务请求，用户不需要重新输账号密码。
+- **服务端可控**：改密码 / 风控 / 多端下线时，DB 清空 `refresh_token` + Redis DEL 白名单，即可让用户在 15 分钟内被强制打回登录页。这补齐了纯无状态 JWT "无法主动踢人"的短板。
+- **Refresh Token Rotation（轮换）防重放**：`RefreshToken` RPC 每次都同时下发**新的** refresh token 并作废旧的，DB 更新用 `WHERE id=? AND refresh_token=旧值` 的 CAS 语义，保证同一份 refresh token 只能被消费一次。一旦被盗，真用户和攻击者必有一方在下次刷新时被 401 踢出，账号盗用可被及时发现。
+
+---
+
 **Profile 版本号缓存流程**：
 
 ```mermaid
@@ -748,6 +769,171 @@ flowchart TD
 | 幂等与恢复 | `processed_events` + pending/acked/pending_count | 重复消费与 DB 提交后 Redis ack 中断可恢复 |
 
 **不要宣称“单机已经支持万级 QPS”**。本项目的可信结论来自 §14.6 的本机压测：正式数据集为 10000 用户、5000 视频；点赞场景最终达到约 `260.4 次业务循环/s`，每个循环包含 Like+Unlike 两个写请求，即约 `520.8 HTTP 写请求/s`，并在压测结束约 7 秒后把 Kafka lag 完全排空。该结果证明的是当前单机开发环境下约 500 事件/s 的可持续闭环，而不是生产集群上限。
+
+#### 8.3.2 批量聚合详解：从 N 条点赞事件到 M 条 UPDATE
+
+用户经常担心的问题：**“是不是每一次点赞都要单独 UPDATE 一次 MySQL？”**
+
+答：**不是**。如果真是每点赞都单独 `UPDATE videos SET likes_count = likes_count + 1 WHERE id = ?`，同一个热门视频的所有点赞会串行争抢同一行的 InnoDB 行锁，单行 QPS 上限只有几百，高并发场景直接崩溃。
+
+本项目采用业界标准的 **write-behind + batch aggregation（写回缓存 + 批量聚合）** 方案，将 N 条点赞事件压缩为 M 条 UPDATE（M ≤ 去重后的视频数，通常 M ≪ N），下面把整条数据通路完整讲清楚。
+
+##### 一、整体数据流
+
+```mermaid
+flowchart LR
+    U[用户点赞 RPC] -->|事务| DB1[(MySQL<br/>likes / interaction_events / outbox_events)]
+    U -->|Lua 脚本| R1[(Redis<br/>pending + delta 立即可见)]
+    DB1 -.outbox.-> OD[outbox dispatcher<br/>扫表分发]
+    OD --> K[Kafka<br/>interaction.like.events<br/>6 partition]
+    K --> C[interaction_sync Consumer<br/>topic+partition 组内保序、组间并发]
+    C -->|累积 500 条<br/>或 100ms 超时| RPC[FlushLikeEvents RPC]
+    RPC --> AGG[内存 map 按 videoID 聚合<br/>deltasByVideo]
+    AGG --> TX[一个 MySQL 事务]
+    TX -->|batch INSERT processed_events| DB2[(MySQL)]
+    TX -->|M 条 UPDATE videos<br/>按 videoID 升序| DB2
+    TX -->|一次 COMMIT| DB2
+    TX --> ACK[按 eventID 逐条 ack Redis<br/>delta - 1 且 SET acked]
+```
+
+##### 二、关键参数与代码位置
+
+| 参数 / 常量 | 值 | 位置 | 作用 |
+|---|---|---|---|
+| `FlushMs` | 100 | `apps/interaction/etc/interaction.yaml` | Consumer 累积多久强制 Flush 一次 |
+| `maxFlushInteractionEvents` | 500 | `apps/interaction/internal/logic/jobhelper.go` | 单个 RPC 批次最多多少条事件 |
+| Kafka partition 数 | 6 | `deploy/kafka/` | Consumer 端并发上限 |
+| `deltasByVideo` map | — | `applyInteractionFlushBatch` in `jobhelper.go` | 按 videoID 在内存里合并 delta |
+| `sortedVideoStatDeltaIDs` | — | 同上 | UPDATE 前按 videoID 升序，防止死锁 |
+
+##### 三、聚合核心代码（`applyInteractionFlushBatch`）
+
+```go
+return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+    deltasByVideo := make(map[uint64]videoStatDelta)      // ★ 按 videoID 聚合
+    for _, event := range orderedEvents {
+        inserted, err := insertProcessedEvent(ctx, tx, event.EventID, ...)
+        if err != nil { return err }
+        if !inserted { continue }                          // 幂等：已处理过则跳过
+        deltasByVideo[event.VideoID] = mergeVideoStatDelta( // ★ 内存合并
+            deltasByVideo[event.VideoID], event.Delta)
+    }
+    for _, videoID := range sortedVideoStatDeltaIDs(deltasByVideo) {
+        delta := deltasByVideo[videoID]
+        if delta == (videoStatDelta{}) { continue }
+        // ★ 每个视频只发一条 UPDATE：likes/comments/popularity 合并到一条
+        if err := applyVideoStatDelta(ctx, tx, videoID, delta); err != nil {
+            if errors.Is(err, gorm.ErrRecordNotFound) { continue } // 视频已删除也提交 processed_events，防永久重试
+            return err
+        }
+    }
+    return nil
+})
+```
+
+##### 四、对比示例：热门视频 1 秒 1000 次点赞
+
+**❌ 假想的糟糕方案：每条单独 UPDATE**
+
+```text
+1000 次 UPDATE videos SET likes_count = likes_count + 1 WHERE id = V1
+
+后果：
+- 1000 次网络往返、1000 次事务提交、1000 次 fsync
+- 全部串行化在同一行行锁上，单行 QPS 上限 ≈ 几百
+- 主从复制延迟激增
+```
+
+**✅ 当前实际方案：Consumer 累积 + 内存聚合**
+
+```text
+Consumer 累积 100ms 或 500 条事件（先到者触发），假设一批全是 V1：
+
+FlushLikeEvents(batch=500):
+  ├─ deltasByVideo[V1] = { LikeDelta: 500, PopularityDelta: 500 }
+  └─ 事务内：
+       INSERT INTO processed_events VALUES (...500 条 ...) -- batch INSERT
+       UPDATE videos SET likes_count      = likes_count      + 500,
+                         popularity_score = popularity_score + 500
+             WHERE id = V1  ← ★ 只有一条 UPDATE ★
+       COMMIT
+
+结果：
+- 1 次网络往返、1 次事务提交、1 次 fsync
+- 行锁只 acquire 一次，持有时间毫秒级
+- 500 条事件的行锁竞争压缩为 1 次
+```
+
+##### 五、多视频批次的聚合示例
+
+一批 500 条事件如果覆盖 3 个不同视频：
+
+```text
+V1: 300 次点赞
+V2: 150 次点赞
+V3:  50 次点赞
+
+事务内按 videoID 升序执行：
+  UPDATE videos SET likes_count = likes_count + 300 WHERE id = V1
+  UPDATE videos SET likes_count = likes_count + 150 WHERE id = V2
+  UPDATE videos SET likes_count = likes_count + 50  WHERE id = V3
+  COMMIT
+```
+
+**为什么必须升序**：任何两个 Consumer worker 同时处理时，都按同一顺序 acquire 行锁，绝不会形成 A 等 B、B 等 A 的循环等待，从根源杜绝死锁。
+
+##### 六、聚合放大倍数与吞吐估算
+
+| 环节 | 单次开销 | 相对原始事件的压缩比 |
+|---|---|---|
+| 用户点赞 RPC 事务 | MySQL 事务 + 3 次 Redis Lua（O(1)） | 无聚合（1:1） |
+| Kafka 消费 | 一次 poll 拉 500 条 | 500:1 |
+| MySQL 事务提交 | 1 次 batch INSERT + M 次 UPDATE（M ≤ 视频数） | 视频重复率越高压缩比越大 |
+| MySQL 行锁持有时间 | 毫秒级 | 同一热点视频的锁竞争几乎消失 |
+
+**在热点视频场景下，压缩比几乎等于批次里同一视频的重复次数**。爆款视频每秒 10 万点赞，可以被压缩成"每 100ms 一条 UPDATE"，MySQL 完全扛得住。
+
+##### 七、读写分离带来的高并发保护
+
+用户读点赞数的路径**完全不打 MySQL**：
+
+```text
+realtimeLikesCount(videoID)
+  = MySQL基准值(缓存 VideoStatsCacheKey) + Redis 实时 delta
+
+  ├─ VideoStatsCacheKey 命中 → Redis O(1) 返回
+  ├─ VideoStatsCacheKey miss  → 回源 MySQL 一次，再回填缓存
+  └─ Redis delta hash HGET    → Redis O(1)
+```
+
+**MySQL 写路径**：每秒最多几百次（500 条一批 × 每批几十毫秒事务）。
+**Redis 读路径**：每秒可以到数万次（走 §8.3 描述的 `MySQL 基准 + Redis delta` 合成）。
+
+这就是"读写分离 + 写回缓存"的性能保证：**在线路径不打 MySQL，MySQL 只承担最终一致性事实源角色**。
+
+##### 八、这套架构在业界的对应位置
+
+- **抖音**："互动流水异步聚合"
+- **B 站 / 微博**："计数器服务 / stat 服务"
+- **通用名称**：Write-Behind Caching + Event Sourcing + Batch Aggregation
+
+**共同特征**（本项目全部具备）：
+
+1. **写入**：先写 Redis（实时可见）+ 事务性事件流水（`outbox_events` → Kafka）
+2. **异步聚合**：Consumer 批量拉取事件，按业务主键（`videoID`）内存聚合
+3. **批量落库**：一个事务处理 500 条事件，只发 M 条 UPDATE（M = 去重后的视频数）
+4. **幂等**：`processed_events` 唯一索引兜底重复消费（同一 event_id + consumer_name 只落一次）
+5. **降级**：Redis 挂了回源 MySQL；MySQL 挂了 Consumer 停下来等，Kafka 兜住事件不丢
+
+##### 九、总结要点
+
+- ❌ **不是**每个点赞单独 UPDATE MySQL
+- ✅ Kafka Consumer 每 `FlushMs=100` 毫秒或每 `maxFlushInteractionEvents=500` 条触发一次批处理（先到者为准）
+- ✅ 一个事务内通过 `deltasByVideo` map **按 videoID 内存聚合**，每个视频只发一条 UPDATE
+- ✅ UPDATE 按 **videoID 升序**执行，杜绝多 worker 死锁
+- ✅ 事务内先 `INSERT processed_events` 做幂等，冲突则跳过对应 delta，防止重复消费
+- ✅ 读路径走 Redis（`MySQL 基准 + Redis delta`），MySQL 仅承担最终一致性事实源
+- ✅ 这是业界标准的 write-behind + batch aggregation，热门视频的高并发点赞可以被高效吞下
 
 ---
 
@@ -1785,6 +1971,193 @@ flowchart TD
 - 点赞数、评论数、热度的 Kafka 聚合必须保留**有符号增量**，使用普通 `column + delta`。原因是不同 partition、重试或人工重放可能让 `-1` 先于 `+1` 到达；若每一步都截断为 0，最终会错误收敛到 1。
 - 用户读侧统一通过 `nonNegative` 截断展示值；定期/人工 `RebuildVideoInteractionStats` 从 `likes/comments` 事实表重建聚合字段，作为最终校准手段。
 
+### 12.5 事务后 Redis 失败的兜底路径
+
+写路径普遍采用「MySQL 事务 COMMIT → 事务后同步失效 Redis 缓存（尽力而为，失败不阻塞）」模式。这里必须理清：**"Redis 写失败会不会导致用户长期看到旧缓存？"** 答案是——**不会**，且原因取决于失败的是哪一类 Redis 操作。事务后要动的 Redis 分为三类，各有不同兜底：
+
+#### 12.5.1 三类 Redis 操作与失败后果
+
+| 类别 | 代表操作 | 失败后果 | 自愈路径 |
+|---|---|---|---|
+| **增量维护类** | 点赞/评论 `applyInteractionDelta`：SET pending + HINCRBY delta + DEL VideoStatsCacheKey | 短时读到**旧但一致**的值（`MySQL 100 + Redis 0 = 100`），不会算错 | Kafka Consumer ack 阶段发现 pending 不存在，走"不减 delta"分支，MySQL 涨到 101 后自动收敛 |
+| **版本号 INCR 类** | `INCR LikeUserVideosListVersionKey / CommentListVersionKey` | 短时看到旧列表（版本号没涨，旧 key 仍命中） | ① 版本号 key 本身有 TTL 自动过期；② Consumer 侧 ack 脚本再 INCR 一次（双保险） |
+| **状态 SET 类** | `SET LikeStateKey`、`SAdd LikeUserVideosKey` | 用户本人看到的"是否点赞过"短时不同步；点了赞的视频没进"我的点赞列表" | ① 各 key 有 `likeStateTTL` 过期后回源 MySQL 事实表；② 重复点赞时事务开头 `SELECT likes` 走幂等分支，不会导致重复计数 |
+
+#### 12.5.2 为什么"Redis 失败不阻塞"是安全的？
+
+**四层安全网**，一层比一层慢，一层比一层可靠：
+
+```mermaid
+flowchart TD
+    A[MySQL 事务 COMMIT<br/>权威事实已落地] --> B{事务后 Redis 操作}
+    B -->|成功| C[用户立刻看到最新值]
+    B -->|失败, 只 log 不阻塞| D[核心业务已成功<br/>返回 fallback 值给客户端]
+    D --> E1[路径①: Kafka Consumer ack<br/>秒级再写一次 Redis]
+    D --> E2[路径②: Redis key TTL 过期<br/>分钟级回源 MySQL 重建]
+    D --> E3[路径③: 版本号 INCR<br/>使旧 key 自然作废]
+    D --> E4[路径④: RebuildVideoInteractionStats<br/>定期从事实表重建]
+    E1 & E2 & E3 & E4 --> F[✅ 最终收敛到 MySQL 权威值]
+```
+
+1. **MySQL 是唯一权威源**：事务已 COMMIT，事实（likes 行、outbox_events 行）已经落地，任何 Redis 失败**不影响真相**；
+2. **Kafka Consumer 是"第二次机会"**：Outbox 保证 at-least-once 投递，Consumer 在 Flush 后再走一次 `acknowledgeInteractionDeltaScript`，会**再一次** DEL stats cache、INCR 版本号——事务后失败的 Redis 动作在这里被补偿；
+3. **所有业务 key 都有 TTL**：`LikeStateKey`（分钟级）、`ListVersionKey`（小时级）、`VideoStatsCacheKey`（短 TTL）——**没有永生的坏缓存**，最坏窗口就是 TTL；
+4. **读路径普遍支持"回源 MySQL"降级**：`realtimeLikesCount`、`batchGetVideoStats` 等在 Redis miss / 报错时会退到 MySQL 事实表，性能变慢但**逻辑绝对正确**。
+
+#### 12.5.3 写侧 `fallbackLikesCount` 兜底
+
+对**用户本人这一次请求**的返回值，也做了单独兜底。看 `LikeVideo`：
+
+```go
+// 事务前先读一次 MySQL 得到基准 likes_count，算出"操作后应该显示的最小值"
+fallbackLikesCount = nonNegative(video.LikesCount) + 1
+
+// 事务 COMMIT 后尝试写 Redis
+likesCount := fallbackLikesCount
+if err := applyRedisLikeState(...); err != nil {
+    l.Errorf("apply redis like state failed after mysql committed, ...")
+    // Redis 失败：返回 fallbackLikesCount = 事务前值 + 1
+} else {
+    likesCount = realtimeLikesCount(...)   // Redis 成功：返回 MySQL 基准 + Redis delta
+}
+return &LikeVideoResp{Liked: true, LikesCount: likesCount}
+```
+
+**保证**：客户端收到的点赞数**永远不小于"我点赞前看到的数 + 1"**，杜绝"点了赞但显示的数还变小了"这种反直觉体验。
+
+#### 12.5.4 Redis 集群整体宕机的极端场景
+
+- ✅ 点赞、评论、发布等**写操作全部正常**（MySQL 事务和 Kafka 消息不依赖 Redis）；
+- ⚠️ 所有列表、计数接口**性能大幅下降**（每次读回源 MySQL），QPS 掉到 MySQL 上限；
+- ⚠️ 用户看到"我刚点赞的视频没进我的点赞列表"——最长几分钟，Consumer 侧版本号 INCR 会把它救回来；
+- ⚠️ 点赞数**滞后 1~2 秒**（因为 Redis delta 拿不到，只能读 MySQL 基准值）——但 Kafka Consumer 秒级会把值刷进 videos 表；
+- ❌ **绝对不会**：点赞数长期错误、点了赞但 MySQL 没记录、点了赞作者永远收不到通知。
+
+### 12.6 pending/ack 双标记：Redis 失败为什么不会污染 MySQL 权威值
+
+`applyInteractionDeltaScript` / `acknowledgeInteractionDeltaScript` 这两段 Lua 脚本是整套架构的"化学键"——它让**在线 RPC 写 delta** 与 **Job ack 减 delta** 无论谁先谁后、失败多少次、重试多少次，同一个 `eventID` 对 delta 的净贡献都是 **0**。
+
+#### 12.6.1 两个标记 Key 的角色
+
+| Key | 生命周期 |
+|---|---|
+| `fsz:interaction:delta:pending:{eventID}` | 在线路径 SET 建立；Consumer ack 时 DEL（或 TTL 7 天过期） |
+| `fsz:interaction:delta:acked:{eventID}` | Consumer ack 时 SET；TTL 7 天过期 |
+| `fsz:interaction:delta:pending_count:{videoID}` | 每次 SET pending 时 INCR；每次 DEL pending 时 DECR；归零时强制 HDEL 三个 delta hash（收敛不变量） |
+
+`eventID` 的状态机只有三种合法路径：
+- `(无) → pending → acked`（**场景 A**：正常时序）
+- `(无) → acked`（**场景 B**：在线写 Redis 失败，或 **场景 C**：Consumer 抢先执行）
+
+#### 12.6.2 在线路径 Lua：`applyInteractionDeltaScript`
+
+```lua
+-- 关卡①: 如果 acked 已存在（Consumer 走在了 RPC 前面），直接放弃
+if redis.call("EXISTS", acked_key) == 1 then return 0 end
+
+-- 关卡②: SET pending NX，若已存在（重复调用）则不重复写
+local inserted = redis.call("SET", pending_key, "1", "NX", "EX", 7d)
+if not inserted then return 0 end
+
+-- 走到这里才是"首次真正写入"：SET pending 和 HINCRBY delta 在同一 Lua 原子块
+HINCRBY like_delta / comment_delta / popularity_delta
+INCR pending_count:{videoID}
+DEL VideoStatsCacheKey:{videoID}
+return 1
+```
+
+**Redis 保证 Lua 脚本单线程原子执行**——SET pending 与 HINCRBY delta **要么一起成功，要么都没发生**。不存在"写了 pending 但没写 delta"或"写了 delta 但没写 pending"的中间态。
+
+#### 12.6.3 离线路径 Lua：`acknowledgeInteractionDeltaScript`——**"没 SET 过 pending 就不减 delta"** 就在这里
+
+```lua
+-- ①: 已 ack 过（Consumer 重试到达），跳过
+if redis.call("EXISTS", acked_key) == 1 then return 0 end
+
+-- ★ 核心分支 ★
+if redis.call("EXISTS", pending_key) == 1 then
+    -- 只有 pending 存在时，才减 delta
+    subtract(like_delta_hash,       field, ARGV.like_delta)
+    subtract(comment_delta_hash,    field, ARGV.comment_delta)
+    subtract(popularity_delta_hash, field, ARGV.popularity_delta)
+    DEL pending_key
+    
+    -- pending_count 收敛不变量：视频最后一个 pending 归零时，
+    -- 强制清除 delta hash 中可能残留的字段（高并发交错、进程切换的兜底）
+    local remaining = DECR pending_count_key
+    if remaining <= 0 then
+        DEL pending_count_key
+        HDEL 三个 delta hash 的对应字段
+    end
+end
+-- 无论有没有 pending，都要 SET acked + DEL stats cache + INCR 版本号
+SET acked_key "1" EX 7d
+DEL VideoStatsCacheKey
+INCR ListVersionKey
+```
+
+**关键就在 `if EXISTS pending then subtract` 这个判断**：
+
+- **有 pending**（正常）：在线路径确实写过 `+1` 到 delta，此刻减 `-1` 抵消 → delta 归零 ✅
+- **无 pending**（在线 Redis 失败 / 消费者抢先 / 消息重放）：**跳过整个 subtract 分支**，delta 保持 0 → 加上 MySQL 已经更新到的 101，读侧算 `101 + 0 = 101` ✅
+
+#### 12.6.4 反例：如果没有这个 `if EXISTS pending` 判断会怎样？
+
+假设 ack 阶段无脑执行 `HINCRBY delta -1`，遇到"在线路径 Redis 写失败"的场景：
+
+```text
+在线写：Redis 完全失败，delta 还是 0
+Consumer：无脑 HINCRBY -1 → delta = -1
+MySQL：涨到 101
+读侧：101 + (-1) = 100 ❌ 永久少 1！
+```
+
+这就是**永久数据偏差 bug**——每一次"在线 Redis 失败"都会让计数少 1，累积下去越来越离谱。而 `if EXISTS pending` 这一行就是彻底拦住这个 bug 的关键——**pending 是在线路径留下的"我确实 +1 过"的凭证，没有凭证就不能减**。
+
+#### 12.6.5 四场景收敛值总结
+
+| 场景 | 在线路径 | Consumer ack | 最终 `MySQL + Redis delta` |
+|---|---|---|---|
+| **A 正常** | SET pending + delta+1 | pending 存在 → delta-1；SET acked | 101 + 0 = **101** ✅ |
+| **B 在线 Redis 失败** | 无 pending、无 delta 变化 | **pending 不存在 → 跳过 subtract**；SET acked | 101 + 0 = **101** ✅ |
+| **C Consumer 抢先** | 后到时发现 acked 已存在 → 拒写 | 先执行时 pending 不存在 → 跳过 subtract；SET acked | 101 + 0 = **101** ✅ |
+| **E ack 失败** | SET pending + delta+1 | ack Lua 执行失败，pending / delta 都没清 | 101 + 1 = 102 ⚠️ 短时偏差 |
+
+**注意**：场景 E 是唯一会造成偏差的场景，且**只会多算、不会少算**——`realtimeLikesCount = MySQL权威值 + Redis残留delta ≥ MySQL权威值`，用户**永远不会**看到少于真实值的点赞数。自愈路径有三条，作用范围与时间尺度**各不相同**：
+
+| 兜底路径 | 触发条件 | 时间尺度 | 能否清 delta 残留 |
+|---|---|---|---|
+| ① `pending_count` 归零 HDEL | 该视频**所有** pending 事件都被清完时（含 TTL 过期与 ack 抵消），下一次 ack 走到 `DECR pending_count → remaining <= 0` 分支 | 分钟到 7 天 | ✅ 能，但需等 pending TTL 过期后配合后续事件才触发 |
+| ② `pending:{E1}` TTL 7 天过期 | Redis 自动过期 | 7 天 | ❌ 只清 pending key 本身，不清对应的 delta hash 字段 |
+| ③ `RebuildVideoInteractionStats` 全量重建 | 定时或人工触发 | 分钟/小时/天（按运维配置） | ✅ 从 `likes/comments` 事实表 COUNT 权威重算，UPDATE `videos` + **清空 Redis 三个 delta hash** |
+
+**真正意义上的"delta 残留彻底清零"依赖兜底 ③——`RebuildVideoInteractionStats`**。兜底 ① 存在但触发条件苛刻（需要该视频完全"排空"pending 才能归零 HDEL），兜底 ② 只是防止 pending 表无限增长。
+
+**关键不变量**（无论处于哪个自愈阶段都成立）：
+- Redis delta 残留 ≥ 0（对 +1 事件），或残留成"pending 未清"的孤立记账；
+- MySQL 权威值绝对正确（Consumer Flush 事务已成功）；
+- 读侧 `realtimeLikesCount = MySQL权威 + Redis残留 ≥ MySQL权威`——**只多不少**；
+- 最终一定收敛到 MySQL 权威值（靠 `RebuildVideoInteractionStats`）。
+
+这是工业界处理"缓存与权威源不一致"的标准取舍：**用"轻微、短暂、方向可预测的偏差"换取"MySQL 永远权威 + Redis 只做加速"的架构清晰性**。
+
+### 12.6.6 追加原子性保证：Lua 脚本执行期间不可能被打断
+
+理解 pending/ack 双标记的**幂等前提**，是理解 Redis 单线程 Lua 执行模型：
+
+- **Redis 主线程单线程执行命令**（Redis 6+ 的多 I/O 线程只并行处理网络读写，命令执行仍是单线程串行）；
+- **Lua 脚本被 Redis 视为一个原子命令**——一旦 `EVAL` 开始执行，直到 `return` 之前，Redis 主线程**不会处理任何其他命令**，包括其他客户端的 `EVAL / SET / GET`；
+- 其他并发到达的命令即使物理上已经到达 Redis 服务器，也只能躺在 TCP receive buffer 里排队，直到当前 Lua 脚本结束后才会被主线程逐个取出处理。
+
+**推论：不存在"acknowledge 脚本执行到 SET acked 之前，applyInteractionDelta 插进来读到 acked 不存在"的时序**。真实时序只能是二选一：
+
+- 情况 ①：apply 的 EVAL 在 acknowledge **整体开始前**到达 Redis → apply 先执行完整走完（SET pending + HINCRBY delta），随后 acknowledge 才执行（读到 pending 存在，走 subtract 归零，SET acked）——这就是**场景 A（正常）**；
+- 情况 ②：apply 的 EVAL 在 acknowledge **整体结束后**才被主线程处理 → apply 读到 acked 已存在，第一行 `EXISTS acked_key == 1` 直接 `return 0` 拒绝——这就是**场景 C（Consumer 抢先）**。
+
+**注意**：`applyInteractionDeltaScript` 内部的 `EXISTS acked → SET pending NX → HINCRBY delta` 三步同样在**同一个 Lua 脚本**里执行，因此也不存在"检查完 acked 不存在、还没写 pending，此时 ack 脚本插进来 SET acked"的中间态。
+
+这就是为什么 pending/ack 双标记能做到"天然幂等"——**不是靠代码层面的 mutex 或分布式锁，而是靠 Redis 主线程物理上就无法并发执行两段 Lua**。
+
 ---
 
 ## 十三、Gateway HTTP API 汇总
@@ -2096,6 +2469,17 @@ go vet ./apps/... ./common/... ./tests/...
 ---
 
 ## 十七、最近更新（Changelog）
+
+### 2026-08-05（文档：批量聚合详解补充）
+
+**PROJECT_OVERVIEW §8.3.2 新增章节「批量聚合详解：从 N 条点赞事件到 M 条 UPDATE」**：
+
+- 澄清"是不是每次点赞都单独 UPDATE MySQL"这个高频疑问，明确本项目采用业界标准的 write-behind + batch aggregation 方案。
+- 给出完整数据流图（用户 RPC → Redis 立即可见 → outbox → Kafka → interaction_sync Consumer → 100ms/500 条触发 Flush → 内存 `deltasByVideo` 聚合 → 单事务 M 条 UPDATE → 按 eventID ack Redis）。
+- 列出关键参数与代码位置：`FlushMs=100`、`maxFlushInteractionEvents=500`、`applyInteractionFlushBatch`、`sortedVideoStatDeltaIDs`（升序 UPDATE 防死锁）。
+- 用对比示例说明"1000 次单条 UPDATE" vs "1 次聚合 UPDATE" 的性能差异，量化聚合放大倍数与吞吐估算。
+- 说明读写分离带来的高并发保护：读路径完全走 Redis（`MySQL 基准 + Redis delta`），MySQL 只承担最终一致性事实源角色。
+- 补充业界对标（抖音/B 站/微博的计数器服务）与本项目在此模式上的具体落地要点。
 
 ### 2026-08-04（Outbox 保序 + 全链路死锁加固）
 
