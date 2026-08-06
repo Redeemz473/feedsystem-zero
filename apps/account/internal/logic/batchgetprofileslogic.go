@@ -302,12 +302,14 @@ func (l *BatchGetProfilesLogic) cachePublicProfileMisses(
 			continue
 		}
 		currentVersion, err := publicProfileVersionResult(versionCmds[userID])
+		//判断此时版本是否一致，不一致则不把旧数据写入缓存
 		if err != nil || currentVersion != expectedVersion {
 			continue
 		}
 
-		cached := publicProfileCacheValue{UserID: userID, Missing: true}
+		cached := publicProfileCacheValue{UserID: userID, Missing: true} //先默认是负缓存
 		ttl := rediskey.AccountPublicProfileMissingTTL
+		//如果是从DB找到了该缓存，则重新赋值
 		if profile, found := profileMap[userID]; found {
 			cached = publicProfileCacheValue{
 				UserID:         profile.GetUserId(),

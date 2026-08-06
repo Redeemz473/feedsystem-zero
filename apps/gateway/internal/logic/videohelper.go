@@ -627,6 +627,7 @@ func loadUploadedChunks(ctx context.Context, redisCli *redis.Client, uploadID st
 func lookupInstantUploadedFile(ctx context.Context, redisCli *redis.Client, db *gorm.DB, upload config.UploadConf, userID uint64, fileHash string) (string, error) {
 	// Redis 只用于加速，file_assets 状态和磁盘文件才决定能否秒传。
 	// 这样视频最后一个引用被删除后，即使旧秒传 key 尚未过期，也不会返回待清理文件。
+	// 先查DB上file_assets表看视频是否真的存在
 	var asset model.FileAsset
 	err := db.WithContext(ctx).
 		Where("file_hash = ? AND file_type = ? AND status = ?", fileHash, model.FileAssetTypeVideo, model.FileAssetStatusActive).
@@ -642,12 +643,13 @@ func lookupInstantUploadedFile(ctx context.Context, redisCli *redis.Client, db *
 		return "", status.Error(codes.Internal, "查询视频资源失败")
 	}
 
+	//如果DB表里的存在的话，再判断磁盘上文件是否真的存在
 	info, err := os.Stat(asset.StoragePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) && asset.RefCount == 0 {
 			_ = db.WithContext(ctx).
 				Model(&model.FileAsset{}).
-				Where("id = ? AND status = ? AND ref_count = 0", asset.ID, model.FileAssetStatusActive).
+				Where("id = ? AND status = ? AND ref_count = 0", asset.ID, model.FileAssetStatusActive). //乐观锁，防止这段时间video publish了然后ref_count!=0
 				Updates(map[string]any{
 					"status":     model.FileAssetStatusDeleted,
 					"deleted_at": time.Now(),

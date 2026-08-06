@@ -437,21 +437,55 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    A["GetProfile userID"] --> B["GET fsz:account:profile:userID:version"]
+    A["GetProfile / BatchGetProfiles"] --> B["Pipeline#1: GET version key"]
     B --> C{"version 存在?"}
-    C -->|存在| D["GET fsz:account:profile:userID:v:version"]
-    D --> E{"cache hit?"}
-    E -->|hit| R1["返回缓存"]
-    E -->|miss| F["SELECT accounts WHERE id=userID"]
-    C -->|不存在| G["SET version=1 NX"]
-    G --> F
-    F --> H["SETEX cache 15min+jitter"]
+    C -->|存在 n| D1["expectedVersion = n"]
+    C -->|redis.Nil| D2["expectedVersion = 0<br/>（内存兜底，不写回 Redis）"]
+    D1 --> E["Pipeline#2:<br/>GET profile:v:expectedVersion<br/>+ 再 GET version key"]
+    D2 --> E
+    E --> F{"两次 version 相等?"}
+    F -->|不等| M1["视为 miss<br/>（并发写发生了）"]
+    F -->|相等 & 数据 hit| R1["返回缓存"]
+    F -->|相等 & 数据 miss| M2["视为 miss"]
+    M1 --> G["回源 MySQL"]
+    M2 --> G
+    G --> H["cachePublicProfileMisses:<br/>回填前再 GET version 校验<br/>currentVersion == expectedVersion 才 SET"]
     H --> R2["返回 MySQL 数据"]
 ```
 
 **关键点**：
-- 更新时 `INCR version`（原子），旧版本 key 无需删除，TTL 到期自动淘汰。
-- **粉丝数变化时也要 INCR 两侧的 version**（follower 和 following），否则 BatchGetProfiles 会读到旧的 follower_count。
+- **写侧独占 INCR**：`UpdateProfile`、`social` 关注/取关、`social_sync` 消费者是**唯二可以修改 version key 的地方**，全部用 `INCR`（原子递增）。旧版本 key 无需扫描删除，等 TTL 自然淘汰。
+- **粉丝数变化时也要 INCR 两侧的 version**（follower 和 following），否则 `BatchGetProfiles` 会读到旧的 follower_count。
+- **读侧永远只 GET，从不 SET version key**——这是版本化缓存能保证一致性的核心约束，下面单独展开。
+
+#### 8.1.1 为什么读侧不"重写"缺失的 version key
+
+`batchgetprofileslogic.go` 里读取 version key 用的是 `publicProfileVersionResult`，遇到 `redis.Nil` 会**直接返回 `(0, nil)` 兜底**，而**没有**任何 `SET version=0` 或 `SETNX` 的回填分支。这是刻意为之：
+
+1. **version key 是权威时钟，不是缓存**。它的语义是"这个用户资料迄今为止一共被写过多少次"，只能由**写路径**通过 `INCR` 单调递增。读侧一旦 SET，就相当于用一个"猜测值"覆盖时钟——任何和这次 SET 并发的写入都可能被"退回"，破坏 CAS 校验（`currentVersion == expectedVersion` 才回填）的正确性，甚至让旧数据长期钉死在新版本槽位里。
+2. **`redis.Nil → 0` 只在内存里生效**：读侧把 miss 当作"版本 0"来构造数据 key `profile:{uid}:v:0` 并走后续 CAS 流程，Redis 上 version key 该不存在就继续不存在。
+3. **和 Redis `INCR` 原生语义天然衔接**：Redis 对**不存在的 key 执行 `INCR` 会自动当作 0 递增**，第一次 `INCR` 完就是 1。所以：
+   - 读侧内存里假设"当前是版本 0" → 数据 key 用 `v:0`；
+   - 一旦写侧首次 `UpdateProfile`/关注写入，`INCR` 把 version 从"不存在"直接刷到 1，数据 key 切到 `v:1`，`v:0` 里的旧快照自然作废（等 TTL 淘汰）。
+   - 读、写两侧对"没写过的用户 = 版本 0"这个约定完全自洽，无需任何显式初始化。
+4. **version key 因此设计成永久 key（无 TTL）**：如果给它设 TTL，就会出现"版本 key 先过期、数据 key 还没过期"的窗口——那时读侧把 miss 归一为 0，可能撞上一份还没被淘汰的旧版本数据 key，读到脏数据。永久 version key + 有 TTL 的数据 key，是这套方案能自愈的前提。
+
+**权限总结**：
+
+| Key | 写侧 | 读侧 | TTL |
+|---|---|---|---|
+| `fsz:account:profile:{uid}:version` | 只允许 `INCR` | **只允许 `GET`**；miss 时**内存里当 0，不回写** | 永久 |
+| `fsz:account:profile:{uid}:v:{n}` | 一般不写（由读侧回填） | `GET` + CAS 校验后 `SET`（含正/负缓存） | 15min + 抖动 / 负缓存 1min |
+
+#### 8.1.2 BatchGetProfiles 的"两段 Pipeline + 二次校验"读路径
+
+`loadPublicProfilesFromCache` 和 `cachePublicProfileMisses` 一起构成完整的读-回填链路：
+
+- **读侧**：先一次 Pipeline 拿所有 version → 再一次 Pipeline 同时拿 `profile:v:{version}` 和"当前 version"；两次 version 不等 → 视为 miss（说明期间被并发写掉了）。
+- **回源**：miss 列表统一走一次 `WHERE id IN (...)` 主键 IN 查询，配合 `syncx.SingleFlight` 合并同一实例上相同 ID 集合的并发回源，降低热点资料刚过期时的 MySQL 瞬时压力。
+- **回填**：`cachePublicProfileMisses` 写入前**再 GET 一次 version**，只有 `currentVersion == expectedVersion` 才 SET `profile:v:{expectedVersion}`。任何一步版本不匹配都放弃回填，等下一次读请求用新版本号自然重新回源。
+- **负缓存防穿透**：MySQL 查不到的 userID 会写 `{Missing:true}` 短 TTL（`AccountPublicProfileMissingTTL=1min`）；读侧命中 `Missing:true` 直接跳过，不回源、不放进响应，避免无效 ID 反复打穿 MySQL。
+- **失败静默**：所有 Redis 错误只记日志、不返回错误——回填缓存是尽力而为，最坏后果只是下一次请求再走一次 DB。
 
 ---
 
@@ -469,7 +503,127 @@ flowchart LR
 | `ListUserVideos` | 用户主页视频列表，游标分页 |
 | `DeleteVideo` | 软删除：`status=2, deleted_at=now`，file_assets.ref_count-1，发 outbox(video.deleted) |
 
-**文件秒传方案 B**：
+#### 8.2.0 客户端上传三条路径：真秒传 / 小文件直传 / 分片上传
+
+同样是"发一条视频"，客户端实际会根据文件大小、以及服务端是否已存在同 hash 记录，走**三条完全不同的路径**。三条路最终都拿到同一个 canonical `play_url`，交给 `/video/publish` 完成发布；但代价差别巨大。
+
+**决策流程（客户端视角）**：
+
+```mermaid
+flowchart TD
+    Start["客户端选中视频文件"] --> Hash["本地读文件 → 计算 SHA256(fileHash)<br/>获取 fileSize / filename"]
+    Hash --> Init["POST /upload/init<br/>只发 { fileHash, fileSize, filename, chunkSize }<br/>—— 一次几十字节的元信息请求"]
+    Init --> Q1{"服务端查 Redis + MySQL<br/>是否已有同 hash 且 Active/PendingDelete?"}
+    Q1 -- "命中<br/>(EnableInstantUpload=true)" --> Instant["✅ 真·秒传<br/>返回 { Needupload:false, Needchunk:false, Playurl }<br/>客户端 0 字节文件内容传输"]
+    Q1 -- "未命中" --> Q2{"fileSize ><br/>ChunkThresholdBytes?"}
+    Q2 -- "小文件" --> Small["返回 { Needupload:true, Needchunk:false }<br/>→ 客户端 POST /upload/video (multipart)<br/>整体一次性上传"]
+    Q2 -- "大文件" --> Big["返回 { Needupload:true, Needchunk:true,<br/>Uploadid, Uploadedchunks[], Chunksize }<br/>→ 客户端循环 /upload/chunk (可并发/断点续传)<br/>→ 最终 POST /upload/complete"]
+    Small --> Post["upsertFileAsset 去重登记<br/>+ 写 Redis 秒传双 key (为未来秒传埋种子)"]
+    Big --> Post
+    Instant --> Publish["拿到 play_url → POST /video/publish<br/>(video-rpc 事务里 ref_count+=1、INSERT videos、写 outbox)"]
+    Post --> Publish
+```
+
+**三条路径的对比**：
+
+| 路径 | 入口接口 | 客户端实际传输 | 触发条件 | 服务端关键动作 |
+|---|---|---|---|---|
+| **① 真·秒传** | `/upload/init` 内联返回 | ~几十字节（只有 fileHash + 元信息） | `EnableInstantUpload=true` 且 Redis/MySQL 已存在同 hash 且状态 `Active`/`PendingDelete` | `lookupInstantUploadedFile` 命中 Redis 或 MySQL → 直接返回旧 canonical `play_url` |
+| **② 小文件直传** | `/upload/video` (`UploadVideoLogic`) | 整个文件一次 HTTP multipart | 秒传未命中 且 `fileSize ≤ ChunkThresholdBytes` | `saveVideoUpload` 落盘 + 边写边算 SHA256 → `upsertFileAsset` 去重登记 → Redis 写秒传双 key |
+| **③ 分片上传** | `/upload/init` → `/upload/chunk`×N → `/upload/complete` | 整个文件（分片可并发、可断点续传） | 秒传未命中 且 `fileSize > ChunkThresholdBytes` | init 建会话 → 每片落到 `chunkTempDir` → complete 合并、二次校验 hash、`upsertFileAsset` → 写秒传双 key |
+
+**关键澄清（很容易误解的点）**：
+
+1. **只有路径 ①（真·秒传）对本次上传的用户来说是"零传输"**。它的前提是客户端必须**先在本地把整个文件读一遍算出 SHA256**，然后只把 hash 发过来。服务器一次查询命中就直接返回 URL，客户端**不用再传文件内容**。这才配叫"秒传"。
+2. **路径 ②/③ 的 `upsertFileAsset` 也会做去重**，但那时候客户端已经把整个文件传上来了。这一步节省的是 **服务端的物理存储和 `file_assets` 的冗余行**（如果 MySQL 里 hash 已存在，就把本次刚落盘的重复文件删掉，返回旧 canonical URL），**并不能节省本次的网络带宽和落盘 IO**。
+3. **`UploadVideoLogic`（`/upload/video`）结尾那两条 `TxPipeline.SET`（写 `ChunkUploadHashKey` + `ChunkUploadGlobalHashKey`）不是"帮本次用户秒传"**，而是**为下一次同 hash 的上传埋种子**——下次别的用户（或自己）传相同文件时，`/upload/init` 就能在 Redis 里命中走路径 ①。这是一次"缓存预热"。
+4. **Redis 只是加速索引，MySQL `file_assets` 才是权威源**。所以：
+   - Redis 秒传 key 写失败只记日志、不回滚 MySQL（MySQL 登记成功即视为业务成功，下次上同 hash 时会自愈重写 Redis）；
+   - `lookupInstantUploadedFile` 内部实现是"先查 Redis 双 key、未命中再兜底查 MySQL `file_assets` 表"——即便 Redis 全挂，只要 MySQL 有记录，秒传照样能命中；
+   - asset_cleanup 物理删除文件后必须 `DEL fsz:chunkupload:hash:global:{fileHash}`，避免 Redis 留下指向已删磁盘的死缓存。
+5. **秒传缓存 TTL（`uploadedFileTTL`，默认 7 天）过期后**并不意味着"不能再秒传"，而是"这次得走 MySQL 兜底"。MySQL 命中后 `upsertFileAsset` 会重新把 Redis 补上——TTL 的作用只是**限制脏缓存的最长驻留时间**，防止 asset_cleanup 之外的意外场景（比如手动改 DB）留下长期不一致。
+6. **分片路径的断点续传**：`/upload/init` 内 `reuseUploadSession` 会查 `fsz:chunkupload:session:{userID}:{fileHash}`，如果存在同一会话且元数据（fileHash/fileSize/finalExt/chunkSize）**强一致校验**通过，就返回已存在的 `uploadID` + 已上传的分片编号数组，客户端只需补传缺失分片。任一元数据不一致则视为新会话。
+7. **上传路径与 `ref_count` 的边界**：无论走哪条路，`file_assets.ref_count` 的 `+=1` 都**不在上传时发生**，而是在后续 `/video/publish` 调用 video-rpc `PublishVideo` 的事务里完成。这样"上传成功但没发布"的孤立资产会在 Grace 期后被 asset_cleanup 回收，不会长期占存储。
+
+**举个连贯的例子**（用户 A 首发、用户 B 秒传）：
+
+1. 用户 A 选中一个 500MB 视频 → 客户端算 SHA256 → `/upload/init` 拿到 `Needupload=true, Needchunk=true`（大文件走分片）；
+2. A 循环 `/upload/chunk` 传完所有分片 → `/upload/complete`：服务端合并 + 二次 hash 校验 + `upsertFileAsset` **首次登记** `Active, ref_count=0` + **`SET fsz:chunkupload:hash:global:{hash} = canonical_url, EX 7d`**；
+3. A 拿到 `play_url` → `/video/publish` → video-rpc 事务内 `ref_count=1` + INSERT videos + 写 outbox；
+4. 几小时后用户 B 拿到同一份视频（可能是转发保存的）→ 客户端算出**同一个 SHA256** → `/upload/init` → 服务端 Redis 命中 → 直接返回 A 之前的 `canonical_url`，**B 一个字节文件都没传**；
+5. B 再 `/video/publish` → video-rpc 事务内对同一 `file_assets` 行 `ref_count=2` + INSERT B 自己的 `videos` 行。
+
+此时磁盘上只有**一份物理文件**，`file_assets` 只有**一行 `Active, ref_count=2`**，两条 `videos`（A 和 B）通过 `play_url` 共同引用它——这就是"秒传 + 引用计数"体系的最终形态。
+
+**分片路径细节：断点续传是怎么实现的**
+
+分片上传（路径 ③）之所以对用户友好，核心在于**可以从任意分片断点续传**——网络断了、浏览器崩了、用户手滑刷新页面，重新打开都能从上次停下的地方继续，而不用从头再传 500MB。这一切都靠"上传会话"（upload session）在 Redis 里的三把 key 支撑：
+
+**上传会话在 Redis 里的三把 key**（都在 `common/rediskey/chunkupload.go`）：
+
+| Key | 类型 | 用途 |
+|---|---|---|
+| `fsz:chunkupload:meta:{uploadID}` | Hash | 上传会话元数据：`user_id / file_name / file_hash / file_size / chunk_size / total_chunks / final_ext / created_at / updated_at`。**强一致的锚点**——续传时必须每一项都匹配才认这个会话 |
+| `fsz:chunkupload:set:{uploadID}` | Set | 已经成功上传的分片编号集合。每上传成功一片 `SADD chunk_index`，续传时 `SMEMBERS` 拿到"已传"列表，客户端只补传"未传"部分 |
+| `fsz:chunkupload:session:{userID}:{fileHash}` | String | `(userID, fileHash) → uploadID` 的反向索引。让客户端只用 hash 就能找回自己上一次的 uploadID，不用记住 uploadID |
+
+TTL 都是 `chunkSessionTTL`（默认 24 小时），且**每次 init/chunk 操作都会 `pipe.Expire` 刷新三把 key 的 TTL**——只要用户还在活跃上传，会话就不会过期；一旦超过 24h 没动作，Redis 自动过期回收，磁盘上残留的分片临时目录也会在下一次同 hash init 时被覆盖（或由运维定时清理）。
+
+**续传决策全流程**（[`initvideouploadlogic.go` 的 `reuseUploadSession`](d:\feedsystem-zero-main-git\apps\gateway\internal\logic\initvideouploadlogic.go) 第 175-233 行）：
+
+```mermaid
+flowchart TD
+    Init["POST /upload/init<br/>{ fileHash, fileSize, chunkSize, filename }"] --> Q0{"秒传命中?<br/>(前面已判定)"}
+    Q0 -- "未命中" --> Session["GET fsz:chunkupload:session:{userID}:{fileHash}"]
+    Session --> Q1{"找到旧 uploadID?"}
+    Q1 -- "无" --> New["生成新 uploadID<br/>mkdir chunkTempDir<br/>HSET meta / EXPIRE 三把 key<br/>返回 Uploadedchunks=[]"]
+    Q1 -- "有" --> Meta["HGETALL fsz:chunkupload:meta:{uploadID}"]
+    Meta --> Q2{"强一致校验:<br/>fileHash / userID / fileSize /<br/>finalExt / chunkSize 全部匹配?"}
+    Q2 -- "任一不匹配" --> New
+    Q2 -- "全部匹配" --> Reuse["SMEMBERS fsz:chunkupload:set:{uploadID}<br/>→ 已上传分片编号列表"]
+    Reuse --> Refresh["Pipeline 刷新三把 key 的 TTL"]
+    Refresh --> Return["返回 { Uploadid, Uploadedchunks:[已传编号], Chunksize }"]
+    New --> Return
+    Return --> Client["客户端遍历 1..totalChunks<br/>只对不在 Uploadedchunks 里的编号<br/>调 /upload/chunk"]
+```
+
+**为什么必须做"强一致校验"？** 想象一下反例：用户先用 500MB 视频 A 开了一个会话传了 3 片，然后又选了另一个 200MB 视频 B（碰巧 SHA256 已经变了但客户端 bug 传错 hash），如果不校验 `file_size / chunk_size / total_chunks`，就会把 B 的分片写到 A 的临时目录里、`SADD` 到同一个 set 里，最终合并出来的是**混合文件**、hash 校验通不过，前面传的 3 片全废。
+
+`reuseUploadSession` 里的这段就是保护：
+```go
+if len(meta) == 0 ||
+    meta["file_hash"] != fileHash ||
+    meta["user_id"] != strconv.FormatUint(userID, 10) ||
+    meta["file_size"] != strconv.FormatInt(fileSize, 10) ||
+    meta["final_ext"] != finalExt {
+    return "", nil, 0, nil // 视为新会话
+}
+```
+任一字段不一致就**放弃复用、开新会话**，绝不复用一个可能被污染的会话。
+
+**分片上传时的关键防御**（[`uploadvideochunklogic.go`](d:\feedsystem-zero-main-git\apps\gateway\internal\logic\uploadvideochunklogic.go)）：
+
+1. **归属校验**：`meta["user_id"] != userID` → 403，防止 A 用户拿到 B 的 uploadID 越权上传；
+2. **分片大小精确校验**：非末片必须等于 `chunkSize`、末片必须等于 `fileSize - chunkSize*(totalChunks-1)`——`written != expectedChunkBytes` 立刻拒绝，防止传半片污染合并结果；
+3. **边写边算 SHA256**：`io.MultiWriter(dst, hasher)` 落盘的同时算 hash，若 `EnableChunkHashValidate=true` 就与前端传来的 `chunkHash` 比对，不一致直接删除临时文件返回 400；
+4. **原子落盘**：先写 `chunk_{idx}.{rand}.tmp`，全部写完、校验通过后才 `os.Rename` 成 `chunk_{idx}`——**任何一步失败都不会留下半吊子的正式分片**，续传时下一次上传同一个 index 会覆盖，`SADD` 幂等；
+5. **响应体带上最新的 `Uploadedchunks`**：客户端每次收到 chunk 响应都拿到"截至现在服务端已确认收到的所有分片编号"，网络重传时客户端可以对齐重试。
+
+**合并阶段的防重入 + 二次校验**（[`completevideouploadlogic.go`](d:\feedsystem-zero-main-git\apps\gateway\internal\logic\completevideouploadlogic.go)）：
+
+1. **分布式合并锁**：`SETNX fsz:chunkupload:lock:{uploadID} = randomToken, EX 5min`——防止两个 tab 同时点"完成上传"或客户端超时重试导致并发合并同一文件；释放锁用 Lua `if get==token then del` 保证不会误删别人的锁；
+2. **完整性校验**：`len(uploadedChunks) != totalChunks` 或缺任一编号 → `FailedPrecondition`；
+3. **秒传兜底**：如果发现 `finalVideoFilePath(fileHash)` 已经存在（比如上次合并成功但响应丢了、客户端重试），直接校验它的 hash 是不是等于本次 `fileHash`，一致就跳过合并、直接进入 `finishCompletedUpload`——**天然幂等**；
+4. **合并全量校验**：按 index 顺序读取 `chunk_1..N` 一边写入 `finalPath.tmp` 一边算 SHA256，最终 `written != fileSize` 或 `actualHash != fileHash` 立刻失败并删除 tmp 文件——**决不让一份哪怕字节数对但内容错的文件进入 `file_assets`**；
+5. **登记 + 清理原子化**：`finishCompletedUpload` 里用 `TxPipeline` 一次性 `SET 秒传双 key + DEL meta / set / session`，然后 `RemoveAll(chunkTempDir)`——会话数据、临时分片、秒传缓存三者最终态强一致。
+
+**一句话总结断点续传**：
+
+> **`(userID, fileHash) → uploadID` 反向索引** + **`meta` 强一致校验** + **`set` 已传编号集合** + **临时分片"tmp 落盘 → 原子 rename"** + **合并阶段分布式锁 + 全量 hash 校验** —— 五重保障共同实现了"任意时刻中断都能从下一个未传分片继续、绝不会因为续传而合并出错误文件"的分片上传语义。客户端要做的仅仅是"每次 init 都发 fileHash，然后跳过响应里 `Uploadedchunks` 已有的编号"这么简单。
+
+**服务端资产登记时序（三条路径未命中秒传后的公共合流点）**：
+
+以下时序图展开的是**路径 ②/③ 落盘后到 `file_assets` 登记完成**的服务端细节，以及后续 `PublishVideo` 事务如何 `ref_count+=1`、`asset_cleanup` Job 如何延迟物理清理——路径 ①（真秒传）直接从 Redis/MySQL 拿到 URL 后跳到最下方 `/video/publish` 环节，中间的落盘和 `upsertFileAsset` 都不经过。
 
 ```mermaid
 sequenceDiagram
@@ -1071,7 +1225,7 @@ sequenceDiagram
 | `MarkNotificationRead` | UPDATE 单条为已读；`rowsAffected>0` 时 `BumpUnreadVersion` |
 | `MarkAllNotificationsRead` | 批量 UPDATE 所有未读为已读；`changed>0` 时 `BumpUnreadVersion` |
 
-**未读数缓存方案 B（版本号 + 惰性重算）**：
+**未读数缓存（版本号 + 惰性重算）**：
 
 ```mermaid
 flowchart TD
@@ -1138,15 +1292,15 @@ sequenceDiagram
     J->>R: bumpReceiverID>0 → Lua INCR+DEL 旧 version key
 ```
 
-#### 8.5.1 设计取舍：为什么用"版本号 + 惰性重算"方案 B？
+#### 8.5.1 设计取舍：为什么用"版本号 + 惰性重算"？
 
-**朴素方案 A**：读一次 → SETEX 缓存，写一次 → DEL 缓存
+最直觉的做法是 **"读一次 → SETEX 缓存，写一次 → DEL 缓存"**，但它有三个问题——本项目正是为了绕开这三个问题才最终选择"版本号 + 惰性重算"：
 
 - 问题 1：**并发写导致缓存穿透** —— 大量写事件同时 DEL 后，读会集中回源到 MySQL COUNT
 - 问题 2：**缓存与 MySQL 之间的不一致窗口** —— DEL 之后、下一次读回填之前，会短暂读到旧值
 - 问题 3：**Redis 宕机重启后所有缓存丢失** —— 大量用户同时 miss → 打爆 MySQL
 
-**方案 B**：版本号 + 惰性重算
+**本项目采用的做法（版本号 + 惰性重算）如何解决这三个问题**：
 
 - 写路径不 DEL 缓存，只 **INCR version + 一次性 DEL 旧版本 key**（Lua 原子）
 - 读路径 `GET version → GET count:v:{version}` 组合 key，miss 时 SELECT COUNT

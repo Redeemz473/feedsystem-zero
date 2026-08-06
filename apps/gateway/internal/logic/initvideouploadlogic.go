@@ -37,13 +37,13 @@ func NewInitVideoUploadLogic(ctx context.Context, svcCtx *svc.ServiceContext) *I
 }
 
 func (l *InitVideoUploadLogic) InitVideoUpload(req *types.InitVideoUploadReq) (resp *types.InitVideoUploadResp, err error) {
-	// 1. 从 JWT 获取 user_id。
+	// 从 JWT 获取 user_id。
 	userID, err := userIDFromCtx(l.ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. 校验 filename/file_hash/file_size/chunk_size/total_chunks。
+	// 校验 filename/file_hash/file_size/chunk_size/total_chunks。
 	filename := strings.TrimSpace(req.Filename)
 	if filename == "" {
 		return nil, status.Error(codes.InvalidArgument, "文件名不能为空")
@@ -89,8 +89,8 @@ func (l *InitVideoUploadLogic) InitVideoUpload(req *types.InitVideoUploadReq) (r
 
 	thresholdBytes := chunkThresholdBytes(l.svcCtx.Config.Upload)
 
-	// 3. file_size <= ChunkThresholdBytes 时返回 need_chunk=false，让前端走 /video/upload 小文件直传。
-	// 4. EnableInstantUpload=true 时先查 rediskey.ChunkUploadHashKey 或 ChunkUploadGlobalHashKey，命中则直接返回 play_url。
+	// file_size <= ChunkThresholdBytes 时返回 need_chunk=false，让前端走 /video/upload 小文件直传。
+	// EnableInstantUpload=true 时先查 rediskey.ChunkUploadHashKey 或 ChunkUploadGlobalHashKey，命中则直接返回 play_url。
 	if l.svcCtx.Config.Upload.EnableInstantUpload {
 		playURL, err := lookupInstantUploadedFile(l.ctx, l.svcCtx.RedisCli, l.svcCtx.GormDB, l.svcCtx.Config.Upload, userID, fileHash)
 		if err != nil {
@@ -120,7 +120,7 @@ func (l *InitVideoUploadLogic) InitVideoUpload(req *types.InitVideoUploadReq) (r
 		}, nil
 	}
 
-	// 5. 未命中时生成 upload_id，写入 rediskey.ChunkUploadMetaKey(upload_id)，TTL 用 chunkSessionTTL。
+	// 未命中时生成 upload_id，写入 rediskey.ChunkUploadMetaKey(upload_id)，TTL 用 chunkSessionTTL。
 	uploadID, uploadedChunks, sessionChunkSize, err := l.reuseUploadSession(userID, fileHash, fileSize, finalExt)
 	if err != nil {
 		return nil, err
