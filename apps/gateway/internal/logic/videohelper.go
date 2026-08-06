@@ -624,6 +624,7 @@ func loadUploadedChunks(ctx context.Context, redisCli *redis.Client, uploadID st
 	return uploadedChunks, nil
 }
 
+// 判断文件是否真的存在能够秒传
 func lookupInstantUploadedFile(ctx context.Context, redisCli *redis.Client, db *gorm.DB, upload config.UploadConf, userID uint64, fileHash string) (string, error) {
 	// Redis 只用于加速，file_assets 状态和磁盘文件才决定能否秒传。
 	// 这样视频最后一个引用被删除后，即使旧秒传 key 尚未过期，也不会返回待清理文件。

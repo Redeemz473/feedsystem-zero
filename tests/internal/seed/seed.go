@@ -22,6 +22,9 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"feedsystem-zero/tests/internal/testconfig"
@@ -30,7 +33,13 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
+)
+
+const (
+	seedVideoFileSize int64 = 1024 * 1024
+	seedCoverFileSize int64 = 256 * 1024
 )
 
 // Account matches deploy/sql/001_schema.sql `accounts` table.
@@ -151,7 +160,7 @@ func (r *Runner) reset(ctx context.Context) error {
 	seedVideo := testconfig.SeedRequestIDPrefix + "%"
 	loadVideo := "loadtest-%"
 
-	return r.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	if err := r.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		steps := []struct {
 			name  string
 			query string
@@ -223,7 +232,7 @@ func (r *Runner) reset(ctx context.Context) error {
 			},
 			{
 				name:  "file_assets",
-				query: "DELETE FROM file_assets WHERE storage_path LIKE '/seed/%'",
+				query: "DELETE FROM file_assets WHERE file_hash LIKE 'seed-%'",
 			},
 			{
 				name:  "accounts",
@@ -263,7 +272,19 @@ func (r *Runner) reset(ctx context.Context) error {
 			return fmt.Errorf("rebuild surviving account counters: %w", err)
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	seedDir, err := r.seedStorageDir()
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(seedDir); err != nil {
+		return fmt.Errorf("remove seed asset files: %w", err)
+	}
+	log.Printf("[seed]   asset files removed: %s", seedDir)
+	return nil
 }
 
 func (r *Runner) resetRedis(ctx context.Context) error {
@@ -347,19 +368,28 @@ func (r *Runner) seedUsers(ctx context.Context) error {
 func (r *Runner) seedFileAssets(ctx context.Context) ([]seedAssetPair, error) {
 	start := time.Now()
 	now := time.Now()
-	assets := buildSeedAssets(r.Flags.FileAssetBuckets, now)
+	seedDir, err := r.prepareSeedAssetFiles(r.Flags.FileAssetBuckets)
+	if err != nil {
+		return nil, err
+	}
+	assets := buildSeedAssets(r.Flags.FileAssetBuckets, now, seedDir)
 	if len(assets) == 0 {
 		return nil, fmt.Errorf("file asset buckets must be positive")
 	}
 	if err := r.DB.WithContext(ctx).
-		Clauses(onConflictDoNothing("file_hash")).
+		Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "file_hash"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"file_type", "url", "storage_path", "size", "status", "deleted_at", "updated_at",
+			}),
+		}).
 		CreateInBatches(assets, 100).Error; err != nil {
 		return nil, err
 	}
 
 	var reread []FileAsset
 	if err := r.DB.WithContext(ctx).
-		Where("storage_path LIKE '/seed/%'").
+		Where("file_hash LIKE 'seed-%'").
 		Order("id ASC").
 		Find(&reread).Error; err != nil {
 		return nil, err
@@ -383,7 +413,7 @@ func (r *Runner) seedFileAssets(ctx context.Context) ([]seedAssetPair, error) {
 	return pairs, nil
 }
 
-func buildSeedAssets(bucketCount int, now time.Time) []FileAsset {
+func buildSeedAssets(bucketCount int, now time.Time, seedDir string) []FileAsset {
 	assets := make([]FileAsset, 0, bucketCount*2)
 	for i := 1; i <= bucketCount; i++ {
 		assets = append(assets,
@@ -391,8 +421,8 @@ func buildSeedAssets(bucketCount int, now time.Time) []FileAsset {
 				FileHash:    fmt.Sprintf("seed-video-hash-%08d", i),
 				FileType:    "video",
 				URL:         fmt.Sprintf(testconfig.SeedPlayURLTemplate, i),
-				StoragePath: fmt.Sprintf("/seed/video_%d.mp4", i),
-				Size:        1024 * 1024,
+				StoragePath: filepath.Join(seedDir, fmt.Sprintf("video_%d.mp4", i)),
+				Size:        seedVideoFileSize,
 				Status:      1,
 				CreatedAt:   now,
 				UpdatedAt:   now,
@@ -401,8 +431,8 @@ func buildSeedAssets(bucketCount int, now time.Time) []FileAsset {
 				FileHash:    fmt.Sprintf("seed-cover-hash-%08d", i),
 				FileType:    "cover",
 				URL:         fmt.Sprintf(testconfig.SeedCoverURLTemplate, i),
-				StoragePath: fmt.Sprintf("/seed/cover_%d.jpg", i),
-				Size:        256 * 1024,
+				StoragePath: filepath.Join(seedDir, fmt.Sprintf("cover_%d.jpg", i)),
+				Size:        seedCoverFileSize,
 				Status:      1,
 				CreatedAt:   now,
 				UpdatedAt:   now,
@@ -410,6 +440,58 @@ func buildSeedAssets(bucketCount int, now time.Time) []FileAsset {
 		)
 	}
 	return assets
+}
+
+func (r *Runner) seedStorageDir() (string, error) {
+	uploadDir := strings.TrimSpace(r.Flags.UploadDir)
+	if uploadDir == "" {
+		uploadDir = testconfig.DefaultUploadDir
+	}
+	uploadAbs, err := filepath.Abs(uploadDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve upload dir: %w", err)
+	}
+	return filepath.Join(uploadAbs, "seed"), nil
+}
+
+// prepareSeedAssetFiles 使用稀疏文件提供真实的 storage_path；逻辑大小与数据库
+// size 一致，但不会实际占用同等磁盘块，适合反复执行本地大规模压测。
+func (r *Runner) prepareSeedAssetFiles(bucketCount int) (string, error) {
+	if bucketCount <= 0 {
+		return "", fmt.Errorf("file asset buckets must be positive")
+	}
+	seedDir, err := r.seedStorageDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(seedDir, 0755); err != nil {
+		return "", fmt.Errorf("create seed asset dir: %w", err)
+	}
+	for i := 1; i <= bucketCount; i++ {
+		if err := ensureSparseSeedFile(filepath.Join(seedDir, fmt.Sprintf("video_%d.mp4", i)), seedVideoFileSize); err != nil {
+			return "", err
+		}
+		if err := ensureSparseSeedFile(filepath.Join(seedDir, fmt.Sprintf("cover_%d.jpg", i)), seedCoverFileSize); err != nil {
+			return "", err
+		}
+	}
+	return seedDir, nil
+}
+
+func ensureSparseSeedFile(path string, size int64) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("create seed asset %s: %w", path, err)
+	}
+	truncateErr := file.Truncate(size)
+	closeErr := file.Close()
+	if truncateErr != nil {
+		return fmt.Errorf("resize seed asset %s: %w", path, truncateErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close seed asset %s: %w", path, closeErr)
+	}
+	return nil
 }
 
 // seedVideos inserts N videos with random authors and staggered created_at.
@@ -488,7 +570,7 @@ func (r *Runner) rebuildSeedAssetRefs(ctx context.Context) error {
 		SET fa.ref_count = COALESCE(actual.refs, 0),
 			fa.status = 1,
 			fa.deleted_at = NULL
-		WHERE fa.storage_path LIKE '/seed/%'`).Error
+		WHERE fa.file_hash LIKE 'seed-%'`).Error
 }
 
 func (r *Runner) verifySeedData(ctx context.Context) error {
@@ -505,7 +587,7 @@ func (r *Runner) verifySeedData(ctx context.Context) error {
 	if err := r.DB.WithContext(ctx).Raw(`SELECT
 		(SELECT COUNT(*) FROM accounts WHERE username LIKE ?) AS seed_users,
 		(SELECT COUNT(*) FROM videos WHERE request_id LIKE ?) AS seed_videos,
-		(SELECT COUNT(*) FROM file_assets WHERE storage_path LIKE '/seed/%') AS seed_assets,
+		(SELECT COUNT(*) FROM file_assets WHERE file_hash LIKE 'seed-%') AS seed_assets,
 		(SELECT COUNT(*)
 		 FROM file_assets fa
 		 LEFT JOIN (
@@ -517,7 +599,7 @@ func (r *Runner) verifySeedData(ctx context.Context) error {
 			 ) active_refs
 			 GROUP BY url
 		 ) actual ON actual.url = fa.url
-		 WHERE fa.storage_path LIKE '/seed/%'
+		 WHERE fa.file_hash LIKE 'seed-%'
 		   AND fa.ref_count <> COALESCE(actual.refs, 0)) AS asset_ref_mismatch,
 		(SELECT COUNT(*)
 		 FROM videos v

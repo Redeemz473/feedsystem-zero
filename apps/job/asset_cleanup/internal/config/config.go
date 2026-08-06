@@ -23,9 +23,11 @@ type UploadConf struct {
 }
 
 type AssetCleanupConf struct {
-	BatchSize           int `json:",default=100"`
-	PollIntervalSeconds int `json:",default=30"`
-	GraceSeconds        int `json:",default=300"`
-	ClaimTimeoutSeconds int `json:",default=300"`
-	DeleteTimeoutMs     int `json:",default=5000"`
+	BatchSize                int `json:",default=100"`
+	PollIntervalSeconds      int `json:",default=30"`
+	GraceSeconds             int `json:",default=300"`
+	ClaimTimeoutSeconds      int `json:",default=300"`
+	DeleteTimeoutMs          int `json:",default=5000"`
+	ReconcileBatchSize       int `json:",default=200"`
+	ReconcileIntervalSeconds int `json:",default=60"`
 }

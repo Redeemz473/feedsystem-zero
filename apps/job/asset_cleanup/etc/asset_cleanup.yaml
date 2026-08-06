@@ -9,9 +9,9 @@ BizRedis:
   DB: 0
 
 # 必须与 gateway 的 Upload.Dir 指向同一个本地目录。
-# 该默认值适用于从 apps/job/asset_cleanup 目录启动本任务。
+# README 默认从仓库根目录启动所有进程，因此两边都使用 uploads。
 Upload:
-  Dir: ../../gateway/uploads
+  Dir: uploads
 
 AssetCleanup:
   BatchSize: 100
@@ -19,3 +19,6 @@ AssetCleanup:
   GraceSeconds: 300
   ClaimTimeoutSeconds: 300
   DeleteTimeoutMs: 5000
+  # 分批校准 Active 资产的真实视频引用，并检查磁盘文件是否仍然存在。
+  ReconcileBatchSize: 200
+  ReconcileIntervalSeconds: 60

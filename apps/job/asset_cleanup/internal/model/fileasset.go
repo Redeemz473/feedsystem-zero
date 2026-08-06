@@ -9,6 +9,8 @@ const (
 	FileAssetStatusCleaning      int32 = 4
 )
 
+const VideoStatusNormal int32 = 1
+
 type FileAsset struct {
 	ID          uint64     `gorm:"column:id;primaryKey;autoIncrement"`
 	FileHash    string     `gorm:"column:file_hash"`

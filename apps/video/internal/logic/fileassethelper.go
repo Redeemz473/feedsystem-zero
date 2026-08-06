@@ -3,6 +3,8 @@ package logic
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -13,36 +15,176 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// orderedFileAssetURLs 为同一事务涉及的资产 URL 提供稳定的加锁顺序。
-// 保留重复 URL，因为视频地址和封面地址即使相同，也代表两个逻辑引用。
-func orderedFileAssetURLs(urls ...string) []string {
-	ordered := append([]string(nil), urls...)
-	sort.Strings(ordered)
-	return ordered
+var errFileAssetStorageUnavailable = errors.New("file asset storage unavailable")
+
+type fileAssetRef struct {
+	URL   string
+	Delta int64
 }
 
-// reserveFileAssetRefByURL 在给定的 db(可以是 *gorm.DB 事务句柄) 内，
-// 将 file_assets 表中 url 对应资产的 ref_count +1。
-// 如果资产不存在（或已被删除），返回 gorm.ErrRecordNotFound，
-// 由调用方决定如何转成业务错误码。
-func reserveFileAssetRefByURL(ctx context.Context, db *gorm.DB, url string) error {
-	if strings.TrimSpace(url) == "" {
-		return nil
+type preparedPublishFileAsset struct {
+	ID          uint64
+	URL         string
+	StoragePath string
+	RefDelta    int64
+}
+
+type publishFileAssetError struct {
+	URL string
+	Err error
+}
+
+func (e *publishFileAssetError) Error() string {
+	return fmt.Sprintf("publish file asset unavailable, url:%s: %v", e.URL, e.Err)
+}
+
+func (e *publishFileAssetError) Unwrap() error {
+	return e.Err
+}
+
+// aggregateFileAssetRefs 将相同 URL 聚合为一个引用增量，同时按 URL 排序固定行锁顺序。
+// 视频地址和封面地址相同时 Delta=2，仍然保留两个逻辑引用。
+func aggregateFileAssetRefs(urls ...string) []fileAssetRef {
+	counts := make(map[string]int64, len(urls))
+	for _, rawURL := range urls {
+		url := strings.TrimSpace(rawURL)
+		if url == "" {
+			continue
+		}
+		counts[url]++
 	}
 
-	result := db.WithContext(ctx).
-		Model(&model.FileAsset{}).
-		Where("url = ? AND status = ?", url, model.FileAssetStatusActive).
-		Updates(map[string]any{
-			"ref_count":  gorm.Expr("ref_count + 1"),
-			"status":     model.FileAssetStatusActive,
-			"deleted_at": nil,
+	orderedURLs := make([]string, 0, len(counts))
+	for url := range counts {
+		orderedURLs = append(orderedURLs, url)
+	}
+	sort.Strings(orderedURLs)
+
+	refs := make([]fileAssetRef, 0, len(orderedURLs))
+	for _, url := range orderedURLs {
+		refs = append(refs, fileAssetRef{URL: url, Delta: counts[url]})
+	}
+	return refs
+}
+
+// preparePublishFileAssets 在事务外一次性读取并检查发布所需的唯一资产。
+// 磁盘 I/O 不占用数据库行锁；事务内仍会再次用 status/storage_path 条件防止状态并发变化。
+func preparePublishFileAssets(ctx context.Context, db *gorm.DB, urls ...string) ([]preparedPublishFileAsset, error) {
+	refs := aggregateFileAssetRefs(urls...)
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	orderedURLs := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		orderedURLs = append(orderedURLs, ref.URL)
+	}
+
+	var assets []model.FileAsset
+	if err := db.WithContext(ctx).
+		Select("id", "url", "storage_path").
+		Where("url IN ? AND status = ?", orderedURLs, model.FileAssetStatusActive).
+		Find(&assets).Error; err != nil {
+		return nil, err
+	}
+	return buildPreparedPublishFileAssets(refs, assets)
+}
+
+func buildPreparedPublishFileAssets(
+	refs []fileAssetRef,
+	assets []model.FileAsset,
+) ([]preparedPublishFileAsset, error) {
+	assetsByURL := make(map[string]model.FileAsset, len(assets))
+	for _, asset := range assets {
+		assetsByURL[asset.URL] = asset
+	}
+
+	prepared := make([]preparedPublishFileAsset, 0, len(refs))
+	for _, ref := range refs {
+		asset, ok := assetsByURL[ref.URL]
+		if !ok {
+			return nil, &publishFileAssetError{URL: ref.URL, Err: gorm.ErrRecordNotFound}
+		}
+		if err := validatePublishAssetFile(asset.StoragePath); err != nil {
+			return nil, &publishFileAssetError{
+				URL: ref.URL,
+				Err: fmt.Errorf("validate asset_id:%d: %w", asset.ID, err),
+			}
+		}
+		prepared = append(prepared, preparedPublishFileAsset{
+			ID:          asset.ID,
+			URL:         asset.URL,
+			StoragePath: asset.StoragePath,
+			RefDelta:    ref.Delta,
 		})
+	}
+	return prepared, nil
+}
+
+// reservePreparedPublishFileAsset 在发布事务中使用条件原子更新增加引用数。
+// UPDATE 本身会持有资产行锁，并与删除、cleanup 状态迁移串行化；调用方必须传入事务句柄。
+func reservePreparedPublishFileAsset(ctx context.Context, db *gorm.DB, asset preparedPublishFileAsset) error {
+	if asset.ID == 0 || asset.RefDelta <= 0 {
+		return &publishFileAssetError{URL: asset.URL, Err: gorm.ErrRecordNotFound}
+	}
+
+	result := updatePreparedPublishFileAssetRef(ctx, db, asset)
 	if result.Error != nil {
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
+		return &publishFileAssetError{URL: asset.URL, Err: gorm.ErrRecordNotFound}
+	}
+	return nil
+}
+
+func updatePreparedPublishFileAssetRef(
+	ctx context.Context,
+	db *gorm.DB,
+	asset preparedPublishFileAsset,
+) *gorm.DB {
+	return db.WithContext(ctx).
+		Model(&model.FileAsset{}).
+		Where(
+			"id = ? AND url = ? AND storage_path = ? AND status = ?",
+			asset.ID,
+			asset.URL,
+			asset.StoragePath,
+			model.FileAssetStatusActive,
+		).
+		Updates(map[string]any{
+			"ref_count":  gorm.Expr("ref_count + ?", asset.RefDelta),
+			"deleted_at": nil,
+		})
+}
+
+func unavailablePublishFileAssetURL(err error) (string, bool) {
+	var assetErr *publishFileAssetError
+	if !errors.As(err, &assetErr) {
+		return "", false
+	}
+	if !errors.Is(assetErr, gorm.ErrRecordNotFound) &&
+		!errors.Is(assetErr, errFileAssetStorageUnavailable) {
+		return "", false
+	}
+	return assetErr.URL, true
+}
+
+func validatePublishAssetFile(storagePath string) error {
+	path := strings.TrimSpace(storagePath)
+	if path == "" {
+		return fmt.Errorf("%w: storage_path is empty", errFileAssetStorageUnavailable)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: file does not exist", errFileAssetStorageUnavailable)
+		}
+		return fmt.Errorf("stat asset file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%w: path is not a regular file", errFileAssetStorageUnavailable)
 	}
 	return nil
 }

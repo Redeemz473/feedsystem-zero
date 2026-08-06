@@ -88,6 +88,28 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 		Status:         model.VideoStatusNormal,
 	}
 
+	// 幂等预检不需要占用事务。首次请求继续执行；重试命中时直接返回原视频，
+	// 并发首发仍由 (author_id, request_id) 唯一键兜底。
+	existedVideo, err := loadVideoByAuthorRequestID(l.ctx, l.svcCtx.GormDB, authorID, requestID)
+	if err == nil {
+		return l.idempotentPublishResponse(existedVideo, playURL, coverURL, tags)
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		l.Errorf("video publish idempotent precheck failed, author_id: %d, request_id: %s, error: %v", authorID, requestID, err)
+		return nil, status.Error(codes.Internal, "发布视频失败")
+	}
+
+	// 在事务外批量加载并检查唯一资产，避免数据库行锁覆盖磁盘 I/O 时间。
+	// 事务内的条件 UPDATE 仍会复核 id/url/storage_path/status，防止预检后的并发状态变化。
+	preparedAssets, err := preparePublishFileAssets(l.ctx, l.svcCtx.GormDB, playURL, coverURL)
+	if err != nil {
+		if clientErr, ok := invalidPublishAssetError(err, playURL); ok {
+			return nil, clientErr
+		}
+		l.Errorf("prepare publish file assets failed, author_id: %d, play_url: %s, error: %v", authorID, playURL, err)
+		return nil, status.Error(codes.Internal, "发布视频失败")
+	}
+
 	// 预生成 outbox 事件 ID，事务里根据 videos.id 组装 payload 后落 outbox_events。
 	eventID, err := newEventID("video_published")
 	if err != nil {
@@ -100,49 +122,13 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 	//      同一个本地事务里，任一步失败都会自动回滚，从根本上杜绝
 	//      "视频存在但 ref_count 被回滚" / "ref_count 已加但视频未创建" / "视频已发布但下游无感知"
 	//      三类一致性漂移。
-	// 幂等：先按 (author_id, request_id) 查已有视频，命中则直接返回；
-	//      未命中才走真正的 reserve + insert + outbox 流程。
-	//      并发写入撞唯一键 uk_video_request 时，通过 duplicate error 兜底回读。
-	var (
-		assetErr        error
-		alreadyExisted  bool
-		existedVideo    model.Video
-		existedTagsFlag bool
-	)
+	// 幂等：事务外预检负责普通重试；并发写入撞唯一键 uk_video_request 时，
+	//      当前事务整体回滚，再通过独立连接回读胜出请求。
 	err = l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
-		// 0. 幂等预检：按 (author_id, request_id) 查询是否已经发布过。
-		//    命中时直接返回原视频，跳过 reserve/create/outbox 等所有副作用。
-		var existed model.Video
-		if err := tx.
-			Where("author_id = ? AND request_id = ?", authorID, requestID).
-			Take(&existed).Error; err != nil {
-			if !errors.Is(err, gorm.ErrRecordNotFound) {
-				return err
-			}
-		} else {
-			// 命中：额外校验幂等键对应的其它入参一致，防止不同的 play_url/cover_url 复用同一个 request_id。
-			if existed.PlayURL != playURL || existed.CoverURL != coverURL {
-				assetErr = status.Error(codes.AlreadyExists, "幂等请求ID已被使用，请重新生成")
-				return errors.New("request_id reused with different payload")
-			}
-			existedVideo = existed
-			alreadyExisted = true
-			existedTagsFlag = true
-			return nil
-		}
-
-		// 1. 在事务内 reserve 视频与封面的引用计数。
-		//    所有请求都按 URL 排序后加锁，避免并发请求分别按 A->B、B->A
-		//    获取 file_assets 行锁形成死锁。
-		for _, assetURL := range orderedFileAssetURLs(playURL, coverURL) {
-			if rerr := reserveFileAssetRefByURL(l.ctx, tx, assetURL); rerr != nil {
-				if errors.Is(rerr, gorm.ErrRecordNotFound) {
-					if assetURL == playURL {
-						assetErr = status.Error(codes.InvalidArgument, "视频资源不存在或已失效，请重新上传")
-					} else {
-						assetErr = status.Error(codes.InvalidArgument, "封面资源不存在或已失效，请重新上传")
-					}
-				}
+		// 1. 按 URL 固定顺序执行条件原子 UPDATE。UPDATE 自身获取行锁，
+		//    同 URL 的视频/封面引用已聚合到 RefDelta，无需重复查询或重复校验文件。
+		for _, asset := range preparedAssets {
+			if rerr := reservePreparedPublishFileAsset(l.ctx, tx, asset); rerr != nil {
 				return rerr
 			}
 		}
@@ -254,8 +240,8 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 		return nil
 	})
 	if err != nil {
-		if assetErr != nil {
-			return nil, assetErr
+		if clientErr, ok := invalidPublishAssetError(err, playURL); ok {
+			return nil, clientErr
 		}
 		// 并发撞唯一键：另一个请求已经用相同 (author_id, request_id) 抢先入库。
 		// 事务已回滚，此处用独立连接把已存在的那条视频读出来幂等返回。
@@ -265,32 +251,11 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 				l.Errorf("video publish idempotent read failed, author_id: %d, request_id: %s, error: %v", authorID, requestID, loadErr)
 				return nil, status.Error(codes.Internal, "发布视频失败")
 			}
-			existedVideo = *winner
-			alreadyExisted = true
-			existedTagsFlag = true
+			return l.idempotentPublishResponse(winner, playURL, coverURL, tags)
 		} else {
 			l.Errorf("video publish failed, author_id: %d, play_url: %s, error: %v", authorID, playURL, err)
 			return nil, status.Error(codes.Internal, "发布视频失败")
 		}
-	}
-
-	if alreadyExisted {
-		// 幂等命中或并发抢占场景：用已存在视频的 tags 一起返回，行为对客户端完全一致。
-		respTags := tags
-		if existedTagsFlag {
-			if loaded, tagsErr := loadTagsByVideoIDs(l.ctx, l.svcCtx.GormDB, []uint64{existedVideo.ID}); tagsErr == nil {
-				respTags = loaded[existedVideo.ID]
-			} else {
-				l.Errorf("load tags for idempotent published video failed, video_id: %d, error: %v", existedVideo.ID, tagsErr)
-			}
-		}
-		if err := invalidateVideoEntityCache(l.ctx, l.svcCtx.RedisCli, existedVideo.ID); err != nil {
-			l.Errorf("invalidate video entity cache after idempotent publish failed, video_id: %d, error: %v", existedVideo.ID, err)
-		}
-		return &videopb.PublishVideoResp{
-			Msg:   "发布成功",
-			Video: toVideoInfo(&existedVideo, respTags, false),
-		}, nil
 	}
 
 	if err := invalidateVideoEntityCache(l.ctx, l.svcCtx.RedisCli, publishedVideo.ID); err != nil {
@@ -299,5 +264,41 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 	return &videopb.PublishVideoResp{
 		Msg:   "发布成功",
 		Video: toVideoInfo(&publishedVideo, tags, false),
+	}, nil
+}
+
+func invalidPublishAssetError(err error, playURL string) (error, bool) {
+	assetURL, ok := unavailablePublishFileAssetURL(err)
+	if !ok {
+		return nil, false
+	}
+	if assetURL == playURL {
+		return status.Error(codes.InvalidArgument, "视频资源不存在或已失效，请重新上传"), true
+	}
+	return status.Error(codes.InvalidArgument, "封面资源不存在或已失效，请重新上传"), true
+}
+
+func (l *PublishVideoLogic) idempotentPublishResponse(
+	video *model.Video,
+	playURL string,
+	coverURL string,
+	fallbackTags []string,
+) (*videopb.PublishVideoResp, error) {
+	if video.PlayURL != playURL || video.CoverURL != coverURL {
+		return nil, status.Error(codes.AlreadyExists, "幂等请求ID已被使用，请重新生成")
+	}
+
+	respTags := fallbackTags
+	if loaded, err := loadTagsByVideoIDs(l.ctx, l.svcCtx.GormDB, []uint64{video.ID}); err == nil {
+		respTags = loaded[video.ID]
+	} else {
+		l.Errorf("load tags for idempotent published video failed, video_id: %d, error: %v", video.ID, err)
+	}
+	if err := invalidateVideoEntityCache(l.ctx, l.svcCtx.RedisCli, video.ID); err != nil {
+		l.Errorf("invalidate video entity cache after idempotent publish failed, video_id: %d, error: %v", video.ID, err)
+	}
+	return &videopb.PublishVideoResp{
+		Msg:   "发布成功",
+		Video: toVideoInfo(video, respTags, false),
 	}, nil
 }

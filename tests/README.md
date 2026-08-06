@@ -66,12 +66,14 @@ seed 做的事：
 
 1. 直接 `INSERT accounts`，用户名统一 `seed_user_{i}`、邮箱 `seed_user_{i}@loadtest.local`、
    密码 **bcrypt(`LoadTest@123`)**（**所有 seed 用户共用同一份密码**，压测登录只需拿用户名）。
-2. 直接 `INSERT file_assets` 造一份可复用的占位视频/封面 URL（走 `/uploads/seed/*.mp4`），
-   `ref_count` 与实际引用视频数一致。
+2. 在 gateway 的 `Upload.Dir` 下创建稀疏占位视频/封面文件，并 `INSERT file_assets`
+   （URL 走 `/uploads/seed/*`，`storage_path` 为真实绝对路径），保证发布压测仍经过磁盘存在性校验；
+   `ref_count` 与实际引用视频数一致。默认目录为仓库根目录的 `uploads`，可用 `-upload-dir` 覆盖。
 3. 直接 `INSERT videos`，`author_id` 在用户中均匀分布，`created_at` 分布在过去 30 天，
    `likes_count / comments_count` 初始为 0（真实互动由压测阶段产生）。
 
-> seed 不向 Redis / Kafka 写入派生业务数据；`-reset-redis` 只在重置时删除 `fsz:*` Key。
+> seed 不向 Redis / Kafka 写入派生业务数据；`-reset` 会清理 `uploads/seed` 测试文件，
+> `-reset-redis` 只在重置时删除 `fsz:*` Key。
 > Kafka topic 和消费位点保持不变，新压测事件会从现有位点继续追加和消费。
 
 ---

@@ -42,20 +42,25 @@ func (s *PublishVideoScenario) Setup(ctx context.Context, f testconfig.LoadTestF
 	}
 	s.tokens = tokens
 
-	// Load the placeholder URLs we seeded; the gateway checks that play_url
-	// is a valid, ref-counted asset.
-	var urls []string
+	// 加载 seed 创建的真实磁盘占位资源，发布仍会经过 video-rpc 的行锁与磁盘校验。
+	var playURLs []string
 	if err := db.WithContext(ctx).
-		Raw("SELECT url FROM file_assets WHERE storage_path LIKE '/seed/%' AND file_type='video'").
-		Scan(&urls).Error; err != nil {
+		Raw("SELECT url FROM file_assets WHERE file_hash LIKE 'seed-video-hash-%' AND file_type='video'").
+		Scan(&playURLs).Error; err != nil {
 		return err
 	}
-	if len(urls) == 0 {
+	var coverURLs []string
+	if err := db.WithContext(ctx).
+		Raw("SELECT url FROM file_assets WHERE file_hash LIKE 'seed-cover-hash-%' AND file_type='cover'").
+		Scan(&coverURLs).Error; err != nil {
+		return err
+	}
+	if len(playURLs) == 0 || len(coverURLs) == 0 {
 		return fmt.Errorf("no seed file_assets; run cmd/seed first")
 	}
-	s.playURLPool = urls
-	s.coverURLPool = urls // reuse the same set as covers; the endpoint doesn't strictly enforce cover-type
-	log.Printf("[publish_video] using %d placeholder asset URLs", len(urls))
+	s.playURLPool = playURLs
+	s.coverURLPool = coverURLs
+	log.Printf("[publish_video] using %d video and %d cover placeholder assets", len(playURLs), len(coverURLs))
 
 	s.client = httpclient.New(f.BaseURL, f.Timeout)
 	return nil

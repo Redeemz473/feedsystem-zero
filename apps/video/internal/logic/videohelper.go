@@ -50,10 +50,17 @@ func isDuplicateKeyError(err error) bool {
 // 用于并发抢占后事务已回滚的场景，把已经写入的那条视频返回给客户端。
 func loadVideoByAuthorRequestID(ctx context.Context, db *gorm.DB, authorID uint64, requestID string) (*model.Video, error) {
 	var v model.Video
-	if err := db.WithContext(ctx).
+	result := db.WithContext(ctx).
 		Where("author_id = ? AND request_id = ?", authorID, requestID).
-		Take(&v).Error; err != nil {
-		return nil, err
+		Limit(1).
+		Find(&v)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 {
+		// 幂等预检未命中是首次发布的正常分支。使用 Find + RowsAffected，
+		// 避免 GORM 把每次正常 miss 记录为 record not found 错误日志。
+		return nil, gorm.ErrRecordNotFound
 	}
 	return &v, nil
 }

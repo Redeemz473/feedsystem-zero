@@ -18,6 +18,7 @@ const (
 	DefaultRedisAddr   = "127.0.0.1:6380"
 	DefaultRedisPass   = "123456"
 	DefaultRedisDB     = 0
+	DefaultUploadDir   = "uploads"
 
 	// SeedUserPrefix is the mandatory prefix for every seeded username / email,
 	// so a `-reset` pass can wipe test data without touching real accounts.
@@ -45,6 +46,9 @@ type SeedFlags struct {
 	RedisAddr string
 	RedisPass string
 	RedisDB   int
+	// UploadDir 必须与 gateway 的 Upload.Dir 指向同一目录。seed 会在其
+	// seed 子目录创建真实占位文件，使 PublishVideo 的磁盘校验保持生效。
+	UploadDir string
 	Users     int
 	Videos    int
 	Reset     bool
@@ -66,6 +70,7 @@ func RegisterSeedFlags(fs *flag.FlagSet, f *SeedFlags) {
 	fs.StringVar(&f.RedisAddr, "redis", DefaultRedisAddr, "Redis address")
 	fs.StringVar(&f.RedisPass, "redis-pass", DefaultRedisPass, "Redis password")
 	fs.IntVar(&f.RedisDB, "redis-db", DefaultRedisDB, "Redis database")
+	fs.StringVar(&f.UploadDir, "upload-dir", DefaultUploadDir, "gateway upload directory used for seed asset files")
 	fs.IntVar(&f.Users, "users", 10000, "number of seed users to create")
 	fs.IntVar(&f.Videos, "videos", 5000, "number of seed videos to create")
 	fs.BoolVar(&f.Reset, "reset", false, "delete existing seed/loadtest business data before inserting new rows")

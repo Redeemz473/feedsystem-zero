@@ -21,7 +21,7 @@
 - ⚙️ **互动事件批量同步**：`interaction_sync` 按 topic+partition 组内保序、组间并发，每 500 条一个幂等事务；事件按视频聚合后升序更新，配合 Redis pending/acked/pending_count 保证最终收敛。
 - 🚀 **Feed 推拉分离**：小 V 走 fanout 写扩散到粉丝 inbox，大 V（`is_big_v` 只升不降）只写自己的 outbox，读侧懒加载合并 inbox 与关注的大 V outbox。
 - 🧠 **可控降级**：Redis 只作为加速层，Profile / Timeline / 未读数 / 评论首页均采用"版本号 + 惰性重算"，任何时刻 Redis 挂掉都能降级到 MySQL 直查。
-- 📦 **文件秒传 + 延迟清理**：分片上传 + 全局 file_hash 秒传，`file_assets.ref_count` 归零后由 asset_cleanup job 延迟物理删除，同时兜底"引用复活"场景。
+- 📦 **文件秒传 + 一致性巡检**：分片上传 + 全局 file_hash 秒传；发布前批量校验唯一物理文件，事务内通过条件原子更新维护 `ref_count`，asset_cleanup 负责延迟物理删除、引用复活和 Active 资产对账。
 - 📊 **可复现压测**：内置造数、HTTP 压测和 E2E 工具，已完成 10000 用户、5000 视频规模验证，并对 Outbox、Kafka lag、Redis 增量和 MySQL 聚合做最终一致性验收。
 - 🎨 **配套前端**：`web/` 目录内是 Vite + React 18 + TS + Tailwind + TanStack Query 实现的完整前端，覆盖登录、上传、播放、点赞、评论、关注、通知全流程。
 
@@ -75,7 +75,7 @@ flowchart LR
 | **feed_timeline** | `feed.video.events` / `social.follow.events` | 推拉分离扇出，ready 丢失时主动 bootstrap |
 | **hotrank** | `interaction.like.events` / `interaction.comment.events` | 独立维护 UTC 分钟窗口，Feed 按需构建衰减快照 |
 | **notification** | `notification.events` | 通知落库、未读数 version bump、死信旁路 |
-| **asset_cleanup** | 无（轮询扫库） | 延迟物理清理 file_assets，抢占超时兜底 + 引用复活 |
+| **asset_cleanup** | 无（轮询扫库） | 延迟物理清理 file_assets，校准 ref_count，巡检磁盘缺失资产 |
 
 ---
 
@@ -105,6 +105,15 @@ bash deploy/kafka/create_topics.sh
 ### 4.3 起后端
 
 RPC 与 Job 都是独立的 `main.go`，各起一个终端即可：
+
+也可以使用统一启动脚本（默认不重置数据；压测前首次运行可增加 `--seed`）：
+
+```bash
+./scripts/start_all.sh --seed
+
+# 基础容器已运行时，仅重新构建并重启后端，不触发 Docker/Sudo
+./scripts/start_all.sh restart --no-deps
+```
 
 ```bash
 # RPC
@@ -204,11 +213,11 @@ feedsystem-zero/
 
 ## 六、测试与验证
 
-仓库内置 `seed` 和 `loadtest`，可直接通过 Gateway 压测完整后端链路。本轮使用 **10000 用户 + 5000 视频**，所有依赖与服务均运行在同一台本地开发机。
+仓库内置 `seed` 和 `loadtest`，可直接通过 Gateway 压测完整后端链路。本轮使用 **10000 用户 + 5000 视频**，所有依赖与服务均运行在同一台本地开发机。seed 会在 `uploads/seed` 创建真实稀疏占位文件，使发布压测同样经过资产行锁和磁盘存在性校验；启动目录不同时可用 `-upload-dir` 指定与 gateway 相同的上传目录。
 
 ```bash
 # 重置压测数据并生成正式规模数据
-go run ./tests/cmd/seed -reset -reset-redis -users 10000 -videos 5000
+go run ./tests/cmd/seed -reset -reset-redis -users 10000 -videos 5000 -file-buckets 100
 
 # 点赞/取消点赞正式压测
 go run ./tests/cmd/loadtest \
@@ -218,7 +227,9 @@ go run ./tests/cmd/loadtest \
 
 | 场景 | 参数 | 成功率 | QPS | P99 |
 |---|---|---:|---:|---:|
-| 发布视频 | 5 并发 / 10s | 100% | 318.7 | 24ms |
+| 发布视频（当前优化，3 轮中位数） | 5 并发 / 10s | 100% | 302.2 | 25ms |
+| 发布视频（当前优化，并发回归） | 20 并发 / 30s | 100% | 542.1 | 60ms |
+| 发布视频（强一致初版饱和压力） | 50 并发 / 60s | 100% | 568.2 | 286ms |
 | 关注 | 10 并发 / 10s | 100% | 354.7 | 54ms |
 | 关注流 | 20 并发 / 30s | 100% | 1076.8 | 30ms |
 | 热榜缓存命中 | 50 并发 / 30s | 100% | 7503.4 | 16ms |
@@ -227,7 +238,9 @@ go run ./tests/cmd/loadtest \
 
 > 点赞场景一次循环包含 Like + Unlike 两个写请求，`260.4 次循环/s` 约等于 `520.8 HTTP 写请求/s`。优化后的 Kafka 消息在压测结束约 7 秒后排空；最终未投递 Outbox、互动死信、Kafka lag、Redis delta/pending 和三类 MySQL 对账差异均为 0。
 
-关键包已通过 `go test -race`，`go vet` 无输出。完整命令、优化前后对照和一致性 SQL 见 [完整测试记录](./docs/PROJECT_OVERVIEW.md#146-测试压测与一致性验收2026-08-03)。E2E 冒烟目前唯一的环境限制是 `@loadtest.local` 虚构邮箱无法通过真实 163 SMTP 接收验证码。
+> 强一致初版采用 `file_assets SELECT FOR UPDATE` 后在锁内校验 `storage_path`，`c=5` QPS 从无校验基线 318.7 降至 288.2。当前实现改为“事务外批量预检 + 事务内条件原子 UPDATE”，并消除正常幂等 miss 的错误日志；最终三轮 QPS 为 `302.2 / 304.8 / 299.9`，中位数 302.2：相比强一致初版回升约 4.9%，收回约 46% 的吞吐损失；相比无校验基线仍低约 5.2%。成功率保持 100%，排空后未投递 Outbox 和资产引用差异均为 0。
+
+关键包已通过 `go test -race`，`go vet` 无输出。完整命令、优化前后对照和一致性 SQL 见 [完整测试记录](./docs/PROJECT_OVERVIEW.md#146-测试压测与一致性验收2026-08-03发布链路回归于-2026-08-07)。E2E 冒烟目前唯一的环境限制是 `@loadtest.local` 虚构邮箱无法通过真实 163 SMTP 接收验证码。
 
 ---
 

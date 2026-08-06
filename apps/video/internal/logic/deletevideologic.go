@@ -38,7 +38,7 @@ func NewDeleteVideoLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Delet
 // 事务边界（P0 + P4 一致性重构）：
 //  1. 事务内 SELECT ... FOR UPDATE 拿到视频，校验作者身份；
 //  2. 事务内 UPDATE videos 软删；
-//  3. 事务内对 play_url / cover_url 各调一次 decreaseFileAssetRefInTx，
+//  3. 事务内按 URL 排序减少 play_url / cover_url 引用，
 //     引用降到 0 时只置 PendingDelete，物理删除交给独立 cleanup job；
 //  4. 事务内 INSERT outbox_events(video.deleted)，让下游 feed / 推荐 / 通知等异步系统能感知；
 //  5. 事务任一步失败 → 全部回滚，不会出现"视频软删了但 ref_count 没减"或"事件已发但视频没删"的漂移。
@@ -113,12 +113,15 @@ func (l *DeleteVideoLogic) DeleteVideo(in *videopb.DeleteVideoReq) (*videopb.Del
 			return gorm.ErrRecordNotFound
 		}
 
-		// 3. 事务内减引用计数（不做物理删除）
-		if err := decreaseFileAssetRefInTx(l.ctx, tx, playURL); err != nil {
-			return err
-		}
-		if err := decreaseFileAssetRefInTx(l.ctx, tx, coverURL); err != nil {
-			return err
+		// 3. 事务内按 URL 固定顺序减少引用计数（不做物理删除）。
+		//    与发布路径使用相同锁序，避免发布和删除并发时发生资产行锁顺序反转；
+		//    视频与封面 URL 相同时 Delta=2，仍会扣除两个逻辑引用。
+		for _, assetRef := range aggregateFileAssetRefs(playURL, coverURL) {
+			for i := int64(0); i < assetRef.Delta; i++ {
+				if err := decreaseFileAssetRefInTx(l.ctx, tx, assetRef.URL); err != nil {
+					return err
+				}
+			}
 		}
 
 		// 4. 事务内写 outbox（P4：video.deleted 事件）

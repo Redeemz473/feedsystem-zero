@@ -673,8 +673,10 @@ sequenceDiagram
     Note over U,V: 秒传/上传成功后前端拿 canonical_url 发布
     U->>G: /video/publish { title, play_url, cover_url, tags, request_id }
     G->>V: PublishVideo
+    V->>DB: SELECT file_assets WHERE url IN (...) AND status=Active
+    V->>Disk: 批量预检唯一 storage_path<br/>存在且为普通文件
     V->>DB: BEGIN
-    V->>DB: file_assets.ref_count += 1 (play_url + cover_url)
+    V->>DB: 条件原子 UPDATE file_assets<br/>ref_count += logical_delta
     V->>DB: INSERT videos + INSERT video_tags
     V->>DB: INSERT outbox_events(feed.video.events, published)
     V->>DB: COMMIT
@@ -689,16 +691,16 @@ sequenceDiagram
     AC->>R: DEL fsz:chunkupload:hash:global:{fileHash}
 ```
 
-**关键点**：`ref_count` 调整与 `videos` 创建/软删除必须在 **video-rpc 同一事务内**。这样 file_assets 永远不会出现“孤儿引用”（视频删了但资产还在）或“悬空视频”（视频存在但资产没引用）。
+**关键点**：`ref_count` 调整与 `videos` 创建/软删除必须在 **video-rpc 同一事务内**。发布前，`preparePublishFileAssets` 用一条 `WHERE url IN (...)` 查询批量加载视频与封面资产，并在事务外检查每个唯一 `storage_path` 是否为真实普通文件；事务内再以 `id + url + storage_path + status=Active` 为条件原子增加引用。任一条件失效都会使 `RowsAffected=0` 并回滚整个发布事务，要求客户端重新上传。
 
-#### 8.2.1 PublishVideo 多资产加锁保序（防死锁）
+#### 8.2.1 PublishVideo 多资产条件更新保序（防死锁）
 
-一条视频最多涉及两个 `file_assets` 行：`play_url` 与 `cover_url`。若两个并发的 `PublishVideo` 事务分别以 `A→B` 和 `B→A` 顺序对同两个资产 `SELECT ... FOR UPDATE`，会形成经典锁序反转死锁。
+一条视频最多涉及两个 `file_assets` 行：`play_url` 与 `cover_url`。条件 `UPDATE` 本身会获取排他行锁；若两个并发事务分别以 `A→B` 和 `B→A` 更新同两个资产，仍会形成经典锁序反转死锁。
 
-`apps/video/internal/logic/fileassethelper.go` 的 `orderedFileAssetURLs` 会**先去重、再对非空 URL 升序排序**，`publishvideologic.go` 的事务体统一按这个稳定顺序调用 `reserveFileAssetRefByURL(tx, url)`。任何两个并发发布事务的加锁序列都相同，从根源消除资产维度的锁序反转，与 §8.4 的 accounts 双行锁思路一致。
+`aggregateFileAssetRefs` 会对 URL **去重、统计逻辑引用数并升序排列**，事务体统一按该顺序调用 `reservePreparedPublishFileAsset`。任何发布或删除事务的资产更新顺序都相同；当 `play_url == cover_url` 时，只执行一次 `ref_count = ref_count + 2`，无需重复查询、校验和更新。
 
-- 单元测试：`fileassethelper_test.go` 断言 `orderedFileAssetURLs` 对乱序、重复、空串的稳定输出。
-- 引用调整仍在事务内完成；即便 `reserveFileAssetRefByURL` 命中 `Cleaning` 状态也会直接返回错误让事务回滚，绝不复活已删资产。
+- 单元测试：`fileassethelper_test.go` 覆盖 URL 聚合保序、重复 URL 的 `Delta=2`、缺失文件以及条件原子 UPDATE 的 SQL 约束。
+- 显式 `SELECT FOR UPDATE` 已被移除，但条件 `UPDATE` 自身仍会持有行锁，并通过 `status=Active` 阻止 `Cleaning/PendingDelete` 资产被重新引用。
 
 **file_assets 四状态机（commit 687d0ab 完善）**：
 
@@ -1924,7 +1926,7 @@ flowchart TD
 
 ### 9.5 asset_cleanup Job（文件资产物理清理）
 
-**定位**：一个单进程、无 Kafka 依赖的定时扫库 Job（默认 30s 一轮），把 video-rpc/gateway 已标记 `PendingDelete` 的 file_assets **延迟物理删除**，同时避免误删控制在中台上传一台删除的秒传竞争窗口。
+**定位**：一个无 Kafka 依赖的定时扫库 Job。它一方面默认每 30s 处理 `PendingDelete/Cleaning` 资产的延迟物理删除，另一方面按主键游标默认每 60s 巡检一批 Active 资产，持续校准 MySQL 引用计数与磁盘状态。
 
 **流程**：
 
@@ -1942,13 +1944,25 @@ flowchart TD
    （使 gateway 秒传全局缓存失效，数据库才是权威来源）。
 ```
 
+**Active 资产巡检**：
+
+```
+1. 按 id 游标读取一批 Active 资产（默认 200，最大 500），避免反复扫描表头。
+2. 逐条在 SELECT FOR UPDATE 行锁内统计正常 videos 的 play_url + cover_url 真实逻辑引用数。
+3. ref_count 不一致 → 原子回填真实值。
+4. 磁盘文件缺失且真实引用为 0 → 标记 Deleted，并删除全局秒传缓存。
+5. 磁盘文件缺失但仍有真实引用 → 保留 Active 元数据、删除全局秒传缓存并记录高优先级错误，
+   防止继续秒传或发布，同时保留故障证据供人工/存储修复。
+```
+
 **一致性保障**：
 - `GraceSeconds`（默认 300s）：避免刚刚软删、尚未成功返回的写路径与清理时长上碰撞。
 - `ClaimTimeoutSeconds`（默认 300s）：旧 Cleaning 抢占者崩溃后自动释放。
+- 发布、删除、引用复活和 Active 巡检都锁定同一 `file_assets` 行，避免巡检用旧计数覆盖刚提交的新引用。
 - Gateway 秒传 `upsertFileAsset` 遇到 Cleaning 必须轮询等待，**绝不会同时存在“Gateway 把 Cleaning 改回 Active” + “Job 正在 Cleaning 删除”的双写**。
 - Redis 删除失败不回滚已完成的物理删除，Gateway 秒传会以 DB 状态二次校验（`lookupInstantUploadedFile` 发现 asset 不存在会主动清 Redis）。
 
-新增配置项 `AssetCleanupConf`（`apps/job/asset_cleanup/etc/asset_cleanup.yaml`）：BatchSize / PollIntervalSeconds / GraceSeconds / ClaimTimeoutSeconds / DeleteTimeoutMs。
+配置项 `AssetCleanupConf`（`apps/job/asset_cleanup/etc/asset_cleanup.yaml`）：BatchSize / PollIntervalSeconds / GraceSeconds / ClaimTimeoutSeconds / DeleteTimeoutMs / ReconcileBatchSize / ReconcileIntervalSeconds。
 
 ---
 
@@ -2424,7 +2438,7 @@ cd apps/gateway
 goctl api go -api gateway.api -dir . --style=goZero
 ```
 
-### 14.6 测试、压测与一致性验收（2026-08-03）
+### 14.6 测试、压测与一致性验收（2026-08-03，发布链路回归于 2026-08-07）
 
 #### 14.6.1 验证范围与结论
 
@@ -2449,7 +2463,7 @@ go run ./tests/cmd/seed \
   -file-buckets 100
 ```
 
-正式测试数据为 **10000 个用户 + 5000 个视频**。压测工具从这些数据中抽取登录池和目标池，不把造数耗时计入请求指标。
+正式测试数据为 **10000 个用户 + 5000 个视频**。seed 还会在 gateway 的 `Upload.Dir` 下创建 `uploads/seed` 稀疏占位文件，并把绝对路径写入 `file_assets.storage_path`，因此 `publish_video` 不会绕过 video-rpc 的磁盘存在性校验；若不是从仓库根目录启动，可用 `-upload-dir` 指向 gateway 实际上传目录。压测工具从这些数据中抽取登录池和目标池，不把造数耗时计入请求指标。
 
 #### 14.6.3 功能与读场景压测结果
 
@@ -2457,12 +2471,30 @@ go run ./tests/cmd/seed \
 
 | 场景 | 参数 | 成功率 | QPS | P50 | P95 | P99 | Max |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 发布视频 | `c=5,d=10s,login=20` | 100% | 318.7 | 15ms | 20ms | 24ms | 53ms |
+| 发布视频（当前优化，3 轮中位数） | `c=5,d=10s,login=20` | 100% | 302.2 | 15ms | 21ms | 25ms | 38ms* |
+| 发布视频（当前优化，并发回归） | `c=20,d=30s,login=100` | 100% | 542.1 | 35ms | 51ms | 60ms | 92ms |
+| 发布视频（强一致初版饱和压力） | `c=50,d=60s,login=500` | 100% | 568.2 | 71ms | 197ms | 286ms | 665ms |
 | 点赞冒烟 | `c=10,d=10s,login=20,target=100` | 100% | 327.7 | 29ms | 40ms | 47ms | 60ms |
 | 关注 | `c=10,d=10s,login=20,target=100` | 100% | 354.7 | 26ms | 43ms | 54ms | 101ms |
 | 关注流 | `c=20,d=30s,login=50` | 100% | 1076.8 | 17ms | 25ms | 30ms | 49ms |
 | 热榜（缓存命中） | `c=50,d=30s` | 100% | 7503.4 | 5ms | 13ms | 16ms | 32ms |
 | 热榜（删除 merge 后重建） | `c=50,d=30s` | 100% | 1428.1 | 34ms | 46ms | 54ms | 82ms |
+
+\* `c=5` 当前优化结果取三轮 QPS 和各延迟分位的中位数；Max 使用中位 QPS 对应轮次，不对三轮极值取平均。
+
+**发布链路一致性与性能优化对比**（相同参数：`c=5,d=10s,warmup=2s,login=20`）：
+
+| 阶段 | 资产处理方式 | QPS | P99 | 相对无校验基线 |
+|---|---|---:|---:|---:|
+| 无物理文件校验基线 | 事务内条件更新引用 | 318.7 | 24ms | 基线 |
+| 强一致初版 | `SELECT FOR UPDATE` 后锁内 `os.Stat` | 288.2 | 25ms | **-9.6%** |
+| 当前优化 | 事务外批量预检 + 事务内条件原子更新 | **302.2** | 25ms | **-5.2%** |
+
+当前最终代码还把正常的幂等预检 miss 从 GORM `Take` 改为 `Find + RowsAffected`，避免每次首次发布都写入 `record not found` 错误日志。最终三轮 QPS 分别为 `302.2 / 304.8 / 299.9`，取中位数 302.2。相比强一致初版提升 `(302.2-288.2)/288.2 = 4.86%`；最初损失为 `318.7-288.2=30.5` QPS，当前收回 `302.2-288.2=14.0` QPS，即约 **46%**。剩余约 5.2% 的成本来自真实文件校验、资产元数据读取及测试波动，是当前一致性保障的可接受代价。
+
+`c=20` 当前代码回归为 542.1 QPS、P99 60ms、成功率 100%。该轮执行前数据库已经累计多轮发布数据，与早期 559.3 QPS 不是严格同一快照，因此只用于确认并发路径无功能和尾延迟回退，不作为优化收益计算依据。回归排空后 `outbox_non_sent=0`、`asset_ref_mismatches=0`，video/outbox/asset_cleanup 日志未出现死锁、锁等待超时或发布失败。
+
+强一致初版的历史饱和测试中，并发从 20 提升到 50 时，QPS 仅由 559.3 增至 568.2，而 P99 从 59ms 增至 286ms，说明单机写链路的性能拐点约在 20～30 并发。该轮饱和压力下 34134 次发布仍全部成功；异步排空后未投递 Outbox 为 0、`feed-timeline-job` 全 partition lag 为 0、`asset_ref_mismatches=0`。
 
 热榜冷构建压测结束后，`fsz:hot:merge:{minute}:ready=50` 且对应 ZSET `ZCARD=50`，证明低 QPS 不是空缓存错误，而是请求触发聚合构建后的真实成本。
 
@@ -2656,7 +2688,8 @@ go vet ./apps/... ./common/... ./tests/...
 
 **Video PublishVideo（`apps/video/internal/logic/{publishvideologic,fileassethelper}.go`）**：
 
-- `orderedFileAssetURLs` 对 `play_url / cover_url` **去重后升序**排列，事务内同顺序调用 `reserveFileAssetRefByURL`。任何两个并发发布事务的资产行加锁序一致，从根源消除资产维度锁序反转。
+- `aggregateFileAssetRefs` 对 `play_url / cover_url` **去重、聚合引用增量并升序**排列；事务外一条 `IN` 查询完成元数据预检和唯一文件校验，事务内按相同顺序执行带 `id/url/storage_path/status` 条件的原子 `UPDATE`。发布与删除使用同一锁序，避免资产行锁顺序反转。
+- 幂等预检移出事务，普通重试直接返回原视频，并发首发继续由 `(author_id, request_id)` 唯一键兜底；查询使用 `Find + RowsAffected` 表达正常 miss，避免 GORM 高频输出 `record not found` 错误日志。
 
 **Interaction Sync（`apps/job/interaction_sync/internal/logic/syncconsumer.go`）**：
 
@@ -2671,7 +2704,7 @@ go vet ./apps/... ./common/... ./tests/...
 
 **测试**：
 
-- 新增/更新单元测试：`dispatcher_test.go`（claim SQL 包含 NOT EXISTS 与 splitOutboxBatches）、`syncconsumer_test.go`（callFlushRPCWithRetry / shouldLogFlushRPCRetry / normalizeSyncBatchSize）、`consumer_test.go`（isRetryableNotificationDBError 覆盖 1213/1205 与 wrapped error）、`fileassethelper_test.go`（orderedFileAssetURLs 去重升序）、`jobhelper_test.go`（videoStatDeltaUpdates 去 GREATEST）。`go test ./...` / `go vet ./...` 均零告警零失败。
+- 新增/更新单元测试：`dispatcher_test.go`（claim SQL 包含 NOT EXISTS 与 splitOutboxBatches）、`syncconsumer_test.go`（callFlushRPCWithRetry / shouldLogFlushRPCRetry / normalizeSyncBatchSize）、`consumer_test.go`（isRetryableNotificationDBError 覆盖 1213/1205 与 wrapped error）、`fileassethelper_test.go`（资产聚合保序、文件异常和条件原子更新）、`jobhelper_test.go`（videoStatDeltaUpdates 去 GREATEST）。`go test ./...` / `go vet ./...` 均零告警零失败。
 
 **文档补充**（`docs/PROJECT_OVERVIEW.md` §9.1）：新增 4 个小节沉淀 Outbox 深度概念——`9.1.1 三层并发单位模型`（集群 / 进程 / 单轮）、`9.1.2 生命周期同步：inFlight 与 WaitGroup 的分工`（并发限制 vs 优雅关闭）、`9.1.3 X 锁 vs 业务层租约`（区分 MySQL 行锁 & lock_token 印章，明确 outbox 是租约模型）、`9.1.4 两阶段独立 ctx 与失败路径的原子处理`（Kafka/DB 各自超时预算、整批重试逐条 markFailed 首错记录、无缓冲 channel + 双 case select 优雅退出）。原 9.1.5 消费者失败处理小节保持不变。
 
