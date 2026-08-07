@@ -270,6 +270,7 @@ type savedUploadAsset struct {
 }
 
 func saveVideoUpload(r *http.Request, upload config.UploadConf) (*savedUploadAsset, error) {
+	// 直传能接受的最大文件 = 分片阈值（超过就该走分片路径）
 	maxBytes := chunkThresholdBytes(upload)
 	if upload.MaxVideoBytes > 0 && upload.MaxVideoBytes < maxBytes {
 		maxBytes = upload.MaxVideoBytes
@@ -333,6 +334,8 @@ func saveMultipartUpload(
 		if header.Size > maxBytes {
 			return nil, status.Error(codes.InvalidArgument, "上传文件过大")
 		}
+
+		// 文件魔数校验 确认文件的真实类型和扩展名声称的一致
 		if err := validateUploadedFileSignature(file, ext); err != nil {
 			return nil, err
 		}
@@ -355,7 +358,8 @@ func saveMultipartUpload(
 
 		hasher := sha256.New()
 		limited := &io.LimitedReader{R: file, N: maxBytes + 1}
-		written, copyErr := io.Copy(io.MultiWriter(dst, hasher), limited)
+		// 一次 IO 读取，同时得到  落盘 + hash + 字节数
+		written, copyErr := io.Copy(io.MultiWriter(dst, hasher), limited) //io.MultiWriter(dst, hasher) —— 把读到的每一个字节同时写入两处：磁盘 dst 和 hasher
 		closeErr := dst.Close()
 		if copyErr != nil {
 			_ = os.Remove(tmpPath)
@@ -377,6 +381,7 @@ func saveMultipartUpload(
 			_ = os.Remove(tmpPath)
 			return nil, status.Error(codes.InvalidArgument, "文件 hash 校验失败")
 		}
+		//内容寻址存储 filename 相同 == 文件内容比特级完全一致
 		filename := fileHash + ext
 		targetPath := filepath.Join(targetDir, filename)
 		//判断目标路径是否存在
@@ -531,6 +536,7 @@ func uploadedFileTTL(upload config.UploadConf) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// 判断是否走分片
 func shouldUseChunkUpload(upload config.UploadConf, fileSize int64) bool {
 	return fileSize > chunkThresholdBytes(upload)
 }
@@ -603,6 +609,7 @@ func hashReaderSHA256(reader io.Reader) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// 从redis查已上传的分片编号
 func loadUploadedChunks(ctx context.Context, redisCli *redis.Client, uploadID string) ([]int64, error) {
 	values, err := redisCli.SMembers(ctx, rediskey.ChunkUploadKey(uploadID)).Result()
 	if err != nil {
@@ -644,7 +651,8 @@ func lookupInstantUploadedFile(ctx context.Context, redisCli *redis.Client, db *
 		return "", status.Error(codes.Internal, "查询视频资源失败")
 	}
 
-	//如果DB表里的存在的话，再判断磁盘上文件是否真的存在
+	// 如果DB表里的存在的话，再判断磁盘上文件是否真的存在
+	// 磁盘上不存在则返回空，让客户端传文件
 	info, err := os.Stat(asset.StoragePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) && asset.RefCount == 0 {
@@ -667,6 +675,7 @@ func lookupInstantUploadedFile(ctx context.Context, redisCli *redis.Client, db *
 		return "", status.Error(codes.Internal, "秒传源文件异常")
 	}
 
+	// 存在则刷新redis缓存
 	ttl := uploadedFileTTL(upload)
 	pipe := redisCli.Pipeline()
 	pipe.Set(ctx, rediskey.ChunkUploadHashKey(userID, fileHash), asset.URL, ttl)

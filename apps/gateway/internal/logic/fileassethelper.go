@@ -18,6 +18,7 @@ import (
 // upsertFileAsset 登记文件并返回数据库中的规范资产地址。
 // file_hash 唯一，因此同一内容即使使用不同扩展名再次上传，也复用已有 URL，
 // 不允许把已被视频引用的记录悄悄改指向另一个路径。
+// 在磁盘文件已经落盘之后，把这份文件登记到DB
 func upsertFileAsset(ctx context.Context, db *gorm.DB, fileType string, fileHash string, url string, storagePath string, size int64) (model.FileAsset, error) {
 	if strings.TrimSpace(fileHash) == "" || strings.TrimSpace(url) == "" || strings.TrimSpace(storagePath) == "" {
 		return model.FileAsset{}, errors.New("文件资产参数不完整")
@@ -33,6 +34,7 @@ func upsertFileAsset(ctx context.Context, db *gorm.DB, fileType string, fileHash
 		Status:      model.FileAssetStatusActive,
 	}
 
+	// 幂等INSERT
 	result := db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "file_hash"}},
 		DoNothing: true,
@@ -44,20 +46,25 @@ func upsertFileAsset(ctx context.Context, db *gorm.DB, fileType string, fileHash
 		return asset, nil
 	}
 
+	// 如果DB里已经有了，判断是不是清理的job在用
 	var existing model.FileAsset
 	cleaningWaitDeadline := time.Now().Add(5 * time.Second)
 	for {
+		//重新SELECT
 		if err := db.WithContext(ctx).
 			Where("file_hash = ?", fileHash).
 			First(&existing).Error; err != nil {
 			return model.FileAsset{}, err
 		}
+		//判断是不是类型冲突
 		if existing.FileType != fileType {
 			return model.FileAsset{}, fmt.Errorf("文件 hash 已被另一种资产类型占用: %s", existing.FileType)
 		}
+		//状态不是cleaning，退出循环
 		if existing.Status != model.FileAssetStatusCleaning {
 			break
 		}
+		//超过5秒，放弃
 		if time.Now().After(cleaningWaitDeadline) {
 			return model.FileAsset{}, errors.New("文件资产正在清理，请稍后重试")
 		}

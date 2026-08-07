@@ -528,7 +528,7 @@ flowchart TD
 
 | 路径 | 入口接口 | 客户端实际传输 | 触发条件 | 服务端关键动作 |
 |---|---|---|---|---|
-| **① 真·秒传** | `/upload/init` 内联返回 | ~几十字节（只有 fileHash + 元信息） | `EnableInstantUpload=true` 且 Redis/MySQL 已存在同 hash 且状态 `Active`/`PendingDelete` | `lookupInstantUploadedFile` 命中 Redis 或 MySQL → 直接返回旧 canonical `play_url` |
+| **① 真·秒传** | `/upload/init` 内联返回 | ~几十字节（只有 fileHash + 元信息） | `EnableInstantUpload=true` 且 MySQL `file_assets` 存在同 hash 且 `status=Active`，且磁盘文件 `os.Stat` 通过 | `lookupInstantUploadedFile` 直查 MySQL + `os.Stat` 双重确认 → 返回该 asset 的 canonical `play_url`（并顺手把两把 Redis 秒传 key 刷新到最新 URL） |
 | **② 小文件直传** | `/upload/video` (`UploadVideoLogic`) | 整个文件一次 HTTP multipart | 秒传未命中 且 `fileSize ≤ ChunkThresholdBytes` | `saveVideoUpload` 落盘 + 边写边算 SHA256 → `upsertFileAsset` 去重登记 → Redis 写秒传双 key |
 | **③ 分片上传** | `/upload/init` → `/upload/chunk`×N → `/upload/complete` | 整个文件（分片可并发、可断点续传） | 秒传未命中 且 `fileSize > ChunkThresholdBytes` | init 建会话 → 每片落到 `chunkTempDir` → complete 合并、二次校验 hash、`upsertFileAsset` → 写秒传双 key |
 
@@ -537,11 +537,12 @@ flowchart TD
 1. **只有路径 ①（真·秒传）对本次上传的用户来说是"零传输"**。它的前提是客户端必须**先在本地把整个文件读一遍算出 SHA256**，然后只把 hash 发过来。服务器一次查询命中就直接返回 URL，客户端**不用再传文件内容**。这才配叫"秒传"。
 2. **路径 ②/③ 的 `upsertFileAsset` 也会做去重**，但那时候客户端已经把整个文件传上来了。这一步节省的是 **服务端的物理存储和 `file_assets` 的冗余行**（如果 MySQL 里 hash 已存在，就把本次刚落盘的重复文件删掉，返回旧 canonical URL），**并不能节省本次的网络带宽和落盘 IO**。
 3. **`UploadVideoLogic`（`/upload/video`）结尾那两条 `TxPipeline.SET`（写 `ChunkUploadHashKey` + `ChunkUploadGlobalHashKey`）不是"帮本次用户秒传"**，而是**为下一次同 hash 的上传埋种子**——下次别的用户（或自己）传相同文件时，`/upload/init` 就能在 Redis 里命中走路径 ①。这是一次"缓存预热"。
-4. **Redis 只是加速索引，MySQL `file_assets` 才是权威源**。所以：
-   - Redis 秒传 key 写失败只记日志、不回滚 MySQL（MySQL 登记成功即视为业务成功，下次上同 hash 时会自愈重写 Redis）；
-   - `lookupInstantUploadedFile` 内部实现是"先查 Redis 双 key、未命中再兜底查 MySQL `file_assets` 表"——即便 Redis 全挂，只要 MySQL 有记录，秒传照样能命中；
-   - asset_cleanup 物理删除文件后必须 `DEL fsz:chunkupload:hash:global:{fileHash}`，避免 Redis 留下指向已删磁盘的死缓存。
-5. **秒传缓存 TTL（`uploadedFileTTL`，默认 7 天）过期后**并不意味着"不能再秒传"，而是"这次得走 MySQL 兜底"。MySQL 命中后 `upsertFileAsset` 会重新把 Redis 补上——TTL 的作用只是**限制脏缓存的最长驻留时间**，防止 asset_cleanup 之外的意外场景（比如手动改 DB）留下长期不一致。
+4. **秒传决策的权威源是 MySQL `file_assets` + 磁盘 `os.Stat`，不是 Redis**。这是最容易被误解的地方：
+   - `lookupInstantUploadedFile` 的**读路径直接 `SELECT file_assets WHERE file_hash=? AND status=Active`**，然后 `os.Stat(storage_path)` 校验磁盘文件真实存在——**完全没有 `GET fsz:chunkupload:hash:*` 的动作**；
+   - 之所以不读 Redis，是为了规避"MySQL 已经 `PendingDelete` 但 Redis 还缓存着旧 URL"这种短暂不一致——**永远以 MySQL 状态和磁盘现实为准**，秒传决策就不会返回一个即将被 asset_cleanup 清理的死文件；
+   - Redis 双 key `ChunkUploadHashKey`（用户维度）和 `ChunkUploadGlobalHashKey`（全局）目前在**读路径上是"预留位"**，只做三件事：① 直传/合并成功后 `SET` 写入、② `lookupInstantUploadedFile` 命中 DB 后 `SET` 刷新、③ 各种"发现不一致"时的 `DEL` 清理；
+   - 保留写路径的价值是"**缓存已经热着**"——未来如果想启用 Redis 加速（在函数开头加 `GET` 短路 MySQL 查询），不需要冷启动预热，改动只有几行；也方便运维/外部系统旁路查询 hash → URL 映射。
+5. **秒传 TTL（默认 7 天）过期后不影响秒传能力**。因为读路径本来就直接查 MySQL，Redis 有没有、准不准都不影响判定结果。TTL 的作用只是限制**写入 Redis 后的最长驻留时间**，避免 asset_cleanup 之外的意外场景（比如运维手改 DB）留下过久的脏缓存。这个 TTL 从来不是秒传能否命中的门槛。
 6. **分片路径的断点续传**：`/upload/init` 内 `reuseUploadSession` 会查 `fsz:chunkupload:session:{userID}:{fileHash}`，如果存在同一会话且元数据（fileHash/fileSize/finalExt/chunkSize）**强一致校验**通过，就返回已存在的 `uploadID` + 已上传的分片编号数组，客户端只需补传缺失分片。任一元数据不一致则视为新会话。
 7. **上传路径与 `ref_count` 的边界**：无论走哪条路，`file_assets.ref_count` 的 `+=1` 都**不在上传时发生**，而是在后续 `/video/publish` 调用 video-rpc `PublishVideo` 的事务里完成。这样"上传成功但没发布"的孤立资产会在 Grace 期后被 asset_cleanup 回收，不会长期占存储。
 
@@ -550,10 +551,235 @@ flowchart TD
 1. 用户 A 选中一个 500MB 视频 → 客户端算 SHA256 → `/upload/init` 拿到 `Needupload=true, Needchunk=true`（大文件走分片）；
 2. A 循环 `/upload/chunk` 传完所有分片 → `/upload/complete`：服务端合并 + 二次 hash 校验 + `upsertFileAsset` **首次登记** `Active, ref_count=0` + **`SET fsz:chunkupload:hash:global:{hash} = canonical_url, EX 7d`**；
 3. A 拿到 `play_url` → `/video/publish` → video-rpc 事务内 `ref_count=1` + INSERT videos + 写 outbox；
-4. 几小时后用户 B 拿到同一份视频（可能是转发保存的）→ 客户端算出**同一个 SHA256** → `/upload/init` → 服务端 Redis 命中 → 直接返回 A 之前的 `canonical_url`，**B 一个字节文件都没传**；
+4. 几小时后用户 B 拿到同一份视频（可能是转发保存的）→ 客户端算出**同一个 SHA256** → `/upload/init` → 服务端 `lookupInstantUploadedFile` 查 MySQL 命中 A 之前的 `file_assets` 行、`os.Stat` 确认磁盘文件仍在 → 直接返回 A 之前的 `canonical_url`，**B 一个字节文件都没传**；
 5. B 再 `/video/publish` → video-rpc 事务内对同一 `file_assets` 行 `ref_count=2` + INSERT B 自己的 `videos` 行。
 
 此时磁盘上只有**一份物理文件**，`file_assets` 只有**一行 `Active, ref_count=2`**，两条 `videos`（A 和 B）通过 `play_url` 共同引用它——这就是"秒传 + 引用计数"体系的最终形态。
+
+**分片路径细节：分片是怎么切的、怎么传的、怎么合并的**
+
+分片上传（路径 ③）不是一次请求就完成的动作，而是**三段式协议**：`/upload/init`（协商会话）→ `/upload/chunk`×N（逐片投递）→ `/upload/complete`（合并成品）。下面把每一步用到的元数据、判定逻辑、以及"分片到底怎么切"讲清楚。
+
+**Step 1：`/upload/init` 协商——决定要不要分片、怎么分片**
+
+客户端读文件、算完 SHA256 之后，先发一个**只包含元信息**的 init 请求：
+
+```
+POST /upload/init
+{
+  "filename":     "vacation.mp4",   // 用于提取扩展名 final_ext，白名单校验
+  "file_hash":    "<SHA256 64 hex>", // 完整文件的哈希，秒传/续传/合并校验的锚点
+  "file_size":    524288000,        // 500MB，字节数
+  "chunk_size":   0,                // 可选，客户端不指定则由服务端给默认值
+  "total_chunks": 0                 // 可选，仅用于交叉校验，不指定也行
+}
+```
+
+服务端在 [`InitVideoUploadLogic`](d:\feedsystem-zero-main-git\apps\gateway\internal\logic\initvideouploadlogic.go) 里按以下顺序做**六层判定**：
+
+| 顺序 | 判定项 | 依据的配置 / 常量 | 不满足时的动作 |
+|---|---|---|---|
+| 1 | JWT 是否合法、能拿到 `user_id` | JWT 中间件 | 401 |
+| 2 | 文件名合法（非空 + 扩展名在视频白名单） | `validateVideoFilename` | 400 |
+| 3 | `file_hash` 是 64 位小写 hex | `normalizeUploadHash` | 400 |
+| 4 | `file_size` 未超上限 | `MaxVideoBytes` = 100MB | 400 |
+| 5 | `chunk_size` 合法：>0 且 ≤ `MaxChunkBytes`；客户端不填则用 `DefaultChunkBytes` | `DefaultChunkBytes` = 8MB，`MaxChunkBytes` = 10MB | 400 |
+| 6 | `total_chunks = ceil(file_size / chunk_size)`；若客户端也传了则必须一致 | `math.Ceil(float64(fileSize) / float64(chunkSize))` | 400 |
+
+**判定通过后才进入"三条路径分流"**：
+
+```
+if EnableInstantUpload && lookupInstantUploadedFile 命中:
+    → 路径 ①（真·秒传）：直接返回 canonical play_url
+elif !shouldUseChunkUpload(upload, fileSize):   // fileSize ≤ ChunkThresholdBytes(20MB)
+    → 路径 ②（小文件直传）：返回 { Needchunk:false }，前端换用 /upload/video 一次性传
+else:                                            // fileSize > 20MB
+    → 路径 ③（分片上传）：
+        reuseUploadSession(userID, fileHash, fileSize, finalExt)
+        ├─ 命中且强一致 → 复用旧 uploadID、返回已传编号
+        └─ 未命中     → randomUploadID() 生成新 uploadID、HSET meta、SET session
+        统一 mkdir chunkTempDir(uploadID)
+        返回 { Uploadid, Needchunk:true, Uploadedchunks[], Chunksize }
+```
+
+`shouldUseChunkUpload` 的判定只有一行：
+
+```go
+return fileSize > chunkThresholdBytes(upload)   // ChunkThresholdBytes 默认 20MB
+```
+
+**恰好等于阈值走直传**（`>` 不是 `>=`），边界包含在"小文件"这侧。
+
+**分片如何切分**：客户端拿到 init 响应里的 `Chunksize` 后，按下述规则切文件：
+
+| 分片编号 | 起始偏移 | 大小 |
+|---|---|---|
+| 1 | `0` | `chunkSize` |
+| 2 | `chunkSize` | `chunkSize` |
+| ... | ... | `chunkSize` |
+| `totalChunks - 1` | `(totalChunks-2) * chunkSize` | `chunkSize` |
+| `totalChunks`（末片） | `(totalChunks-1) * chunkSize` | `fileSize - chunkSize*(totalChunks-1)` |
+
+**只有末片可能小于 `chunkSize`**，其他片必须精确等于 `chunkSize`。编号从 **1** 开始（不是 0），且末片编号等于 `totalChunks`。举例：`fileSize=500MB, chunkSize=8MB` → `totalChunks = ceil(500/8) = 63`，前 62 片各 8MB，第 63 片 = `500*1024*1024 - 8*1024*1024*62 = 4MB`。
+
+**Step 1 结束时的元数据落地**（新会话才写，续传只刷 TTL）：
+
+```
+Redis:
+  fsz:chunkupload:meta:{uploadID}          Hash    { user_id, file_name, file_hash,
+                                                     file_size, chunk_size, total_chunks,
+                                                     final_ext, created_at, updated_at }
+  fsz:chunkupload:session:{userID}:{fileHash}  String  uploadID    (反向索引)
+  fsz:chunkupload:set:{uploadID}           Set     (空集合，等分片进来 SADD)
+
+磁盘:
+  {uploadRoot}/chunks/{uploadID}/          目录    (mkdir 幂等，续传不重建)
+```
+
+**Step 2：`/upload/chunk` 逐片投递——分片编号由前端生成、后端严格校验**
+
+前端拿到 `uploadID` 和 `chunkSize` 后，对每一个待传的分片（跳过 `Uploadedchunks` 里已有的编号）发一个 `multipart/form-data` 请求：
+
+```
+POST /upload/chunk
+Content-Type: multipart/form-data
+
+form fields:
+  upload_id     = "xxx"          // 定位会话
+  chunk_index   = 1..totalChunks // 前端自己算的编号（1 起）
+  chunk_hash    = "<SHA256>"     // 可选，仅 EnableChunkHashValidate=true 时必填
+  file / chunk  = <binary>       // 分片二进制
+```
+
+服务端 [`UploadVideoChunkLogic`](d:\feedsystem-zero-main-git\apps\gateway\internal\logic\uploadvideochunklogic.go) 对前端传来的 `chunk_index` **不信任**，用 Redis 里的 `meta` 做三重校验：
+
+| 校验项 | 具体判断 | 失败时 |
+|---|---|---|
+| **归属** | `meta.user_id == JWT.userID` | 403 |
+| **会话有效** | `meta` 存在（未过期） | 404 |
+| **编号范围** | `1 ≤ chunk_index ≤ meta.total_chunks` | 400 |
+| **期望大小** | 非末片：`written == meta.chunk_size`；末片：`written == fileSize - chunk_size*(total_chunks-1)` | 400，删掉临时文件 |
+| **单片上限** | `written ≤ meta.chunk_size` 且 `≤ MaxChunkBytes`（10MB） | 400 |
+| **分片 hash**（可选） | `EnableChunkHashValidate=true` 时 `sha256(chunk) == chunk_hash` | 400，删掉临时文件 |
+
+**这里最巧妙的一点是"期望大小"**——服务端**根据前端报的 `chunk_index` 反推这片应该有多大**，前端就算敢瞎报编号也没用，因为字节数对不上就会被拒。想欺骗后端就必须把"编号 + 分片大小"两个变量同时构造正确，成本极高。
+
+**分片落盘用"tmp 文件 + 原子 rename"保证不留半吊子**：
+
+```
+1. 写到 {tempDir}/chunk_{index}.{randomToken}.tmp   // 边写边算 SHA256
+2. 校验大小、校验 hash（如启用）
+3. 全部通过 → os.Rename → chunk_{index}             // 原子替换
+4. 任一步失败 → os.Remove(tmp) → 400
+```
+
+**幂等语义**：同一个 `chunk_index` 重复上传（比如客户端网络抖动导致的重试）会**覆盖**上一次的正式文件，Redis `SADD` 天然去重也不会因为重复而报错——所以客户端可以放心重试。
+
+**响应体**：
+
+```json
+{
+  "msg": "上传分片成功",
+  "upload_id": "xxx",
+  "chunk_index": 5,
+  "uploaded_chunks": [1, 2, 3, 4, 5]    // 截至此刻服务端已确认收到的所有编号
+}
+```
+
+每次响应都会带上最新的 `uploaded_chunks`，客户端据此维护本地进度条、判断是否所有分片都传完了。
+
+**Step 3：`/upload/complete` 合并——分布式锁 + 全量二次校验**
+
+当前端确认 `uploaded_chunks.length == total_chunks` 后，发起合并请求：
+
+```
+POST /upload/complete
+{
+  "upload_id": "xxx"
+}
+```
+
+服务端 [`CompleteVideoUploadLogic`](d:\feedsystem-zero-main-git\apps\gateway\internal\logic\completevideouploadlogic.go) 在这一步做的事情比前两步加起来还多，因为它是**上传流程的"最后一公里"**，一旦落地就是不可逆的资产登记：
+
+1. **归属 + 会话校验**：`meta.user_id == JWT.userID`，防止越权触发合并；
+2. **分布式合并锁**：`SETNX fsz:chunkupload:lock:{uploadID} = randomToken, EX 5min`——防止两个 tab 同时点"完成上传"或客户端超时重试导致并发合并同一文件；释放锁用 Lua `if get==token then del` 保证不会误删别人的锁；
+3. **完整性校验**：`len(uploadedChunks) != totalChunks` 或缺任一 1..N 编号 → `FailedPrecondition`；
+4. **秒传兜底（幂等）**：如果发现 `finalVideoFilePath(fileHash)` 已经存在（比如上次合并成功但响应丢了、客户端重试），直接校验它的 hash 是不是等于本次 `meta.file_hash`，一致就跳过合并、直接进入 `finishCompletedUpload`；
+5. **按编号顺序合并 + 全量 hash 校验**：`for i := 1; i <= totalChunks; i++` 读 `chunk_{i}` 一边写入 `finalPath.tmp` 一边算 SHA256，最终 `written != fileSize` 或 `actualHash != meta.file_hash` **立刻失败**并删除 tmp 文件——**决不让一份哪怕字节数对但内容错的文件进入 `file_assets`**；
+6. **原子 rename 到正式路径**：`finalPath.tmp → finalPath`（`uploads/yyyy/mm/dd/{fileHash}.{ext}`）；
+7. **`upsertFileAsset` 去重登记**：查 MySQL `file_assets`——若同 hash 已存在则删掉本次刚落盘的重复文件、返回 canonical URL；若不存在则 INSERT `Active, ref_count=0`；
+8. **一次性收尾**：`TxPipeline` 里 `SET fsz:chunkupload:hash:global:{fileHash} = canonical_url, EX 7d`（为未来秒传埋种子）+ `DEL meta / set / session`（清理会话数据）；
+9. **物理清理**：`os.RemoveAll(chunkTempDir(uploadID))`——临时分片目录整体删掉；
+10. **返回 canonical `play_url`** 给前端 → 前端调 `/video/publish` 完成整个"发视频"流程。
+
+**上传三步涉及的所有元数据（一图看全）**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Redis                                                                    │
+├──────────────────────────────────────────────┬──────────┬────────────────┤
+│ Key                                          │ 类型     │ TTL / 生存期   │
+├──────────────────────────────────────────────┼──────────┼────────────────┤
+│ fsz:chunkupload:session:{userID}:{fileHash}  │ String   │ 24h，滑动刷新  │
+│ fsz:chunkupload:meta:{uploadID}              │ Hash     │ 24h，滑动刷新  │
+│ fsz:chunkupload:set:{uploadID}               │ Set      │ 24h，滑动刷新  │
+│ fsz:chunkupload:lock:{uploadID}              │ String   │ 5min（合并锁）│
+│ fsz:chunkupload:hash:global:{fileHash}       │ String   │ 7d（秒传缓存）│
+│ fsz:chunkupload:hash:{userID}:{fileHash}     │ String   │ 7d（用户级）  │
+├──────────────────────────────────────────────┴──────────┴────────────────┤
+│  meta Hash 字段清单                                                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│  user_id       归属校验                                                   │
+│  file_name     原文件名（提取 final_ext 用）                              │
+│  file_hash     完整文件 SHA256 —— 续传强一致校验、合并二次校验的锚点      │
+│  file_size     文件字节数 —— 分片数换算、末片大小推算、合并大小校验       │
+│  chunk_size    单片字节数 —— 分片切分、非末片大小校验                     │
+│  total_chunks  分片总数 —— 编号范围校验、完整性校验                       │
+│  final_ext     .mp4 / .mov 等，白名单校验后落库                           │
+│  created_at    会话创建时间                                               │
+│  updated_at    每次操作后刷新                                             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  磁盘                                                                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│  {uploadRoot}/chunks/{uploadID}/chunk_{i}          第 i 片的正式文件      │
+│  {uploadRoot}/chunks/{uploadID}/chunk_{i}.{r}.tmp  第 i 片的临时文件      │
+│  {uploadRoot}/yyyy/mm/dd/{fileHash}.{ext}          合并后的正式文件       │
+│  {uploadRoot}/yyyy/mm/dd/{fileHash}.{ext}.tmp      合并中的临时文件       │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  MySQL file_assets（合并完成后才登记，上传过程中完全不碰）                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│  id / type / file_hash / storage_path / url / size /                     │
+│  status (Active/PendingDelete/Cleaning/Deleted) / ref_count /             │
+│  created_at / updated_at / deleted_at                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**关键配置项一览**（[`gateway.yaml`](d:\feedsystem-zero-main-git\apps\gateway\etc\gateway.yaml)）：
+
+| 配置项 | 默认值 | 作用 |
+|---|---|---|
+| `MaxVideoBytes` | `104857600`（100MB） | 单个视频文件总大小上限 |
+| `ChunkThresholdBytes` | `20971520`（20MB） | ≤ 该值走小文件直传，> 该值走分片 |
+| `DefaultChunkBytes` | `8388608`（8MB） | 客户端不指定 chunk_size 时的默认单片大小 |
+| `MaxChunkBytes` | `10485760`（10MB） | 单片大小上限（防止客户端把 chunk_size 拉太大导致大内存 buffer） |
+| `ChunkSessionTTLSeconds` | `86400`（24 小时） | meta / session / set 三把 key 的存活时长（每次操作刷新） |
+| `EnableInstantUpload` | `true` | 是否启用秒传（关掉则每次都走真实上传） |
+| `EnableChunkHashValidate` | 由配置控制 | 是否强制前端为每片附带 `chunk_hash` 并做逐片校验 |
+
+**分片 hash 校验的两种模式**：
+
+| | `EnableChunkHashValidate = false` | `EnableChunkHashValidate = true` |
+|---|---|---|
+| **前端** | 只切片、传 `chunk_index` + 二进制，**不算 hash** | 每片切完先算 SHA256，随 `chunk_hash` 一起 POST |
+| **后端** | 边写边用 `sha256.New()` 算 hash，**但不比对**（只做大小校验） | 边写边算，落盘前用 `actualHash != chunk_hash` 严格比对，不一致就删掉临时文件返回 400 |
+| **失败发现时机** | 只能在 `/upload/complete` 合并时全量 hash 校验发现坏片 | 传坏的当片立即失败，客户端可立即重传该片 |
+| **性能代价** | 前端零开销 | 前端每片多一次 SHA256（几十 MB 分片 CPU 上几十毫秒） |
+
+**不管是否启用逐片校验，`/upload/complete` 都会对合并后的完整文件再算一次 SHA256 与 `meta.file_hash` 比对——这是强制兜底防线，保证最终落盘文件字节级正确。**
 
 **分片路径细节：断点续传是怎么实现的**
 
@@ -623,7 +849,7 @@ if len(meta) == 0 ||
 
 **服务端资产登记时序（三条路径未命中秒传后的公共合流点）**：
 
-以下时序图展开的是**路径 ②/③ 落盘后到 `file_assets` 登记完成**的服务端细节，以及后续 `PublishVideo` 事务如何 `ref_count+=1`、`asset_cleanup` Job 如何延迟物理清理——路径 ①（真秒传）直接从 Redis/MySQL 拿到 URL 后跳到最下方 `/video/publish` 环节，中间的落盘和 `upsertFileAsset` 都不经过。
+以下时序图展开的是**路径 ②/③ 落盘后到 `file_assets` 登记完成**的服务端细节，以及后续 `PublishVideo` 事务如何 `ref_count+=1`、`asset_cleanup` Job 如何延迟物理清理——路径 ①（真秒传）直接从 MySQL 拿到 URL 后跳到最下方 `/video/publish` 环节，中间的落盘和 `upsertFileAsset` 都不经过。
 
 ```mermaid
 sequenceDiagram
@@ -638,11 +864,13 @@ sequenceDiagram
 
     Note over U,G: 分片/整传统一走 Gateway
     U->>G: POST /file/upload/init { fileHash, fileType, size }
-    G->>R: HGET fsz:chunkupload:hash:global:{fileHash}
+    G->>DB: SELECT file_assets WHERE file_hash=? AND status=Active
 
-    alt Redis 命中且 DB 状态 = Active（秒传命中）
-        R-->>G: url
-        G-->>U: { instant:true, url }
+    alt DB 命中 且 os.Stat(storage_path) 通过（秒传命中）
+        DB-->>G: asset row
+        G->>Disk: os.Stat 校验磁盘文件存在且为普通文件
+        G->>R: SET fsz:chunkupload:hash:global / hash:{userID}<br/>= asset.url, EX 7d（刷新缓存）
+        G-->>U: { instant:true, url = asset.url }
     else 未命中 → 走真实上传
         U->>G: 分片上传 or 整传
         G->>Disk: 落盘临时文件
@@ -709,7 +937,49 @@ sequenceDiagram
 | `Active(1)` | 正常引用中（ref_count 可为 0 但仍在 grace 期） | ✅ | ref_count=0 且过了 GraceSeconds |
 | `PendingDelete(2)` | 最后一个引用删除后标记待删 | ❌ | ✅ |
 | `Cleaning(4)` | 已被 asset_cleanup 临时抢占，即将物理删除 | ❌（轮询等待） | 只能同一抢占者推进 |
-| `Deleted(3)` | 已物理删除 | ❌ | ❌ |
+| `Deleted(3)` | 已物理删除（**软删除标记，DB 行仍存在**） | ❌（但可被复活） | ❌ |
+
+**四状态在"上传路径 `upsertFileAsset`"视角下的判定与差异**：
+
+DB 中"记录存在与否"和"status 字段值"是**两件完全不同的事**——尤其是 `Deleted` 状态（DB 行还在、只是 status 字段值为 3）与"行被 asset_cleanup Job 从表里 `DELETE` 掉"（行彻底不存在）**必须严格区分**，这直接决定了 `upsertFileAsset` 的 SELECT 循环里走 `break` 还是 `return`：
+
+| 情况 | DB 行 | 磁盘文件 | SELECT 结果 | upsertFileAsset 行为 |
+|---|---|---|---|---|
+| **状态 = Active** | 存在（status=1） | 存在 | ✅ 拿到行 | `break` 出循环 → 走"路径调节"分支（同路径直接复用；不同路径删多余副本或修复丢失文件） |
+| **状态 = PendingDelete** | 存在（status=2） | 存在 | ✅ 拿到行 | `break` 出循环 → 走"复活"分支：`os.Stat` 校验磁盘文件 + CAS `WHERE id=? AND status=?` 改回 Active |
+| **状态 = Cleaning** | 存在（status=4） | 即将被 os.Remove | ✅ 拿到行 | **不 break**，进入 `select { ctx.Done, time.After(50ms) }` 轮询等待，直到状态变化或 5s 超时 |
+| **状态 = Deleted** | 存在（status=3） | 已被物理删除，但 DB 行仍作为"墓碑"保留 | ✅ 拿到行 | `break` 出循环 → 走"复活"分支：`os.Stat(storagePath)` 校验**本次刚落盘的新副本**在磁盘上，然后 CAS `Deleted → Active` |
+| **行被物理 DELETE** | ❌ 不存在（asset_cleanup 在极少数场景下会硬删行；或行还没被创建） | ❌ 不存在 | ❌ `record not found` | `return err` **退出整个函数**——调用方拿到错误后重试整个 `upsertFileAsset`，重试时段落 2 的 `INSERT ... ON CONFLICT DO NOTHING` 会成功走"全新插入"分支 |
+
+**关键区别（回答"为什么 Deleted 是 break、record not found 是 return"）**：
+
+- **`Deleted` 状态是"软删除标记"**：DB 行还在表里，只是 `status` 字段值改成了 3、`deleted_at` 打了时间戳。此时 `existing` 有完整数据（`id/file_hash/file_type` 全都能读到），完全可以通过 CAS `UPDATE WHERE id=? AND status=Deleted` **原子复活**——`break` 出循环让复活路径继续处理。
+- **"行被物理 DELETE"是"硬删除"**：整行从表里消失，SELECT 返回 `gorm.ErrRecordNotFound`，`existing` 是零值结构体、没有任何有效字段可用来做后续决策——**必须 return** 让调用方从头重试。重试时 `file_hash` 唯一键约束已消失，段落 2 的幂等 INSERT 会插入全新行，走情况 A 完成登记。
+- **`Cleaning` 之所以既不 break 也不 return，而是"等"**：Job 的 `os.Remove` 已在飞行途中且不可撤销，上传路径贸然把 status 改回 Active 会导致"DB 说资产活着但磁盘文件被 Job 顺手删了"的错乱——唯一安全的选择是让 Job 先干完，等 status 稳定到 `Deleted`（或整行被 DELETE）后再决策。
+
+**上传路径决策一览（配合 `upsertFileAsset` for 循环阅读）**：
+
+```
+                          段落 2: INSERT ... ON CONFLICT DO NOTHING
+                                     │
+                    ┌────────────────┴────────────────┐
+             RowsAffected==1                    RowsAffected==0
+             （全新插入成功）                    （hash 已存在）
+                    │                                 │
+                 return                       段落 3: for { SELECT }
+                                                      │
+                    ┌─────────┬──────────┬────────────┼────────────┐
+                    ▼         ▼          ▼            ▼            ▼
+              record       类型冲突   Cleaning     Active       Deleted /
+              not found                                        PendingDelete
+                    │         │          │            │            │
+                 return    return   等 50ms         break         break
+                                    继续循环          │            │
+                                                     ▼            ▼
+                                              段落 5:         段落 4:
+                                              路径调节         复活 (CAS)
+                                              return          return
+```
 
 ```mermaid
 stateDiagram-v2
