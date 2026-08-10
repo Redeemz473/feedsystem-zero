@@ -122,23 +122,19 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 	//      同一个本地事务里，任一步失败都会自动回滚，从根本上杜绝
 	//      "视频存在但 ref_count 被回滚" / "ref_count 已加但视频未创建" / "视频已发布但下游无感知"
 	//      三类一致性漂移。
-	// 幂等：事务外预检负责普通重试；并发写入撞唯一键 uk_video_request 时，
-	//      当前事务整体回滚，再通过独立连接回读胜出请求。
+	// 幂等：事务外预检负责普通重试；并发写入撞唯一键 uk_video_request 时，当前事务整体回滚，再通过独立连接回读胜出请求。
 	err = l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
-		// 1. 按 URL 固定顺序执行条件原子 UPDATE。UPDATE 自身获取行锁，
-		//    同 URL 的视频/封面引用已聚合到 RefDelta，无需重复查询或重复校验文件。
+		// 按 URL 固定顺序执行条件原子 UPDATE。UPDATE 自身获取行锁，同 URL 的视频/封面引用已聚合到 RefDelta，无需重复查询或重复校验文件。
 		for _, asset := range preparedAssets {
 			if rerr := reservePreparedPublishFileAsset(l.ctx, tx, asset); rerr != nil {
 				return rerr
 			}
 		}
 
-		// 2. video写入mysql
+		// video写入mysql
 		createdVideo := publishedVideo
 		if err := tx.Create(&createdVideo).Error; err != nil {
-			// 并发场景：另一个协程/请求已经用相同 (author_id, request_id) 抢先入库，
-			//           这里会撞唯一键 uk_video_request。当前事务需要整体回滚（reserve 也一并撤销），
-			//           外层捕获后再用独立连接回读原视频返回。
+			// 并发场景：另一个协程/请求已经用相同 (author_id, request_id) 抢先入库， 这里会撞唯一键 uk_video_request。当前事务需要整体回滚（reserve 也一并撤销），外层捕获后再用独立连接回读原视频返回。
 			if isDuplicateKeyError(err) {
 				return errDuplicateVideoRequest
 			}
@@ -196,8 +192,8 @@ func (l *PublishVideoLogic) PublishVideo(in *videopb.PublishVideoReq) (*videopb.
 			}
 		}
 
-		// 3. 事务内写 outbox（video.published 事件，投递到 feed.video.events topic）
-		//    与删除路径对称：下游 feed/推荐/通知等异步消费者只需订阅一个 topic 即可感知两类事件。
+		// 事务内写 outbox（video.published 事件，投递到 feed.video.events topic）
+		// 与删除路径对称：下游 feed/推荐/通知等异步消费者只需订阅一个 topic 即可感知两类事件。
 		now := time.Now()
 		occurredAt := now.UnixMilli()
 		payloadBytes, err := json.Marshal(eventx.FeedVideoEvent{

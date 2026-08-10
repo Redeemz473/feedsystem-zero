@@ -90,6 +90,7 @@ func preparePublishFileAssets(ctx context.Context, db *gorm.DB, urls ...string) 
 	return buildPreparedPublishFileAssets(refs, assets)
 }
 
+// 查磁盘IO，验证视频文件和封面文件都存在
 func buildPreparedPublishFileAssets(
 	refs []fileAssetRef,
 	assets []model.FileAsset,

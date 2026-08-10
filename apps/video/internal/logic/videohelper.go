@@ -58,8 +58,7 @@ func loadVideoByAuthorRequestID(ctx context.Context, db *gorm.DB, authorID uint6
 		return nil, result.Error
 	}
 	if result.RowsAffected == 0 {
-		// 幂等预检未命中是首次发布的正常分支。使用 Find + RowsAffected，
-		// 避免 GORM 把每次正常 miss 记录为 record not found 错误日志。
+		// 幂等预检未命中是首次发布的正常分支。使用 Find + RowsAffected，避免 GORM 把每次正常 miss 记录为 record not found 错误日志。
 		return nil, gorm.ErrRecordNotFound
 	}
 	return &v, nil

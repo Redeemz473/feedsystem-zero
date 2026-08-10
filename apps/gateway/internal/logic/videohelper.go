@@ -303,7 +303,7 @@ func normalizeFormHash(r *http.Request, field string) (string, error) {
 	return normalizeUploadHash(rawHash)
 }
 
-// 整文件直传
+// 完整文件直传，落盘
 func saveMultipartUpload(
 	r *http.Request,
 	upload config.UploadConf,
@@ -551,10 +551,12 @@ func chunkFilePath(upload config.UploadConf, uploadID string, chunkIndex int64) 
 	return filepath.Join(chunkTempDir(upload, uploadID), fmt.Sprintf("%06d.part", chunkIndex))
 }
 
+// 生成服务器磁盘上视频的最终存储路径
 func finalVideoFilePath(upload config.UploadConf, fileHash string, ext string) string {
 	return filepath.Join(uploadBaseDir(upload), "videos", strings.ToLower(fileHash)+ext)
 }
 
+// 生成同一个视频对外可访问的 HTTP URL
 func finalVideoPublicURL(upload config.UploadConf, fileHash string, ext string) string {
 	return publicURL(upload, "videos", strings.ToLower(fileHash)+ext)
 }

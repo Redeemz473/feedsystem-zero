@@ -40,7 +40,7 @@ func NewCompleteVideoUploadLogic(ctx context.Context, svcCtx *svc.ServiceContext
 }
 
 func (l *CompleteVideoUploadLogic) CompleteVideoUpload(req *types.CompleteVideoUploadReq) (resp *types.CompleteVideoUploadResp, err error) {
-	// 1. 从 JWT 获取 user_id，并校验 upload_id 元数据归属。
+	// 从 JWT 获取 user_id，并校验 upload_id 元数据归属。
 	userID, err := userIDFromCtx(l.ctx)
 	if err != nil {
 		return nil, err
@@ -92,7 +92,7 @@ func (l *CompleteVideoUploadLogic) CompleteVideoUpload(req *types.CompleteVideoU
 		return nil, status.Error(codes.InvalidArgument, "上传参数与初始化会话不一致")
 	}
 
-	// 2. 用 ChunkUploadLockKey(upload_id) 加短 TTL 分布式锁，避免重复合并。
+	// 用 ChunkUploadLockKey(upload_id) 加短 TTL 分布式锁，避免重复合并。
 	lockKey := rediskey.ChunkUploadLockKey(uploadID)
 	lockToken, err := randomHex(16)
 	if err != nil {
@@ -107,7 +107,7 @@ func (l *CompleteVideoUploadLogic) CompleteVideoUpload(req *types.CompleteVideoU
 	}
 	defer l.releaseUploadLock(lockKey, lockToken)
 
-	// 3. 校验 uploaded_chunks 数量等于 total_chunks，缺失则返回明确错误。
+	// 校验 uploaded_chunks 数量等于 total_chunks，缺失则返回明确错误。
 	uploadedChunks, err := loadUploadedChunks(l.ctx, l.svcCtx.RedisCli, uploadID)
 	if err != nil {
 		return nil, err
@@ -125,9 +125,10 @@ func (l *CompleteVideoUploadLogic) CompleteVideoUpload(req *types.CompleteVideoU
 		}
 	}
 
-	// 4. 按 chunk_index 顺序读取 chunkFilePath 并合并到 finalVideoFilePath。
+	// 按 chunk_index 顺序读取 chunkFilePath 并合并到 finalVideoFilePath。
 	finalPath := finalVideoFilePath(l.svcCtx.Config.Upload, fileHash, finalExt)
 	playURL := finalVideoPublicURL(l.svcCtx.Config.Upload, fileHash, finalExt)
+	// 先判断磁盘上是否已经真的存在目标文件，有可能用户重复点完成上传
 	if existingHash, err := hashFileSHA256(finalPath); err == nil {
 		if existingHash != fileHash {
 			return nil, status.Error(codes.Internal, "目标文件 hash 异常")
@@ -198,7 +199,7 @@ func (l *CompleteVideoUploadLogic) CompleteVideoUpload(req *types.CompleteVideoU
 		return nil, status.Error(codes.Internal, "保存合并文件失败")
 	}
 
-	// 5. 计算最终文件 SHA256，与 file_hash 对比，失败则删除合并文件。
+	// 计算最终文件 SHA256，与 file_hash 对比，失败则删除合并文件。
 	if written != req.Filesize {
 		return nil, status.Error(codes.InvalidArgument, "合并文件大小与初始化不一致")
 	}
@@ -215,8 +216,8 @@ func (l *CompleteVideoUploadLogic) CompleteVideoUpload(req *types.CompleteVideoU
 	}
 	needRemoveTmp = false
 
-	// 6. 写入 ChunkUploadHashKey/ChunkUploadGlobalHashKey 做秒传。
-	// 7. 删除临时 chunk 目录和 upload 会话 key，返回 play_url。
+	// 写入 ChunkUploadHashKey/ChunkUploadGlobalHashKey 做秒传。
+	// 删除临时 chunk 目录和 upload 会话 key，返回 play_url。
 	canonicalURL, err := l.finishCompletedUpload(userID, uploadID, fileHash, playURL, absolutePath(finalPath), req.Filesize)
 	if err != nil {
 		return nil, err
@@ -253,6 +254,7 @@ func (l *CompleteVideoUploadLogic) finishCompletedUpload(userID uint64, uploadID
 	return canonicalAsset.URL, nil
 }
 
+// 用Lua脚本，只有是自己的locktoken才释放锁
 func (l *CompleteVideoUploadLogic) releaseUploadLock(lockKey string, lockToken string) {
 	const unlockScript = `
 if redis.call("get", KEYS[1]) == ARGV[1] then

@@ -34,7 +34,7 @@ func upsertFileAsset(ctx context.Context, db *gorm.DB, fileType string, fileHash
 		Status:      model.FileAssetStatusActive,
 	}
 
-	// 幂等INSERT
+	// 幂等INSERT，如果DB里有这行，则先什么都不做
 	result := db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "file_hash"}},
 		DoNothing: true,
@@ -78,13 +78,14 @@ func upsertFileAsset(ctx context.Context, db *gorm.DB, fileType string, fileHash
 		}
 	}
 
+	//如果是pending或者deleted状态
 	if existing.Status != model.FileAssetStatusActive {
 		if _, err := os.Stat(storagePath); err != nil {
 			return model.FileAsset{}, fmt.Errorf("待登记文件不可用: %w", err)
 		}
 		update := db.WithContext(ctx).
 			Model(&model.FileAsset{}).
-			Where("id = ? AND status = ?", existing.ID, existing.Status).
+			Where("id = ? AND status = ?", existing.ID, existing.Status). //乐观锁的使用，看看更新写入前校验状态有没有发生改变
 			Updates(map[string]any{
 				"url":          url,
 				"storage_path": storagePath,

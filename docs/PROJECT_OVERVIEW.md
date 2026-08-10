@@ -675,6 +675,18 @@ form fields:
 
 **幂等语义**：同一个 `chunk_index` 重复上传（比如客户端网络抖动导致的重试）会**覆盖**上一次的正式文件，Redis `SADD` 天然去重也不会因为重复而报错——所以客户端可以放心重试。
 
+**并发上传能力**：分片上传**支持前端多 goroutine / 多 XHR 并发投递不同分片**，这是分片上传相对小文件直传"提速"的核心场景。并发安全性从三个粒度分别得到保障：
+
+| 并发粒度 | 场景 | 保护机制 | 结果 |
+|---|---|---|---|
+| **① 同 `upload_id` + 不同 `chunk_index`** | 前端并行发 6 个 goroutine 同时传分片 1~6 | **每片写到 `chunk_index` 唯一决定的独立文件路径**（`chunk_1` / `chunk_2` / ...），文件系统层面天然不相交 + **Redis `SADD` 原子命令**（单线程执行、集合天然去重） | ✅ 完全并发，零冲突 |
+| **② 同 `upload_id` + 同 `chunk_index`** | 网络抖动导致同一片被重复投递 | `randomHex(8)` 生成随机 `tmpToken` 写入 `chunk_{i}.{token}.tmp`，多 goroutine 各写各的 tmp 互不干扰，最终 `os.Rename` **原子提交**；分片 hash 校验保证两个成功写入的内容完全一致，谁覆盖谁都幂等 | ✅ 最终一致，不产生"半 A 半 B"损坏文件 |
+| **③ 不同 `upload_id` + 同 `file_hash`** | 多用户并发上传同一份视频 | 每个 `upload_id` 拥有独立的 `chunkTempDir(uploadID)` 目录，物理隔离；最终 `CompleteVideoUpload` 阶段按 `file_hash` 命名的产物走**内容寻址存储**（`{uploadRoot}/yyyy/mm/dd/{fileHash}.{ext}`）+ `upsertFileAsset` 秒传去重，天然收敛到同一个物理文件 | ✅ 各自独立，最终去重 |
+
+**complete 阶段的并发保护**：`CompleteVideoUploadLogic` 通过 `SetNX fsz:chunkupload:lock:{uploadID} = randomToken, EX 5min` 加**分布式合并锁**——防止前端超时重试或用户重复点击"完成"按钮同时触发两个合并流程；释放锁用 Lua `if get==token then del` 保证不会误删别人的锁。
+
+**部署侧约束（多副本 gateway 场景）**：**如果 gateway 是多副本部署，且分片存储用的是节点本地磁盘（非 NFS / CephFS / 共享卷）**，前端必须保证**同一个 `upload_id` 的所有分片请求打到同一个 gateway 节点**——推荐在负载均衡层（Nginx / K8s Ingress / 网关）按 `upload_id` 做**一致性哈希路由**。否则不同节点会各自持有部分 `chunk_{i}` 文件、`CompleteVideoUpload` 合并阶段会读不到全部分片而报错。**如果分片目录挂在共享存储上**（NFS / CephFS / 对象存储挂载），分片请求可以任意打到任何节点，并发能力最大化。
+
 **响应体**：
 
 ```json
@@ -930,6 +942,108 @@ sequenceDiagram
 - 单元测试：`fileassethelper_test.go` 覆盖 URL 聚合保序、重复 URL 的 `Delta=2`、缺失文件以及条件原子 UPDATE 的 SQL 约束。
 - 显式 `SELECT FOR UPDATE` 已被移除，但条件 `UPDATE` 自身仍会持有行锁，并通过 `status=Active` 阻止 `Cleaning/PendingDelete` 资产被重新引用。
 
+#### 8.2.2 `preparePublishFileAssets` / `buildPreparedPublishFileAssets` 双函数拆解
+
+发布视频的"资产预检两步曲"位于 [`apps/video/internal/logic/fileassethelper.go`](../apps/video/internal/logic/fileassethelper.go)，在真正进入事务、抢行锁之前一次性完成"批量拉取 + 磁盘校验 + 打包 CAS 素材"。
+
+**核心设计理念**：**磁盘 `os.Stat` 是慢 I/O、事务持有行锁是稀缺资源**——两者绝不能捆绑。所以把批量 SELECT 和 `os.Stat` 全部**前置到事务外**做（失败尽早、行锁持有时间毫秒级），事务里只留一件事——按字典序、按 asset 逐个跑条件 UPDATE `ref_count += Delta`。
+
+##### 数据流全景
+
+```
+输入：urls = ["videoURL", "coverURL"]
+   │
+   ▼
+【preparePublishFileAssets】负责 I/O
+   ├─ ① aggregateFileAssetRefs：去空 + 计数聚合 + 字典序排序
+   │    ├─ 常规：{"videoURL":1, "coverURL":1}
+   │    └─ 特殊：playURL == coverURL → {"sameURL":2}   ← Delta=2
+   │    输出：[]fileAssetRef（按 URL 字典序）
+   ├─ ② orderedURLs = ["coverURL","videoURL"]
+   └─ ③ 一条 SQL 批量查：
+        SELECT id, url, storage_path
+        FROM file_assets
+        WHERE url IN (?) AND status = ACTIVE
+        ↑ 非 ACTIVE 直接在 SQL 层被过滤掉、不会带回 Go 侧
+   │
+   ▼
+【buildPreparedPublishFileAssets】纯内存配对与校验（无 I/O、无 ctx / db，天然可单测）
+   ├─ ① 建 assetsByURL map（slice → map，O(1) 查找）
+   └─ ② 按 refs 字典序遍历：
+        ├─ map 里没有该 URL → 报 publishFileAssetError 包 ErrRecordNotFound
+        │  （URL 伪造 / 资产被 clean job 降级为 PendingDelete）
+        ├─ validatePublishAssetFile(storagePath) 磁盘三重校验：
+        │    ├─ path 非空
+        │    ├─ os.Stat 成功、且不是 os.ErrNotExist
+        │    └─ info.Mode().IsRegular()（拒绝目录/软链/设备文件）
+        │  失败 → 报 publishFileAssetError 包 errFileAssetStorageUnavailable
+        └─ 通过 → 拼装 preparedPublishFileAsset{ ID, URL, StoragePath, RefDelta }
+   │
+   ▼
+输出：[]preparedPublishFileAsset（按字典序、CAS 素材包）
+```
+
+##### `preparePublishFileAssets`——负责 I/O
+
+1. **`aggregateFileAssetRefs(urls...)` 去空 + 计数聚合 + 字典序排序**：
+   - `strings.TrimSpace` 过滤空 URL；`counts[url]++` 计数——**同 URL 的引用被合并成一个 Delta**。
+   - `play_url == cover_url` 时 `Delta = 2`——**必须 +2 而不是 +1**，因为软删时 `videos` 记录会同时释放 playURL 和 coverURL 两次（`-2`），若 reserve 只 +1，release -2 会把 `ref_count` 打到 -1 造成漂移。
+   - `sort.Strings(orderedURLs)` 按字典序排序——**这是消灭死锁的关键**（详见 8.2.1）。
+2. **`len(refs) == 0` 短路**：所有 URL 都是空字符串（被 `TrimSpace` 洗掉）时直接返回 `nil, nil`，不报错。
+3. **一条 SQL 批量查**：
+   - `Select("id","url","storage_path")` 显式列裁剪——只取事务内 CAS 所需的三个字段，减少 MySQL→Go 传输和 gorm 反射赋值开销。
+   - `WHERE url IN (?) AND status = ACTIVE`——**在 SQL 层就过滤掉非 ACTIVE 状态**（`PendingDelete/Cleaning/Deleted` 都不会带回 Go 侧）。
+   - `Find(&assets)` 而不是 `First`——`Find` 不把"找不到全部"当错误、把"哪些 URL 缺失"的判定下沉给 `buildPreparedPublishFileAssets`。
+4. **把 refs（期望）和 assets（实际）交给下游做配对**——**职责分离**：本函数只管 I/O、下游是纯函数便于单测。
+
+##### `buildPreparedPublishFileAssets`——纯内存配对与校验
+
+1. **`assetsByURL` map 索引**：把 `[]FileAsset` slice 索引成 `map[url]FileAsset`，让后续按 URL 查找从 O(N×M) 降到 O(N+M)。
+2. **按 refs 的字典序遍历**（不是遍历 assets）——保证返回的 `prepared` slice 也是字典序，供下游事务按序抢行锁。
+3. **两重校验**：
+   - **map 里没有该 URL** → 返回 `&publishFileAssetError{URL, Err: gorm.ErrRecordNotFound}`；触发场景：URL 伪造、上传后没在有效期内发布被 clean job 扫成 `PendingDelete`、上传流程异常导致 `file_assets` 没落成 ACTIVE。
+   - **`validatePublishAssetFile(storagePath)` 磁盘三重校验**：
+     - `strings.TrimSpace(path) == ""` → 拒绝（DB 脏数据）；
+     - `os.Stat` + `errors.Is(err, os.ErrNotExist)` → 拒绝（**防止"DB 记录还在但磁盘文件被误删"的数据漂移，让用户不会发布出永远播放失败的视频**）；
+     - `info.Mode().IsRegular()` → 拒绝目录/软链接/设备文件（防御性检查、防止路径被换成攻击路径）。
+     - 失败 → 返回 `&publishFileAssetError{URL, Err: fmt.Errorf("validate asset_id:%d: %w", asset.ID, errFileAssetStorageUnavailable)}`——`%w` 保留 sentinel 供 `errors.Is` 判类型，同时追加 `asset_id` 便于日志排查。
+4. **拼装 CAS 素材包 `preparedPublishFileAsset{ID, URL, StoragePath, RefDelta}`**——四个字段在下游事务里各有精确用途：
+
+| 字段 | 事务内用途 |
+|------|-----------|
+| `ID` | UPDATE WHERE 主键定位 |
+| `URL` | **CAS 条件字段**——预检快照 vs 事务时实际值 |
+| `StoragePath` | **CAS 条件字段**——防止 URL 被重命名或路径迁移 |
+| `RefDelta` | UPDATE SET `ref_count = ref_count + RefDelta` |
+
+##### 错误链设计（Go 1.13+ error wrapping）
+
+`publishFileAssetError` 实现了 `Unwrap()`，且携带 `URL` 字段——外层可以：
+
+- 用 `errors.Is(err, gorm.ErrRecordNotFound)` 或 `errors.Is(err, errFileAssetStorageUnavailable)` 判断**具体不可用原因**；
+- 用 `errors.As(err, &assetErr)` 提取 `URL` 定位到出问题的具体资产；
+- `unavailablePublishFileAssetURL` 就是这样把 URL 提取出来，让顶层 `PublishVideo` 里 `invalidPublishAssetError` 精确区分是 playURL 还是 coverURL 出问题，返回不同的中文错误给客户端。
+
+##### 与事务内 CAS 的联动（`reservePreparedPublishFileAsset`）
+
+下游事务里的 `updatePreparedPublishFileAssetRef` 用的 WHERE 条件：
+
+```go
+Where("id = ? AND url = ? AND storage_path = ? AND status = ?",
+      asset.ID, asset.URL, asset.StoragePath, model.FileAssetStatusActive)
+```
+
+**四个条件字段全都是预检时拍下来的快照**——如果事务开始后任何一个字段被并发改动（状态被降级为 `PendingDelete`、URL 被重命名、storage_path 被迁移），UPDATE 命中 0 行 → `RowsAffected == 0` → `reservePreparedPublishFileAsset` 返回 `publishFileAssetError{Err: ErrRecordNotFound}` → 整个发布事务回滚。**这就是"事务外乐观预检 + 事务内条件写"组合成的 CAS**，避免了"预检 OK 但入库时资产已被删"的漏洞。
+
+##### 精心设计的 4 个关键点总结
+
+| # | 设计 | 解决的问题 |
+|---|------|-----------|
+| ① | **聚合同 URL 的 Delta** | `play_url == cover_url` 时 `ref_count += 2`、防止软删漂移 |
+| ② | **`sort.Strings` 字典序排序** | 所有并发事务按同一顺序抢行锁——从根本上消灭死锁 |
+| ③ | **批量 SELECT + 事务外 `os.Stat`** | 磁盘 I/O 不占用行锁、事务持锁时间毫秒级 |
+| ④ | **返回 `{id, url, storage_path, refDelta}`** | 供事务内 CAS UPDATE 使用、防止预检-写入之间的并发状态漂移 |
+
 **file_assets 四状态机（commit 687d0ab 完善）**：
 
 | 状态 | 含义 | 可秒传 | 可被 asset_cleanup 抢占 |
@@ -984,20 +1098,21 @@ DB 中"记录存在与否"和"status 字段值"是**两件完全不同的事**�
 ```mermaid
 stateDiagram-v2
     direction LR
-    [*] --> Active : upsertFileAsset<br/>首次登记 / 秒传登记
+    [*] --> Active : ① upsertFileAsset 段落 2<br/>INSERT DO NOTHING 成功<br/>（新 hash 首次登记）
 
-    Active --> Active : ref_count += 1<br/>（新视频引用）
-    Active --> PendingDelete : ref_count 减到 0<br/>deleted_at = now
+    Active --> Active : ref_count += 1<br/>（新视频引用同一资产）
+    Active --> PendingDelete : ② video-rpc SoftDeleteVideo<br/>ref_count 减到 0<br/>deleted_at = now
+    Active --> Deleted : ③ asset_cleanup 巡检异常<br/>reconcileActiveAsset：<br/>磁盘丢失 AND 真实引用=0<br/>（跳过 PendingDelete）
 
-    PendingDelete --> Active : 视频复活 / 新视频再次引用<br/>ref_count > 0（复活兜底）
-    PendingDelete --> Cleaning : asset_cleanup 抢占<br/>WHERE deleted_at ≤ now-Grace<br/>AND ref_count = 0
+    PendingDelete --> Active : ⑥ asset_cleanup claimAsset<br/>事务内二次校验真实引用>0<br/>（Grace 期被复用，自纠错）
+    PendingDelete --> Cleaning : ⑤ asset_cleanup 抢占<br/>过 GraceSeconds=300s + 二次校验 ref=0
 
-    Cleaning --> PendingDelete : os.Remove 失败<br/>（回退重试）
-    Cleaning --> Active : 事务内二次校验 videos 引用 > 0<br/>（Grace 期内被复用）
-    Cleaning --> Deleted : os.Remove 成功<br/>UPDATE + DEL Redis 全局缓存
-    Cleaning --> Cleaning : 抢占者崩溃 → ClaimTimeout<br/>被其他实例重抢
+    Cleaning --> PendingDelete : ⑧ removeAssetFile 失败<br/>（回退重试，下轮再抢）
+    Cleaning --> Deleted : ⑦ removeAssetFile 成功<br/>UPDATE + DEL Redis 全局缓存
+    Cleaning --> Cleaning : 抢占者崩溃 → 过 ClaimTimeout<br/>被其他实例重抢
 
-    Deleted --> [*]
+    Deleted --> Active : ④/⑨ upsertFileAsset 段落 4<br/>用户上传同 hash<br/>CAS 复活（os.Stat 校验通过后）
+    Deleted --> [*] : ⑩ 兜底 GC<br/>长时间无复活 → 硬 DELETE 整行
 
     note right of Cleaning
       Gateway upsertFileAsset 遇到 Cleaning
@@ -1013,7 +1128,39 @@ stateDiagram-v2
     end note
 ```
 
-**秒传正确性保护**：`upsertFileAsset` 发现已存在相同 hash 的记录时，如果处于 `Cleaning` 则必须轮询等待（默认 5s），**绝不能直接将 Cleaning 改回 Active**——否则 asset_cleanup 可能在激活后删除新上传文件。若已处于 `PendingDelete/Deleted`，则以本次上传文件为准将其 UPDATE 回到 `Active`。
+**完整状态转换表（每条边的触发者、前置条件、代码位置）**：
+
+| # | From → To | 触发者 | 前置条件 | 代码位置 |
+|---|---|---|---|---|
+| ① | ∅ → Active | Gateway 上传路径 | 该 hash 从未在 `file_assets` 存在 | `upsertFileAsset` 段落 2：`INSERT ... ON CONFLICT DO NOTHING`，`RowsAffected==1` |
+| ② | Active → PendingDelete | video-rpc 软删除 | 视频软删除后该资产 `ref_count` 减到 0 | `SoftDeleteVideo` 事务内 `UPDATE status=PendingDelete, deleted_at=NOW()` |
+| ③ | **Active → Deleted**（异常跳过） | asset_cleanup 巡检 | `reconcileActiveAsset` 发现磁盘文件已丢失 **且** 真实 `videos` 引用=0 | `cleaner.go` `reconcileActiveAsset`：`fileExists==false && actualRefs==0` |
+| ④ | Deleted → Active | Gateway 上传路径 | 用户上传同 hash，本次副本 `os.Stat` 通过 | `upsertFileAsset` 段落 4：CAS `UPDATE ... WHERE id=? AND status=Deleted SET status=Active` |
+| ⑤ | PendingDelete → Cleaning | asset_cleanup 抢占 | `deleted_at ≤ now - GraceSeconds(300s)` **且** 事务内 `SELECT FOR UPDATE` 二次校验 `ref_count=0` 且真实引用=0 | `cleaner.go` `claimAsset`：`UPDATE status=Cleaning` |
+| ⑥ | PendingDelete → Active（Job 自纠错） | asset_cleanup 抢占 | `claimAsset` 二次校验发现真实 `videos` 引用>0（Grace 期内被新视频复用） | `cleaner.go` `claimAsset`：`activeRefs>0` 分支 `UPDATE status=Active, ref_count=activeRefs, deleted_at=NULL` |
+| ⑦ | Cleaning → Deleted | asset_cleanup 清理 | `removeAssetFile` 成功 `os.Remove` | `cleaner.go` `cleanOne`：`UPDATE ... WHERE status=Cleaning AND ref_count=0 SET status=Deleted`，并 `DEL fsz:chunkupload:hash:global:{hash}` |
+| ⑧ | Cleaning → PendingDelete（回退） | asset_cleanup 清理失败 | `removeAssetFile` 报错（I/O、权限、context 超时） | `cleanOne` 失败分支：`UPDATE ... SET status=PendingDelete`，等下一轮重试 |
+| ⑨ | Deleted → Active | 同 ④ | 说明这条边可以被上传路径反复触发（每次同 hash 上传都能复活） | 同 ④ |
+| ⑩ | Deleted → ∅ | GC 兜底 | 长时间无复活的 Deleted 行被硬删除 | 兜底 GC（`DELETE FROM file_assets WHERE ...`） |
+
+**五类边分类速览**：
+
+| 类别 | 边 | 语义 |
+|---|---|---|
+| **主干路径** | ① → ② → ⑤ → ⑦ | 新登记 → 引用归零 → 抢占清理 → 物理删除完成，正常生命周期 |
+| **复活边** | ④/⑨ Deleted→Active、⑥ PendingDelete→Active | 上传复活 & Job 自纠错——**资产可反复复用**是软删除+内容寻址的核心 |
+| **回退边** | ⑧ Cleaning→PendingDelete | 清理失败不卡死在 Cleaning，回退等待下轮 |
+| **异常跳过** | ③ Active→Deleted | 磁盘已丢失+无引用，无需走 PendingDelete 宽限期，直接标 Deleted |
+| **终点边** | ⑩ Deleted→∅ | 兜底 GC，让墓碑最终消失，回到"下次新登记"的初始状态 |
+
+**关键洞察**：
+- **不是** `Active → PendingDelete → Cleaning → Deleted` 单线路径，而是**多入口、多出口、多回退、多复活**的有向图。
+- **Cleaning 是极短过渡态**（只有 `os.Remove` 一次系统调用的耗时），存在的意义是**告诉其他路径"我正在删物理文件，请等我"**。
+- **PendingDelete 是最长的"等待态"**（默认 300s Grace），故意留 5 分钟给"反悔"的机会（用户重传同 hash → 走边 ④；新视频引用 → 走边 ⑥）。
+- **Deleted 是可复活的"墓碑"，不是终点**——只要还没被 GC 硬删除，任何时候用户上传同 hash 都能通过边 ④ 复活。这就是为什么 `file_assets` 用**软删除 + 内容寻址**，而不是每次都物理 DELETE 再重新 INSERT。
+- **边 ③（Active→Deleted）是唯一跳过 PendingDelete 的边**：磁盘文件已经丢失、真实引用又是 0，说明这份资产已经彻底"不可用"，没必要再走 Grace 期宽限，直接进 Deleted 让下次上传走复活/新登记。
+
+**秒传正确性保护**：`upsertFileAsset` 发现已存在相同 hash 的记录时，如果处于 `Cleaning` 则必须轮询等待（默认 5s），**绝不能直接将 Cleaning 改回 Active**——否则 asset_cleanup 可能在激活后删除新上传文件。若已处于 `PendingDelete/Deleted`，则以本次上传文件为准将其 UPDATE 回到 `Active`（边 ④/⑨，含 `os.Stat` 兜底防止登记死链接）。
 
 **文件魔数二次校验**：`saveMultipartUpload` 和分片合并时都会调用 `validateUploadedFileSignature`，根据扩展名预期校验前 12 字节魔数（jpg/png/webp/mp4/webm），防止伪造后缀或传输损坏。
 
