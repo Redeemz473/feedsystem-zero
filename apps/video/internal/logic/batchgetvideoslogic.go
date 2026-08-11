@@ -76,7 +76,7 @@ func NewBatchGetVideosLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Ba
 
 // BatchGetVideos 批量返回正常视频实体，不存在、已删除或已下架的视频直接跳过。
 func (l *BatchGetVideosLogic) BatchGetVideos(in *videopb.BatchGetVideosReq) (*videopb.BatchGetVideosResp, error) {
-	// 1. 限制批次、过滤 0、去重并保留输入顺序。
+	// 限制批次、过滤 0、去重并保留输入顺序。
 	videoIDs, err := normalizeBatchVideoEntityIDs(in.GetVideoIds())
 	if err != nil {
 		return nil, err
@@ -85,11 +85,11 @@ func (l *BatchGetVideosLogic) BatchGetVideos(in *videopb.BatchGetVideosReq) (*vi
 		return &videopb.BatchGetVideosResp{Videos: []*videopb.VideoInfo{}}, nil
 	}
 
-	// 2. Redis pipeline 批量读取实体和版本；Redis 异常时降级为一次 MySQL 批量查询。
+	// Redis pipeline 批量读取实体和版本；Redis 异常时降级为一次 MySQL 批量查询。
 	videoMap := make(map[uint64]*videopb.VideoInfo, len(videoIDs))
 	missVideoIDs, cacheVersions, cacheAvailable := l.loadVideoEntitiesFromCache(videoIDs, videoMap)
 
-	// 3. 相同 miss 集合在单实例内通过 SingleFlight 合并，只执行一次视频查询和一次标签查询。
+	// 相同 miss 集合在单实例内通过 SingleFlight 合并，只执行一次视频查询和一次标签查询。
 	if len(missVideoIDs) > 0 {
 		dbVideos, err := l.loadVideoEntitiesFromDB(missVideoIDs)
 		if err != nil {
@@ -106,7 +106,7 @@ func (l *BatchGetVideosLogic) BatchGetVideos(in *videopb.BatchGetVideosReq) (*vi
 		}
 	}
 
-	// 4. 按请求顺序组装；无效视频跳过，不让调用方再处理空占位。
+	// 按请求顺序组装；无效视频跳过，不让调用方再处理空占位。
 	videos := make([]*videopb.VideoInfo, 0, len(videoIDs))
 	for _, videoID := range videoIDs {
 		if videoInfo, ok := videoMap[videoID]; ok {
@@ -136,6 +136,7 @@ func normalizeBatchVideoEntityIDs(rawVideoIDs []uint64) ([]uint64, error) {
 	return videoIDs, nil
 }
 
+// Redis 批量读缓存
 func (l *BatchGetVideosLogic) loadVideoEntitiesFromCache(
 	videoIDs []uint64,
 	videoMap map[uint64]*videopb.VideoInfo,
@@ -186,6 +187,7 @@ func (l *BatchGetVideosLogic) loadVideoEntitiesFromCache(
 			missVideoIDs = append(missVideoIDs, videoID)
 			continue
 		}
+		// Missing则证明在DB里也不存在，防缓存穿透
 		if cached.Missing {
 			continue
 		}

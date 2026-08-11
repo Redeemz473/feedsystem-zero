@@ -70,7 +70,7 @@ func (l *DeleteVideoLogic) DeleteVideo(in *videopb.DeleteVideoReq) (*videopb.Del
 	)
 
 	if txErr := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
-		// 1. 事务内加行锁读，避免并发删除同一视频时重复扣减 ref_count。
+		// 事务内加行锁读，避免并发删除同一视频时重复扣减 ref_count。
 		var item model.Video
 		if err := tx.
 			Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -96,7 +96,7 @@ func (l *DeleteVideoLogic) DeleteVideo(in *videopb.DeleteVideoReq) (*videopb.Del
 		playURL = item.PlayURL
 		coverURL = item.CoverURL
 
-		// 2. 软删 videos
+		// 软删 videos
 		now := time.Now()
 		result := tx.Model(&model.Video{}).
 			Where("id = ? AND status = ? AND deleted_at IS NULL", videoID, model.VideoStatusNormal).
@@ -113,9 +113,9 @@ func (l *DeleteVideoLogic) DeleteVideo(in *videopb.DeleteVideoReq) (*videopb.Del
 			return gorm.ErrRecordNotFound
 		}
 
-		// 3. 事务内按 URL 固定顺序减少引用计数（不做物理删除）。
-		//    与发布路径使用相同锁序，避免发布和删除并发时发生资产行锁顺序反转；
-		//    视频与封面 URL 相同时 Delta=2，仍会扣除两个逻辑引用。
+		// 事务内按 URL 固定顺序减少引用计数（不做物理删除）。
+		// 与发布路径使用相同锁序，避免发布和删除并发时发生资产行锁顺序反转；
+		// 视频与封面 URL 相同时 Delta=2，仍会扣除两个逻辑引用。
 		for _, assetRef := range aggregateFileAssetRefs(playURL, coverURL) {
 			for i := int64(0); i < assetRef.Delta; i++ {
 				if err := decreaseFileAssetRefInTx(l.ctx, tx, assetRef.URL); err != nil {
@@ -124,7 +124,7 @@ func (l *DeleteVideoLogic) DeleteVideo(in *videopb.DeleteVideoReq) (*videopb.Del
 			}
 		}
 
-		// 4. 事务内写 outbox（P4：video.deleted 事件）
+		// 事务内写 outbox（P4：video.deleted 事件）
 		occurredAt := now.UnixMilli()
 		payloadBytes, err := json.Marshal(eventx.FeedVideoEvent{
 			EventID:    eventID,

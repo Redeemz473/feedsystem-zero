@@ -302,7 +302,7 @@ func (l *BatchGetProfilesLogic) cachePublicProfileMisses(
 			continue
 		}
 		currentVersion, err := publicProfileVersionResult(versionCmds[userID])
-		//判断此时版本是否一致，不一致则不把旧数据写入缓存
+		//因为有可能并发写INCR了版本号，所以需要判断此时版本是否一致，不一致则不把旧数据写入缓存，让下一次读侧回填缓存
 		if err != nil || currentVersion != expectedVersion {
 			continue
 		}

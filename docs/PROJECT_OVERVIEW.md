@@ -487,6 +487,187 @@ flowchart LR
 - **负缓存防穿透**：MySQL 查不到的 userID 会写 `{Missing:true}` 短 TTL（`AccountPublicProfileMissingTTL=1min`）；读侧命中 `Missing:true` 直接跳过，不回源、不放进响应，避免无效 ID 反复打穿 MySQL。
 - **失败静默**：所有 Redis 错误只记日志、不返回错误——回填缓存是尽力而为，最坏后果只是下一次请求再走一次 DB。
 
+#### 8.1.3 Key 结构详解：多版本 Key 共存 & 与 Video 方案的对比
+
+`BatchGetProfiles` 的读一致性保障根本上建立在 **"版本号嵌入 Key 名"** 这一设计上。Key 语义（见 `common/rediskey/account.go`）：
+
+| Key | 数据结构 | 值 | 用途 |
+|---|---|---|---|
+| `fsz:account:profile:{uid}:version` | STRING(int64) | 单调递增版本号 | 权威时钟，写侧 `INCR`；旧版本无需扫描删除，等 TTL 自然淘汰 |
+| `fsz:account:profile:{uid}:v:{n}` | STRING(JSON) | `{user_id, username, avatar_url, bio, follower_count, following_count}` | 版本 n 的资料快照；读侧回填、写侧不主动删除 |
+
+**核心特征**：`AccountPublicProfileKey(userID, version)` 生成的 Key **不同版本对应完全不同的 Redis Key**（`profile:100:v:5` 和 `profile:100:v:6` 是两个独立 Key）——**新版本不覆盖旧版本，旧版本 Key 无人访问、TTL 到期自动消失**。
+
+**这个设计带来 3 个直接后果**：
+
+1. **写侧极简**：`UpdateProfile` / `social` 关注、取关、`social_sync` 消费者**只需要一条 `INCR`**——不用协调 `DEL` 旧 Key、不用担心竞态；
+2. **读侧必须先拿版本号**：因为要用 `version` 拼出正确的数据 Key `profile:{uid}:v:{version}`，**必须先 GET 版本号**——所以设计成 "**两段 Pipeline**"（第一段拿版本、第二段用版本读实体+二次校验）；
+3. **两次版本读之间需要收敛点**：读侧从第一次读到 `version=5`、到第二次读到 `version` 用来校验，中间任何并发写产生的 `INCR → 6` 都会被 **`currentVersion != expectedVersion`** 识破放弃——这也是 8.1.2 提到的"两次 Pipeline + 二次校验"的物理基础。
+
+**读路径 3 步命令时序（`loadPublicProfilesFromCache`）**：
+
+```mermaid
+sequenceDiagram
+    participant R as 读侧 Logic
+    participant W as 并发写侧
+    participant Redis as Redis
+
+    R->>Redis: Pipeline#1: GET version:100
+    Redis-->>R: 5 (expectedVersion=5)
+    W->>Redis: INCR version:100 → 6
+    R->>Redis: Pipeline#2:<br/>GET profile:100:v:5<br/>+ GET version:100
+    Redis-->>R: 旧 JSON A, 6
+    R->>R: 校验: expected=5, current=6 → 不一致
+    R->>R: 放弃 → 加入 missUserIDs 回源
+```
+
+**"先读实体再读版本"次序在这里也成立**：Pipeline#2 里 `GET profile:v:5` 排在 `GET version` 之前，保证读到的版本 ≥ 实体的版本，任何在两条命令之间的写入都会被识别为不一致（和 Video 方案思路一致）。
+
+**回填的三次校验链条（`cachePublicProfileMisses`）**：
+
+回填时又走了一遍 CAS，避免"回源期间发生并发写、把旧 DB 快照写到新版本槽位"：
+
+```
+读侧看到 expectedVersion=5 → 回源 MySQL 拿数据 A
+    ↓ 中间可能并发发生 INCR → 6 + 更新 MySQL 为 B
+回填前: cachePublicProfileMisses 再 GET version → 6
+    ↓ currentVersion=6 != expectedVersion=5
+放弃 SET profile:v:5=A    ← 关键：不把 A 写到 v:5 槽位
+```
+
+如果**没有**这道校验：读侧会把 A 写到 `profile:100:v:5`；下一次读版本还是 6，去读 `profile:v:6` 是 miss 无害；**但** 如果在两次 `INCR` 之间读侧又读到 5 并回填 A，就可能污染刚被激活的 v:5 槽位——所以这一层 CAS 是必需的。
+
+**与 Video `BatchGetVideos` 的对比总览**：
+
+| 维度 | Account `BatchGetProfiles` | Video `BatchGetVideos` |
+|---|---|---|
+| Key 里是否含版本号 | ✅ 含（`profile:{uid}:v:{n}`） | ❌ 不含（`entity:{vid}`） |
+| 不同版本关系 | 多版本共存（独立 Key） | 单版本覆盖（同一 Key） |
+| 读侧 RTT 数 | **2 次 Pipeline** | 1 次 Pipeline |
+| 读侧命令 | Pipeline1: GET version;<br/>Pipeline2: GET data + GET version(校验) | Pipeline: GET entity + GET version |
+| 写侧动作 | 仅 `INCR` | `INCR` + `DEL` + Lua CAS |
+| 旧缓存清理 | 无人访问 + TTL 自然淘汰 | 写侧 `DEL` 主动清理 |
+| 脏数据窗口 | 双重版本校验，几乎无窗口 | 一次请求内可能返回旧值（~10ms） |
+| 单体缓存开销 | 高（多版本共存，最长 15min） | 低（同一 Key 覆盖） |
+| 单条数据大小 | 小（几百字节） | 大（含 title/description/tags，可达几 KB） |
+| 业务更新频率 | 极低（用户几周才改一次） | 较高（点赞/评论/状态频繁变） |
+| 一致性容忍度 | 更严格（用户改了立刻要看到） | 允许毫秒级最终一致 |
+
+**权衡本质**：两者是同一套 [[memory:9l16e7mx]] 版本号+惰性重算方案 B 的**两种落地形态**——Account 用**多版本 Key + 两段 Pipeline** 换严格一致（多用旧 Key 内存换 RTT 上的两次校验、写侧简化），Video 用**单版本 Key + Lua CAS** 换低内存和更少 RTT（接受一次请求内的毫秒级窗口、复杂化写侧）。**没有优劣，只有场景匹配**。
+
+**SingleFlight 合并并发回源机制详解**：
+
+`BatchGetProfiles` 和 `BatchGetVideos` 缓存 miss 时并**不是**每个请求都直接打到 MySQL——两者都用 `github.com/zeromicro/go-zero/core/syncx.SingleFlight` 把**同一实例内、同一批 ID 集合的并发回源合并成一次 DB 查询**、防止"缓存击穿"打垮 MySQL。
+
+**代码结构（两者完全对称）**：
+
+```go
+// 包级单例，进程共享
+var publicProfileDBLoadGroup = syncx.NewSingleFlight()          // account
+var videoEntityDBLoadGroup   = syncx.NewSingleFlight()          // video
+
+// 回源函数用 Do(key, fn) 包一层
+value, err := publicProfileDBLoadGroup.Do(
+    publicProfileDBLoadKey(userIDs),                             // flight key
+    func() (any, error) {                                        // 真正的 DB 查询
+        var users []model.Account
+        err := gormDB.Select(...).Where("id IN ?", userIDs).Find(&users).Error
+        // ... 组装成 map[uint64]*PublicProfile 返回
+        return profiles, nil
+    },
+)
+```
+
+**`Do(key, fn)` 的语义**：
+- 如果 `key` 上已经有一个 `fn` 正在执行 → **当前 goroutine 阻塞等待**、不启动新的 `fn`；
+- 否则 → 启动 `fn` 执行、执行期间所有 `Do(相同 key)` 都挂在同一个等待队列上；
+- `fn` 返回后 → **所有等待者共享同一份 `(value, error)`**；
+- 立刻从内部 map 中删除 `key`——**下一次 `Do(同 key)` 会重新启动 `fn`**（不做长期结果缓存、真正的缓存交给上游 Redis）。
+
+**flight key 为什么必须排序拼字符串**（`publicProfileDBLoadKey` / `videoEntityDBLoadKey`）：
+
+```go
+func publicProfileDBLoadKey(userIDs []uint64) string {
+    sortedUserIDs := append([]uint64(nil), userIDs...)           // ① 拷贝副本，不改调用方切片
+    sort.Slice(sortedUserIDs, func(i, j int) bool {              // ② 稳定排序
+        return sortedUserIDs[i] < sortedUserIDs[j]
+    })
+
+    var builder strings.Builder                                  // ③ 拼接 "1,2,3,"
+    for _, userID := range sortedUserIDs {
+        builder.WriteString(strconv.FormatUint(userID, 10))
+        builder.WriteByte(',')
+    }
+    return builder.String()
+}
+```
+
+三步做的事情：
+
+1. **`append([]uint64(nil), ids...)` 拷贝副本**——绝对不能就地 `sort.Slice(userIDs)`，否则会打乱调用方期望的响应顺序（`BatchGetProfiles` 最后按输入顺序组装响应，一旦就地排序响应就会乱掉）；
+2. **`sort.Slice` 排序**——让 `[1,2,3]` / `[2,3,1]` / `[3,1,2]` 三个并发请求**识别为同一 flight**、共享一次 DB 查询；否则纯字面拼接会当作三次独立回源；
+3. **`strings.Builder` 拼接**——O(N) 生成一个可比较的字符串（比 `fmt.Sprintf` 少一次反射开销），末尾多一个 `,` 无害。
+
+（`batchgetvideoslogic_test.go:TestVideoEntityDBLoadKeyOrderIndependent` 专门测了 `[9,2,7]` 和 `[7,9,2]` 生成同一个 flight key——是这条不变式的回归保护。）
+
+**"防缓存击穿"典型场景**：
+
+假设某热门用户资料的 15min 缓存刚过期、瞬时有 500 个请求都来查同一批用户 ID：
+
+| 无 SingleFlight | 有 SingleFlight |
+|---|---|
+| 500 个 goroutine 各自看到 miss → 500 次 `WHERE id IN (...)` DB 查询 → MySQL CPU 瞬时打满、慢查询积压 | 500 个 goroutine 竞争同一个 flight key → **只有 1 个执行 DB 查询**、其余 499 个阻塞等待 → 一次查询返回后 499 个 goroutine 立刻拿到同一份结果 |
+
+——这就是 Redis 章节里常说的**"缓存击穿保护"**（cache stampede protection）。
+
+**关键边界与约束**：
+
+| 边界 | 说明 |
+|---|---|
+| **进程内单例** | `syncx.NewSingleFlight()` 是**进程内**的合并，跨实例（不同 Pod）的并发回源**不合并**——但配合上游 Redis 缓存已经足够抗住热点；跨实例并发合并需要分布式锁，代价大且非必要。 |
+| **flight key 精确匹配** | key 是字符串精确匹配、必须完全相同才合并；`[1,2]` 和 `[1,2,3]` 是**两个 flight**、不合并 —— 这是正确的（两次查的数据不同，不能共享结果）。 |
+| **错误也会共享** | `fn` 返回 error 时、所有等待者拿到**同一个 error**——如果 DB 抖动导致 fn 报错，499 个请求会同时失败；但因为每次 `Do` 完立即从 map 删除 key，下一次请求会立刻重试。 |
+| **不缓存结果** | SingleFlight 只在"并发窗口内"合并、不做结果缓存 —— fn 返回后 key 立即失效，第 501 个请求（若晚到）会重新启动一次 fn。这是刻意设计——真正的缓存交给 Redis，SingleFlight 只解决"击穿瞬间"的并发放大问题。 |
+| **同一实例内的顺序副作用** | 若 `fn` 有副作用（如触发写操作），499 个等待者不会各自触发一次副作用——**副作用只发生一次**。BatchGet* 场景纯读、无副作用，天然安全。 |
+| **不阻塞跨 flight 请求** | 不同 flight key 之间完全独立、互不阻塞。 |
+| **返回值必须做类型断言** | `Do` 签名是 `func() (any, error)`、调用方要 `value.(map[uint64]*PublicProfile)`——两边都加了 `if !ok { return errors.New("...结果类型异常") }` 兜底防止类型漂移。 |
+
+**为什么放在缓存 miss 之后、而不是入口就 Do 一层**：
+
+看 `BatchGetProfiles` 的调用位置——`loadPublicProfilesFromDB` 只在 `missUserIDs` 非空时被调用、且传入的是**已经过缓存过滤的 miss 子集**。这样的设计意味着：
+
+- **Redis 命中的请求根本不进入 SingleFlight**——它们各自走各自的 Pipeline、不会互相阻塞；
+- **只有缓存 miss 的少数请求**才会争抢 flight —— 击穿瞬间才需要合并；
+- **flight key 是排序后的 miss ID 子集**——两个请求即使原始 ID 不同、只要经过缓存过滤后 miss 集合相同，仍可合并（例如请求 A 查 [1,2,3]、请求 B 查 [3,4,5]，若 1,2,4,5 都命中缓存、只剩 3 miss，两者会合到同一个 flight 的 "3," key 上）。
+
+**项目内其他 SingleFlight 落点（供参考）**：
+
+同一套模式在项目多个模块被复用、都用于**"批量/分页查询 + 缓存 miss 时合并回源"**：
+
+| 位置 | 用途 | flight key 组成 |
+|---|---|---|
+| `apps/account/internal/logic/batchgetprofileslogic.go` | 批量用户资料回源 | 排序后的 userID 集合 |
+| `apps/video/internal/logic/batchgetvideoslogic.go` | 批量视频实体回源 | 排序后的 videoID 集合 |
+| `apps/interaction/internal/logic/listcommentslogic.go` | 视频评论列表回源 | `videoID + cursorCreatedAt + cursorCommentID + pageSize` |
+| `apps/interaction/internal/logic/listmylikedvideoslogic.go` | "我点赞的视频" 列表回源 | `userID + cursor + pageSize` |
+| `apps/social/internal/logic/listfollowerslogic.go` | 粉丝列表回源 | `userID + cursor + pageSize` |
+| `apps/social/internal/logic/listfollowingslogic.go` | 关注列表回源 | `userID + cursor + pageSize` |
+| `apps/feed/internal/logic/feedhelper.go` | Timeline 构建 / 热榜快照构建 | 独立两个 group |
+
+——**"进程内合并 + 上游 Redis 抗量 + 下游 MySQL 兜底"** 已成为该项目 batch/list 类接口的**通用模板**。
+
+**共通的通用最佳实践**（两者都用）：
+
+1. **`SingleFlight` 合并回源**（`publicProfileDBLoadGroup` / `videoEntityDBLoadGroup`）——防击穿，同实例内相同 ID 集合合并一次 DB 查询；
+2. **flight key 排序拼字符串**——让 `[1,2,3]` 和 `[3,1,2]` 识别为同一 flight；
+3. **`Missing:true` 负缓存 + 短 TTL** —— 防穿透；
+4. **TTL 抖动 `userID % 300s`** —— 防雪崩，且同一 ID TTL 可预测；
+5. **Redis 挂了 `cacheAvailable=false` 全走 DB** —— 降级保可用；
+6. **列裁剪**：`Select` 只取公开字段——最小化 DB 传输；
+7. **`normalize*IDs`** 输入归一化：限批 100、过滤 0、去重保序；
+8. **响应按输入顺序对齐**：`for _, id := range ids` 拼装、Missing/不存在直接跳过；
+9. **失败静默**：所有 Redis 错误只记日志、不影响给客户端的响应。
+
 ---
 
 ### 8.2 Video 视频模块
@@ -1044,6 +1225,207 @@ Where("id = ? AND url = ? AND storage_path = ? AND status = ?",
 | ③ | **批量 SELECT + 事务外 `os.Stat`** | 磁盘 I/O 不占用行锁、事务持锁时间毫秒级 |
 | ④ | **返回 `{id, url, storage_path, refDelta}`** | 供事务内 CAS UPDATE 使用、防止预检-写入之间的并发状态漂移 |
 
+#### 8.2.3 PublishVideo 端到端流程七阶段总览
+
+`PublishVideo` 位于 [`apps/video/internal/logic/publishvideologic.go`](../apps/video/internal/logic/publishvideologic.go)，是整个视频模块最复杂的写路径。它把参数校验、幂等预检、资产预检、事务写入、缓存失效串成一条完整链路，可以拆分成 **"三前置 + 一事务 + 三分流"** 七大阶段：
+
+##### 阶段全景
+
+```
+① 参数校验 + 标签两级降级
+        ↓
+② 事务外幂等预检 #1（loadVideoByAuthorRequestID）
+   命中 → idempotentPublishResponse 直接返回
+        ↓
+③ 事务外资产预检（preparePublishFileAssets：聚合 + 排序 + 批量 SELECT + 磁盘校验）
+        ↓
+④ 预生成 outbox eventID（事务外做、避免占用行锁）
+        ↓
+⑤ 开启事务
+   ├─ 5.1 for CAS UPDATE file_assets.ref_count += Delta（按字典序）
+   ├─ 5.2 INSERT videos（撞 uk_video_request 唯一键 → errDuplicateVideoRequest）
+   ├─ 5.3 INSERT tags ON CONFLICT(name) DO NOTHING
+   ├─ 5.4 SELECT tags WHERE name IN (?) 回读 tag.ID
+   ├─ 5.5 INSERT video_tags ON CONFLICT(video_id, tag_id) DO NOTHING
+   └─ 5.6 INSERT outbox_events(video.published, status=Pending)
+        ↓
+⑥ 事务失败三分流 / 事务成功 invalidateVideoEntityCache
+        ↓
+⑦ 返回 VideoInfo + "发布成功"
+```
+
+##### 阶段 ① 参数校验 + 标签两级降级
+
+- **必填字段全校验**：`authorID / authorUsername / title / playURL / coverURL / requestID` 缺一不可。
+- **`requestID` 是幂等三道防线的核心**：非空校验 + 长度上限 128（防注入）；gateway 层会为老客户端兜底生成、这里再兜一层强制要求，防止直接跨服务调用绕过 gateway。
+- **标签两级降级**：`normalizeTags(in.GetTags())` 先规范化前端传入 → 若为空则 `extractTags(title + " " + description)` 从标题描述里抽 `#xxx` 兜底 → `maxVideoTags=20` 硬上限。
+
+##### 阶段 ② 事务外幂等预检 #1 —— `loadVideoByAuthorRequestID`
+
+用**独立的 DB 连接**按 `(author_id, request_id)` 查 `videos` 表——**这是三道幂等防线的第一道**，专门处理"客户端网络超时后正常重试"这类**大概率会命中**的场景：
+
+- 命中 → `idempotentPublishResponse` 直接返回原视频，**并额外校验 PlayURL/CoverURL 是否一致**（防止同一 requestID 被复用发不同内容 → 返回 `AlreadyExists`）。
+- 未命中 → 继续走首次发布流程。
+
+**为什么不放事务里做**：这个 SELECT 只是幂等预判、和后续写入没有原子性绑定；放事务外能避免大量重试请求空占 DB 事务/行锁资源。真并发首发时会走第三道防线（唯一键 + 事务后回读）兜底。
+
+##### 阶段 ③ 事务外资产预检 —— `preparePublishFileAssets`
+
+详见 8.2.2。核心产出是 **CAS 素材包 `[]preparedPublishFileAsset{ID, URL, StoragePath, RefDelta}`**——每一个字段都会作为事务内 UPDATE 的 WHERE 条件。**磁盘 `os.Stat` 三重校验和批量 SELECT 全部前置到事务外**，让事务持锁时间压缩到毫秒级。
+
+##### 阶段 ④ 预生成 outbox eventID
+
+`newEventID("video_published")` 在事务外生成——**任何可以事务外做的事都不占用行锁**是本项目一贯的设计哲学。事务里只需要把 `eventID + createdVideo.ID + payload` 组装成 envelope 后 INSERT outbox_events 即可。
+
+##### 阶段 ⑤ 事务体六步原子操作
+
+`gormDB.Transaction(func(tx) error { ... })` 内**六个原子步骤**任何一步失败都会自动 ROLLBACK：
+
+| 步骤 | 操作 | 关键设计 |
+|------|------|---------|
+| **5.1** | `for _, asset := range preparedAssets { reservePreparedPublishFileAsset(tx, asset) }` | 按字典序、CAS UPDATE 四字段快照（见 8.2.4） |
+| **5.2** | `tx.Create(&createdVideo)` | 撞 `uk_video_request(author_id, request_id)` 唯一键 → `isDuplicateKeyError` → 返回 `errDuplicateVideoRequest`（幂等第二道防线）|
+| **5.3** | `tx.Clauses(OnConflict{Columns:name, DoNothing:true}).Create(&tagRows)` | 标签表按 `name` 唯一键幂等 INSERT |
+| **5.4** | `tx.Where("name IN ?", tags).Find(&savedTags)` | **必须回读**：DoNothing 冲突时 `tagRows[i].ID=0`、无法建关联，必须再 SELECT 一次拿真实 ID |
+| **5.5** | `tx.Clauses(OnConflict{Columns:video_id+tag_id, DoNothing:true}).Create(&videoTags)` | 一条 SQL 批量建关联、冲突忽略 |
+| **5.6** | 序列化 `eventx.FeedVideoEvent + Envelope` → `tx.Create(&OutboxEvent{Status:Pending})` | 与 videos 同事务，杜绝"视频已发布但下游无感知" |
+
+**关键不变式**：`file_assets.ref_count +=1`、`INSERT videos`、`INSERT outbox_events` **必须在同一本地事务内**——任一步失败全部回滚，从根本上杜绝以下三类漂移：
+
+- ❌ "视频存在但 ref_count 被回滚" → CDN 播放但资产 ref_count=0 被 Job 误清理；
+- ❌ "ref_count 已加但视频未创建" → 资产孤儿引用、永远不会被清理；
+- ❌ "视频已发布但下游无感知" → feed/推荐/通知模块永远收不到事件。
+
+##### 阶段 ⑥ 事务失败的三分流精准返回
+
+事务返回的 error 会被外层用 `errors.Is / errors.As` 精确分流成**三种完全不同的用户响应**：
+
+| 分流 | 触发条件 | 用户响应 | HTTP 语义 |
+|------|---------|---------|----------|
+| **A. CAS 失败** | `errors.As(err, &publishFileAssetError)` + `errors.Is(err, ErrRecordNotFound / errFileAssetStorageUnavailable)` | 区分 playURL/coverURL → "视频/封面资源不存在或已失效，请重新上传" | 400 InvalidArgument |
+| **B. 撞唯一键**（幂等第三道防线） | `errors.Is(err, errDuplicateVideoRequest)` | 独立连接 `loadVideoByAuthorRequestID` 拿"胜出者" → `idempotentPublishResponse` | **200 成功**（幂等语义）|
+| **C. 其他 DB 错误** | 兜底 | "发布视频失败" | 500 Internal |
+
+**最漂亮的地方**：分流 B 的 `errDuplicateVideoRequest` 虽然是 Go 层的 error、但**用户视角是成功**——意味着"你的另一个请求（或另一个协程）已经赢了、我把结果给你"。这就是**幂等语义的精确表达**：**同一 `request_id` 下无论重放多少次、返回的都是同一条视频、且视频只被真正创建一次**。
+
+##### 阶段 ⑦ 缓存失效 + 返回
+
+事务成功后 `invalidateVideoEntityCache(RedisCli, videoID)`——失败仅记日志、**不影响给客户端的响应**（缓存最终一致性、下次读时会回源）。最后 `toVideoInfo` 序列化后返回 `VideoInfo + "发布成功"`。
+
+##### 三道幂等防线全景
+
+| 防线 | 位置 | 处理场景 | 处理方式 |
+|------|------|---------|---------|
+| **第一道** | 阶段 ② 事务外 `loadVideoByAuthorRequestID` | 客户端正常网络重试（大概率命中）| 直接返回原视频、不进事务 |
+| **第二道** | 阶段 ⑤.2 DB 唯一键 `uk_video_request(author_id, request_id)` | 毫秒级真并发首发（预检漏网） | INSERT 撞键、事务整体 ROLLBACK（含已 reserve 的 ref_count）|
+| **第三道** | 阶段 ⑥.B 事务后独立连接再查 | 兜底：确保撞唯一键的请求也能拿到胜出者结果 | `idempotentPublishResponse` 返回胜出者、用户无感 |
+
+---
+
+#### 8.2.4 file_assets UPDATE 并发安全的四层机制协同
+
+`reservePreparedPublishFileAsset` 里对 `file_assets` 的 UPDATE 是整个项目最典型的**并发控制样板**。它的并发安全性**不是靠单一机制**、而是**四层机制协同**的结果——**每一层单独用都有致命漏洞、缺一不可**：
+
+```go
+db.WithContext(ctx).
+    Model(&model.FileAsset{}).
+    Where(
+        "id = ? AND url = ? AND storage_path = ? AND status = ?",  // ← 第 3 层：CAS 快照
+        asset.ID, asset.URL, asset.StoragePath, model.FileAssetStatusActive,
+    ).
+    Updates(map[string]any{
+        "ref_count":  gorm.Expr("ref_count + ?", asset.RefDelta),   // ← 第 2 层：原子表达式
+        "deleted_at": nil,
+    })
+// ← 第 1 层：MySQL 自动持 X 锁；第 4 层：调用前 sort.Strings 保序
+```
+
+##### 四层机制的分工矩阵
+
+| 层次 | 手段 | 防的具体并发问题 | 单独用够不够 |
+|------|------|-----------------|-------------|
+| **① MySQL 行锁** | InnoDB `UPDATE` 自动持 X 锁至事务提交 | 同一时刻两条 UPDATE 冲突（SQL 层串行化）| ❌ 防不住丢失更新 |
+| **② 原子 SQL 表达式** | `gorm.Expr("ref_count + ?", Delta)` | Lost Update（读旧值再覆盖）| ❌ 防不住状态漂移 |
+| **③ 乐观锁 CAS 快照** | `WHERE id=? AND url=? AND storage_path=? AND status=ACTIVE` | 预检-写入间隙的并发状态漂移（用户 vs Job / DBA）| ❌ 防不住多行死锁 |
+| **④ 字典序抢锁** | `sort.Strings(orderedURLs)` | 多行 UPDATE 的循环等待死锁 | ❌ 单用不完整 |
+| **① + ② + ③ + ④ 协同** | 四位一体 | 全部并发问题 | ✅ 完美 |
+
+##### 第 1 层：MySQL 行锁 —— 保证 SQL 层串行化
+
+InnoDB 下 `UPDATE ... WHERE ...` 会**自动对目标行加排他锁（X 锁）**，直到当前事务 COMMIT / ROLLBACK 才释放。它保证两条并发 UPDATE 不会同时进入执行、后到者阻塞等待。
+
+**它防的是**：两条 UPDATE 同时执行产生的原子性冲突。
+**它防不住**：读-算-写间隙的 Lost Update、预检快照失效、跨行死锁。
+
+##### 第 2 层：原子 SQL 表达式 —— 消灭 Lost Update
+
+**反例（错误写法）**：
+
+```go
+// ❌ 先 SELECT 读出、应用层 +1、再 UPDATE 写回
+var asset model.FileAsset
+tx.Where("id = ?", id).First(&asset)              // 读到 ref_count = 5
+tx.Model(&asset).Update("ref_count", asset.RefCount+1)  // 写回 6
+```
+
+并发下：A 读 5、B 读 5、A 写 6、B 写 6——**丢了一次引用**、后续 cleanup Job 会提前误删还在用的文件。
+
+**正例（项目写法）**：
+
+```go
+"ref_count": gorm.Expr("ref_count + ?", asset.RefDelta)
+```
+
+**渲染成 SQL 是 `SET ref_count = ref_count + 1`**——MySQL 在持有行锁的**同一个原子操作**内完成"读 + 算 + 写"，永远不会出现"读到旧值再覆盖"的漏洞。
+
+**类比 Java `AtomicInteger.incrementAndGet()`**：它的线程安全**不是**因为方法加了 `synchronized`、**而是**因为用 CPU CAS 指令做原子的读-改-写；MySQL 里 `SET x = x + 1` 完全同理——**真正的原子性来自 SQL 表达式本身、行锁只是配合**。
+
+##### 第 3 层：乐观锁 CAS 快照 —— 防状态漂移
+
+WHERE 四字段：`id` 是定位字段，`url / storage_path / status = ACTIVE` **全部是预检时拍下来的快照**。触发 CAS 失败（`RowsAffected == 0`）的三大场景：
+
+| 场景 | 谁改动了字段 | 后果 |
+|------|-------------|------|
+| **`status` 被 Job 抢先降级** | `asset_cleanup` Job 把 ACTIVE 改成 Cleaning/PendingDelete | 磁盘文件可能已被删、拒绝写入 |
+| **`url` 被并发改动** | 运维脚本重命名 CDN URL | 快照失效、拒绝写入 |
+| **`storage_path` 被并发改动** | 磁盘迁移工具改路径 | 快照失效、拒绝写入 |
+
+**共同本质**：预检时看到的世界 vs 事务写入时的世界发生了变化——**行锁只锁"同一时刻的行"、锁不住"预检和 UPDATE 之间的间隙"**。CAS 快照就是 SQL 层的 Compare-And-Swap，专门补这个洞。
+
+##### 第 4 层：字典序抢锁 —— 消灭死锁
+
+如果不排序、两个用户同时发布并引用同两个资产：
+
+```
+用户 A：锁 URL_x → 想锁 URL_y（等待 B）
+用户 B：锁 URL_y → 想锁 URL_x（等待 A）
+→ 循环等待、MySQL 死锁检测器强制回滚一个事务
+```
+
+`aggregateFileAssetRefs` 里的 `sort.Strings(orderedURLs)` 保证**所有并发事务按同一顺序抢多行的锁**——永远只有"后到者等前到者"、**从根本上消灭循环等待**。这是**资源排序法**在 DB 场景的经典应用。
+
+##### 单独用任一层会翻车的反例场景
+
+**只有行锁没有 CAS 快照**：
+
+```
+T0：preparePublishFileAssets 读 status=ACTIVE
+T1：asset_cleanup Job：UPDATE status=PendingDelete → COMMIT、行锁释放
+T2：Job 继续 UPDATE status=Cleaning → 物理 os.Remove(disk) → status=Deleted → COMMIT
+T3：发布事务：UPDATE ref_count += 1 WHERE id=?（没检查 status！）
+     ↑ 行锁没人持、正常拿到、原子 +1 也没问题
+     ↑ 但 status 已经是 Deleted、磁盘文件已经被删！
+T4：用户点开视频 → 404 事故
+```
+
+**行锁救不了这个场景**——T3 时刻的资产行锁根本没人持有、UPDATE 顺利执行——**必须有 `AND status = ACTIVE` 的 CAS 快照检查**才能在 T3 时刻发现"世界已经变了、拒绝写入"、触发事务回滚、返回客户端 400 让用户重传。
+
+##### 核心心智模型
+
+**行锁只锁"同一时刻的行"、锁不住"预检和 UPDATE 之间的间隙"、也解决不了"读出来再写回去"的丢失更新**——**并发安全 = 行锁 + 原子表达式 + CAS 快照 + 字典序**、四位一体、缺一不可，这才是"事务外乐观预检 + 事务内 CAS 条件写"能真正 work 的底层数学基础。
+
+---
+
 **file_assets 四状态机（commit 687d0ab 完善）**：
 
 | 状态 | 含义 | 可秒传 | 可被 asset_cleanup 抢占 |
@@ -1165,6 +1547,297 @@ stateDiagram-v2
 **文件魔数二次校验**：`saveMultipartUpload` 和分片合并时都会调用 `validateUploadedFileSignature`，根据扩展名预期校验前 12 字节魔数（jpg/png/webp/mp4/webm），防止伪造后缀或传输损坏。
 
 **上传接口统一返回 canonical URL**：`upsertFileAsset` 返回数据库中的规范副本 URL，`UploadVideo` / `UploadCover` / `CompleteVideoUpload` 均使用 `canonicalAsset.URL` 返回，避免同一 hash 因建议路径不同导致视频 play_url 不一致。
+
+#### 8.2.5 BatchGetVideos 单版本 Key + Lua CAS 读路径
+
+`apps/video/internal/logic/batchgetvideoslogic.go` 是 Feed / 视频卡片批量拉取的核心接口，和 `BatchGetProfiles` **底层同属"版本号+惰性重算方案 B"**，但因业务特点不同、**Key 结构与读写方案完全不同**——Video 选的是"**单版本 Key 覆盖 + JSON 内嵌版本 + Lua CAS 回写**"。
+
+**Key 结构（见 `common/rediskey/video.go`）**：
+
+| Key | 数据结构 | 说明 |
+|---|---|---|
+| `fsz:video:entity:{videoID}` | STRING(JSON) | 视频实体缓存，JSON 内**内嵌 `version` 字段**，所有版本共用同一个 key（新版本覆盖旧版本） |
+| `fsz:video:entity:{videoID}:version` | STRING(int64) | 视频实体缓存版本号，`invalidateVideoEntityCache` INCR |
+
+**与 Account 方案的核心差异对照**：
+
+| 维度 | Account（`profile:{uid}:v:{n}`） | Video（`entity:{vid}`） |
+|---|---|---|
+| Key 里是否含版本号 | ✅ 含 —— 多版本共存 | ❌ 不含 —— 单版本覆盖 |
+| 不同版本关系 | 不同 key 独立存在 | 同一 key 反复覆盖 |
+| 旧版本清理 | 无人访问 + TTL 自然淘汰 | 写侧 `DEL` 主动清理 |
+| 读侧 RTT 数 | 2 次 Pipeline（先拿版本再读实体+验证） | 1 次 Pipeline（同时读实体+版本） |
+| 写侧动作 | 仅 `INCR` | `INCR` + `DEL` + Lua CAS 保护 |
+| 脏数据窗口 | 双重版本校验，几乎无窗口 | 一次请求内可能返回旧值（~10ms 毫秒级） |
+
+**读路径 5 步（`BatchGetVideos → loadVideoEntitiesFromCache → loadVideoEntitiesFromDB → cacheVideoEntityMisses`）**：
+
+```mermaid
+flowchart TD
+    A["BatchGetVideos"] --> B["normalizeBatchVideoEntityIDs<br/>限批 100 / 过滤 0 / 去重保序"]
+    B --> C["loadVideoEntitiesFromCache<br/>一次 Pipeline: GET entity + GET version"]
+    C --> D{"cached.Version == 当前 version<br/>且 status == VideoStatusNormal?"}
+    D -- "是" --> E1["cached.toVideoInfo() → 命中"]
+    D -- "Missing:true" --> E2["跳过（负缓存生效）"]
+    D -- "否" --> M["加入 missVideoIDs"]
+    M --> F["loadVideoEntitiesFromDB<br/>SingleFlight(排序后拼 key 合并并发)<br/>WHERE id IN ? AND status=Normal AND deleted_at IS NULL"]
+    F --> G["cacheVideoEntityMisses<br/>Lua CAS: current==ARGV[1] 才 SET"]
+    G --> H["按输入顺序组装响应<br/>Missing/Deleted 直接跳过"]
+```
+
+**"先读实体再读版本"命令顺序的关键性**：
+
+`loadVideoEntitiesFromCache` 里 Pipeline 命令顺序是 `GET Entity` 后 `GET Version`——**必须是这个顺序**，反过来会导致误判为命中而返回脏数据：
+
+| 时序 | 我方读命令 | 并发删除 |
+|---|---|---|
+| T1 | `GET Entity`（读到 v=5 的旧实体） | |
+| T2 | | `INCR Version → 6` + `DEL Entity` |
+| T3 | `GET Version`（读到 6） | |
+
+结果：`cached.Version=5 ≠ version=6` → **不一致 → 强制回源**。若顺序反过来（先 Version 后 Entity），T1 拿到 v=5、T2 bump 到 v=6、T3 读到旧实体，`cached.Version=5 == 我方记住的 version=5`，会**误判为一致返回脏数据**。**这是 Video 单版本 Key 方案的一致性基础**。
+
+**Lua CAS 回写（`setVideoEntityCacheIfMatch`）**：
+
+```lua
+local current = redis.call("GET", KEYS[1])   -- 当前 version
+if not current then current = "0" end
+if current ~= ARGV[1] then                    -- 与我方读到的 version 比较
+    return 0                                   -- 版本已变 → 放弃写入
+end
+redis.call("SET", KEYS[2], ARGV[2], "PX", ARGV[3])
+return 1
+```
+
+- **防"回源期间被删除"竞态**：T1 读缓存 miss、拿 DB 快照（版本 v=5）；T2 并发删除视频、`INCR Version → 6`；T1 若直接 `SET` 会把已删除视频的旧快照写回。用 Lua 原子比对——`current=6 ≠ ARGV[1]=5` → 放弃写入。
+- **KEYS[1]** 是 version key、**KEYS[2]** 是 entity key（**两个 key 同一 Redis 槽位**才能保证 Lua 原子性——通过 hashtag 一致性设计天然满足）。
+- **注释里明确写道**："Lua 在写缓存时原子比较版本，防止并发删除后旧数据库快照重新写回缓存"。
+
+**写侧 `invalidateVideoEntityCache`（`videohelper.go:160`）**：
+
+```go
+func invalidateVideoEntityCache(ctx, redisCli, videoID) error {
+    pipe := redisCli.TxPipeline()      // TxPipeline: MULTI/EXEC 原子
+    pipe.Incr(ctx, VideoEntityVersionKey(videoID))
+    pipe.Del(ctx, VideoEntityKey(videoID),
+        VideoDetailKey(videoID), VideoStatsCacheKey(videoID))
+    _, err := pipe.Exec(ctx)
+    return err
+}
+```
+
+- **调用点**：`PublishVideoLogic`（发布成功后、幂等分支后）、`DeleteVideoLogic`（软删除事务提交后）——**全部在 MySQL 事务提交后**、遵循"先写 DB 再作废缓存"原则。
+- **失败静默**：所有调用点都是 `if err != nil { l.Errorf(...) }`——只记日志、不重试、不阻塞给客户端的响应。
+- **失败可容忍的三重兜底**：① 版本号漂移（`INCR` 幂等、任何后续成功写入都能修复）；② TTL 到期（`VideoEntityMissingTTL=30s` / `VideoEntityCacheTTL=10min`）；③ Redis 全挂时 `cacheAvailable=false` 全走 DB 降级。
+
+**Missing 负缓存与命中过滤**：
+
+- MySQL 查不到的 videoID 会写 `{Version, Missing:true, VideoID}`、TTL=`VideoEntityMissingTTL=30s`，读侧命中 `Missing:true` 直接跳过、不加入响应；
+- **额外的"状态漂移守护"**：即使命中的正缓存 `cached.Status != VideoStatusNormal`（说明视频已被下架/删除，但缓存 JSON 里存了旧的正常状态），也会**强制回源 + `DEL Entity`**，避免旧状态被反复读到。
+
+**SingleFlight 合并回源（防击穿）**：
+
+`videoEntityDBLoadGroup = syncx.NewSingleFlight()` 是 `batchgetvideoslogic.go` 的包级单例，`loadVideoEntitiesFromDB` 用 `videoEntityDBLoadKey(videoIDs)` 作为 flight key 包裹回源函数——**合并同一实例内、同一批 videoID 集合的并发回源请求**，防止热点视频缓存刚过期时 MySQL 被击穿。（**完整机制与语义详见 [8.1.3 → SingleFlight 合并并发回源机制详解](#813-key-结构详解多版本-key-共存--与-video-方案的对比)**，此处只列 Video 特有的部分。）
+
+**flight key 构造（`videoEntityDBLoadKey`）**：
+
+```go
+func videoEntityDBLoadKey(videoIDs []uint64) string {
+    sortedVideoIDs := append([]uint64(nil), videoIDs...)   // 拷贝副本，不影响调用方响应顺序
+    sort.Slice(sortedVideoIDs, func(i, j int) bool {
+        return sortedVideoIDs[i] < sortedVideoIDs[j]
+    })
+    var builder strings.Builder
+    for _, videoID := range sortedVideoIDs {
+        builder.WriteString(strconv.FormatUint(videoID, 10))
+        builder.WriteByte(',')
+    }
+    return builder.String()
+}
+```
+
+- **必须先拷贝再排序**：`BatchGetVideos` 最后按输入顺序组装响应、就地排序会把响应顺序打乱；
+- **必须排序**：让 `[9,2,7]` / `[2,7,9]` / `[7,9,2]` 三个并发请求识别为同一 flight（有回归测试 `batchgetvideoslogic_test.go:TestVideoEntityDBLoadKeyOrderIndependent` 守护这条不变式）；
+- **不用 map 或 hash**：拼接字符串比 map 更轻量、比 hash 更直观（碰撞不可能）。
+
+**Video 场景为什么特别需要 SingleFlight**：
+
+对比 Account 场景（用户资料几周才改一次），Video 场景**热点更集中、更凶险**：
+
+| 触发场景 | 现象 | 无 SingleFlight 后果 | 有 SingleFlight 效果 |
+|---|---|---|---|
+| **热门视频刚发布/刚下架** | `invalidateVideoEntityCache` 触发 `INCR + DEL` → 所有已缓存客户端下次读都 miss | Feed / 推荐流瞬时几千 QPS 都打到 `videos` 表主键 IN 查询 | 单实例内合并为 1 次 DB 查询 |
+| **TTL 到期同时刻雪崩** | 大批同批次发布的视频过期时刻接近 | 每条视频的每个查询者独立回源 | 同一批 videoID 集合合并；同时依赖 TTL 抖动 `videoID%300s` 打散 |
+| **热榜/推荐 Feed 突发访问** | 冷启动或热点事件瞬时大量新访问者请求同一批视频 | N 个客户端 × 每人查 100 条 = N 次 IN 查询 | 每个实例最多 1 次 IN 查询（若 miss 集合完全相同） |
+
+**回源函数内还额外做了两件事**（超出 SingleFlight 本身范围，但由它保护）：
+
+```go
+value, err := videoEntityDBLoadGroup.Do(videoEntityDBLoadKey(videoIDs), func() (any, error) {
+    var videos []model.Video
+    // ① 列裁剪：只 SELECT 公开字段，最小化传输
+    if err := gormDB.
+        Select("id","author_id","author_username","title","description",
+               "play_url","cover_url","likes_count","comments_count",
+               "popularity","status","created_at","updated_at").
+        Where("id IN ? AND status = ? AND deleted_at IS NULL",
+              videoIDs, model.VideoStatusNormal).
+        Find(&videos).Error; err != nil {
+        return nil, err
+    }
+    // ② 一次 IN 查询批量拿 tags，防止 N+1
+    foundVideoIDs := ...
+    tagsMap, err := loadTagsByVideoIDs(ctx, gormDB, foundVideoIDs)
+    // ...
+})
+```
+
+**核心价值**：SingleFlight 把 "N 个并发请求 × 2 次 DB 查询（videos + video_tags）" 压缩为 "**1 次 videos IN 查询 + 1 次 video_tags IN 查询**"——**总 DB 负载与并发数完全解耦**、只与 miss 集合的数量线性相关。这也是为什么 Video 服务能在热榜/推荐 Feed 场景下扛住突发流量的底层保护。
+
+**边界重申**：SingleFlight 是**进程内**合并，多个 Pod 之间不合并——但配合 Redis 缓存（10min 正常 + 30s Missing）+ TTL 抖动 + Missing 负缓存，**跨实例的击穿风险已经足够小**、不需要引入分布式锁。
+
+**TTL 抖动防雪崩**：
+
+```go
+func videoEntityCacheTTL(videoID uint64) time.Duration {
+    jitterRange := uint64(videoEntityCacheTTLJitter/time.Second) + 1
+    return VideoEntityCacheTTL + time.Duration(videoID%jitterRange)*time.Second
+}
+```
+
+用 `videoID % 300s` 而非纯随机——**同一 videoID 的 TTL 可预测**、避免不同实例回填给同一视频不同 TTL 导致的过期时刻错乱；同时把大批同批次发布的视频过期时刻打散到 5 分钟窗口内。
+
+**响应组装边界**：`BatchGetVideos` 只负责 Video 服务自有字段——`likes_count/comments_count/popularity` 是 Video 服务从 `interaction` 服务异步同步来的**滞后快照**（通过 outbox + kafka + `interaction_sync` job）；Gateway 拿到 `BatchGetVideos` 结果后**必须再调 `InteractionRpc.BatchGetVideoStats` 用实时统计覆盖**——这是 CQRS 边界的强制约定，注释里明确写道："互动统计可能随后变化，Gateway 必须再用 InteractionRpc.BatchGetVideoStats 覆盖"。
+
+**读侧一致性总结**：
+
+| 场景 | Video 方案表现 |
+|---|---|
+| 视频从未被访问过 | Pipeline 两个 GET 都 `redis.Nil`，视为 miss、回源 DB、Lua CAS 写入 v=0 快照 |
+| 缓存命中、无并发写 | 一次 RTT 返回 |
+| 缓存命中、期间发生并发写 | `cached.Version` 与新 version 不一致 → 强制回源；**但本次请求已读到的旧值可能已返回给客户端**（毫秒窗口） |
+| 回源期间发生并发删除 | Lua CAS `current != ARGV[1]` → 放弃写入，避免旧快照覆盖新版本 |
+| Redis 全挂 | `cacheAvailable=false` → 全部 miss、走一次 DB IN 查询、跳过回填 |
+| 视频不存在 / 已下架 | 负缓存 `{Missing:true}` 30s，防穿透 |
+
+#### 8.2.6 Video / Account 读写路径统一视角：读侧永不写脏数据 + 短暂脏窗口 + TTL 兜底
+
+前面 8.1.3 和 8.2.5 分别铺开了 `BatchGetProfiles` 和 `BatchGetVideos` 的实现细节，两套方案落地形态迥异——**Account 用"多版本 Key 短暂共存 + 两段 Pipeline 二次校验"**、**Video 用"单版本 Key 覆盖 + Lua CAS 原子回写"**。表面上看差别巨大、写侧逻辑一简一繁、读侧 RTT 一少一多、Key 数量一多一少，但**从"一致性契约"的角度看它们共享同一条不变式**——这是理解整个项目缓存架构的核心。
+
+**共享不变式：读侧永不写脏数据（Read Never Persists Stale）**
+
+无论 Account 走的是"多版本 Key + Pipeline 双读版本对比"，还是 Video 走的"单版本 Key + Lua 内原子比对当前版本"，两条读路径的**唯一写动作都是回填缓存**（`cachePublicProfileMisses` / `cacheVideoEntityMisses`），并且在真正 `SET` 之前**都要再确认一次'我刚才从 DB 读到的这份数据、对应的版本号至今没被 INCR 过'**——只要发现版本号已经漂移就**立刻放弃写入**、把这一次的 DB 数据用完就丢、绝不把可能已经过期的快照写回 Redis 污染后续读者。
+
+这条不变式是"读侧安全"的**最本质保证**——任何时候只要写侧执行了 `INCR version`，之前所有正在回源途中的读侧回填动作**都会自动作废**，等下一次读请求用新版本号自然重新回源。**"写侧只往前走（版本号单调递增）、读侧永远追赶（拿到旧版本号写不进新槽位）"** 就是版本化缓存能提供强一致性的底层机制。
+
+**两套方案对同一不变式的两种实现**：
+
+| 维度 | Account 的实现 | Video 的实现 |
+|---|---|---|
+| 读侧 CAS 校验发生在哪里 | **Go 代码层**：`cachePublicProfileMisses` 里显式再 `GET version` 与 `expectedVersion` 比较，Go 代码判断相等才 `SET`；判断和 SET 之间**再加一次 WATCH/MULTI 事务**才能保原子（当前实现用的是"再 GET 一次"的乐观判断） | **Redis Lua 层**：`setVideoEntityCacheIfMatch` 把 `GET version → 比较 → SET entity` **打包成一条 Lua 脚本**在 Redis 单线程内原子执行，从判断到写入无任何间隙可被抢占 |
+| 数据 Key 命名 | `profile:{uid}:v:{n}` —— **版本号编入 Key 名**、不同版本是完全独立的 Redis Key、彼此不覆盖 | `entity:{vid}` —— **版本号编入 JSON 值内**（`{version:5, ...}`）、所有版本共用同一个 Key、新版本直接覆盖旧版本 |
+| 读到旧数据的判定手段 | 读侧拿到实体后**再读一次 version**、与之前拿到的 `expectedVersion` 比较不等即视为 miss | 读侧一次 Pipeline 同时拿实体和 version、比较**实体 JSON 内嵌 version** 与 **version key 当前值**是否相等 |
+| 旧版本 Key 清理方式 | **没人主动清理**——`profile:100:v:5` 被 `v:6` 取代后无人再访问、**靠 TTL（15min ± 抖动）自然淘汰** | **写侧主动 `DEL`**——`invalidateVideoEntityCache` 在 `INCR version` 的同一个 `TxPipeline` 里 `DEL entity`、旧数据立刻消失 |
+| 读侧回填是否可能"晚到" | 可能。读侧 A 从 DB 拿到 v=5 快照、期间写侧 INCR 到 6，A 想写 `profile:v:5` 时二次校验发现 version 已经是 6 → 放弃写入。**新的 v=6 槽位由 A 之后的读请求补上** | 可能。读侧 A 从 DB 拿到 v=5 快照、期间写侧 INCR 到 6 + DEL entity，A 想 SET entity 时 Lua 里 `current=6 ≠ ARGV[1]=5` → 放弃写入。**新的 entity 快照由 A 之后的读请求补上** |
+| 短暂"脏窗口"发生在哪 | 读侧从 Pipeline#1 拿到 version=5、到 Pipeline#2 拿到实体 & 二次 version 之间的**几毫秒**——但这个窗口被 Pipeline#2 里"二次读 version"直接兜住、发现不等就视为 miss、**不会真的返回脏数据** | 读侧从 `GET entity` 到 `GET version` 之间的**几微秒**——由于命令顺序是"**先实体后版本**"、任何在中间发生的 `INCR + DEL` 都会让"实体 JSON 里的 version" 小于 "version key"、被识破为不一致、也**不会真的返回脏数据** |
+| **真正会返回给客户端的"脏数据"窗口** | **几乎为零**——两次版本校验 + SingleFlight 合并回源，正常情况下每次都能识破并回源到 DB | **一次请求内可能返回"命中缓存但已过时"的旧值 ~10ms**——见下面详细说明 |
+
+**Video 方案的"短暂脏窗口"具体是什么**：
+
+前面 8.2.5 "读侧一致性总结"里有一行 `缓存命中、期间发生并发写 | ... 但本次请求已读到的旧值可能已返回给客户端（毫秒窗口）`——让我们把这个窗口精确说清：
+
+```
+T0: Redis 上 entity_v5 存在，version key = 5
+T1: 读侧 R1 发起 BatchGetVideos → Pipeline: GET entity(=v5 快照), GET version(=5)
+T2: R1 校验：cached.Version=5 == version=5 → 命中 → 返回给客户端 v=5 数据
+T3: 写侧 W1 完成 PublishVideo/DeleteVideo 事务 → invalidateVideoEntityCache:
+    TxPipeline{ INCR version → 6, DEL entity }
+T4: 客户端拿到了 R1 返回的 v=5 数据（此时 Redis 已经是 version=6 + entity 空）
+```
+
+**T1~T3 之间那份被 R1 返回的 v=5 数据，站在 T4 客户端视角看确实是"脏的"（它没反映最新写入）**——这就是 Video 方案的"短暂脏窗口"。**Account 方案则不会出现这种情况**、因为它每次读都要"两段 Pipeline"、第二段 Pipeline 里的二次 version 读取会兜住这个窗口。
+
+**关键澄清——这个"脏窗口"是最终一致性、不是不一致**：
+
+- 窗口的**大小取决于写侧 `INCR + DEL` 相对读侧 Pipeline 完成时刻的先后**——通常只有几毫秒到几十毫秒；
+- 窗口关闭后（下一次读请求）：R2 发起 Pipeline → `GET entity` 拿到 nil（因为被 DEL 了）→ 视为 miss → 走 SingleFlight 回源 DB → Lua CAS 写入 v=6 快照 → 后续所有读都拿到最新数据；
+- **绝不会出现"客户端切到另一个接口拿到更旧数据"的场景**——因为 Video 服务内所有点位（`GetVideo`、`BatchGetVideos`、`ListUserVideos`）都读同一份 `entity:{vid}` 缓存、拿到的 view 是全局单调递进的；
+- Feed / 视频卡片场景**天然容忍毫秒级最终一致**——用户不会敏感到"我发布的视频要立刻在别人的 Feed 上出现"这种秒级实时性。
+
+**Account 方案为什么能做到"几乎零脏窗口"？** 因为它多花了一次 RTT——Pipeline#2 里"再读一次 version"就是专门为这个窗口设置的兜底。**代价**是每次读多一次 Pipeline（多几百微秒）、多存 N 份旧版本 Key（每份几百字节）。**收益**是即使在极端并发下也几乎不会返回旧数据。**这是 Account 场景（用户资料修改后要立刻看到）的一致性需求所决定的。**
+
+**Video 方案为什么可以接受这个脏窗口？** 因为如果也要做"两段 Pipeline"、每个 batch 100 条视频就要多一次 100 条实体的读取 + 一次 100 条 version 的校验读取——**读放大代价太大**、而 Feed 场景本来就是"最终一致优先"、几毫秒延迟无感知。所以 Video 选择"单次 Pipeline + 内嵌版本比对 + Lua CAS 回填"——**接受几毫秒脏窗口换取一半的 Redis RTT 和 10 倍以下的存储开销**。
+
+**发布视频 / 删除视频的写侧动作：INCR + DEL 一体化**
+
+这个"短暂脏窗口"的核心触发者、也是 Video 缓存写路径的**唯一入口**，就是 [`invalidateVideoEntityCache`](d:\feedsystem-zero-main-git\apps\video\internal\logic\videohelper.go)（`videohelper.go:160`）——**发布视频**（`PublishVideoLogic:257,293`）和**删除视频**（`DeleteVideoLogic:175`）都**必须、只在 MySQL 事务提交成功之后**调用它。
+
+```go
+func invalidateVideoEntityCache(ctx context.Context, redisCli *redis.Client, videoID uint64) error {
+    pipe := redisCli.TxPipeline()                                  // ← MULTI/EXEC 原子块
+    pipe.Incr(ctx, rediskey.VideoEntityVersionKey(videoID))        // ① 版本号 +1
+    pipe.Del(
+        ctx,
+        rediskey.VideoEntityKey(videoID),                          // ② 实体缓存清空
+        rediskey.VideoDetailKey(videoID),                          // ③ 详情快照清空
+        rediskey.VideoStatsCacheKey(videoID),                      // ④ 统计快照清空
+    )
+    _, err := pipe.Exec(ctx)
+    return err
+}
+```
+
+**这个函数的 4 条命令必须放在同一个 `TxPipeline`（Redis MULTI/EXEC 事务）里执行**、原因是：
+
+- **只 INCR 不 DEL**：新读请求会先拿到 version=6、再 `GET entity` 拿到的仍是 v=5 的旧 JSON、发现 `cached.Version=5 ≠ 6` → 视为 miss、走回源——正确性没问题、**但** 读者会白白多一次 miss 判断（本来通过 DEL 可以让下一次读直接 nil、更快识别）；
+- **只 DEL 不 INCR**：`entity` 被删空、下一次读会 miss 走回源、走 Lua CAS 写入——**但** Lua CAS 里比较的是 `current == expectedVersion`、如果 version 没 INCR、任何回源途中的读者写回的都是"合法版本" → **完全无法防御"并发删除期间的旧快照回填"**；
+- **INCR 和 DEL 之间被切断**：若 INCR 完瞬间 Redis 挂了 DEL 没执行，下次读拿到旧 `entity`（version=5）+ 新 version=6 → `cached.Version=5 ≠ 6` → 视为 miss → 回源 → 正确性还是没问题（**这就是"INCR 是主一致性保障、DEL 只是清理加速"的深层原因**）。
+
+**发布/删除视频两个调用点的时序**（皆遵循"先写 DB 再作废缓存"的经典模式）：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as 客户端 / RPC 调用方
+    participant V as Video RPC Logic<br/>(PublishVideoLogic / DeleteVideoLogic)
+    participant DB as MySQL
+    participant R as Redis
+    participant R2 as 后续读侧 goroutine
+
+    C->>V: PublishVideo / DeleteVideo
+    V->>DB: BEGIN → 状态变更（INSERT / UPDATE videos + tags + outbox）→ COMMIT
+    Note over V,DB: 事务成功提交才继续<br/>失败则直接返回错误、不触发缓存作废
+    V->>R: invalidateVideoEntityCache:<br/>TxPipeline{ INCR version, DEL entity/detail/stats }
+    Note over R: version: 5 → 6<br/>entity/detail/stats 三把 key 被清空
+    Note over V,R: 【失败静默】所有调用点都是<br/>if err != nil { l.Errorf(...) }<br/>只记日志、不重试、不阻塞客户端响应
+    V-->>C: 返回成功
+    Note over R2: 稍后...
+    R2->>R: Pipeline: GET entity(=nil), GET version(=6)
+    R2->>DB: SingleFlight 合并回源 → SELECT videos WHERE id IN ...
+    R2->>R: Lua CAS: current==6 ? SET entity{version:6,...} : skip
+```
+
+**"失败静默"设计的三重兜底**：
+
+`PublishVideoLogic:257,293` 和 `DeleteVideoLogic:175` 都是同一种写法——`if err := invalidateVideoEntityCache(...); err != nil { l.Errorf(...) }`——**只打日志、不返回错误给客户端**。这在别处看起来像是"偷懒"、但在这里是**刻意的架构设计**、因为缓存作废失败不影响正确性：
+
+| 兜底层 | 保护什么 | 具体机制 |
+|---|---|---|
+| **① 版本号本身是幂等的** | 即使这次 `INCR` 失败、下一次任何写操作（发布/删除/关注/取关）成功执行 `INCR` 都能修复 —— 版本号只单调递增、不需要精确对应每个业务事件 | Redis `INCR` 命令语义天然幂等（对不存在的 key = 从 0 递增到 1） |
+| **② 缓存 TTL 到期自然一致** | 即使 `INCR + DEL` 完全失败、Redis 里留着旧 `entity`（v=5）+ 旧 version（=5）——**最坏后果只是持续读到 v=5 直到 TTL 过期**（`VideoEntityCacheTTL=10min + videoID%300s` 抖动） | `entity` key 有 10min ± 5min TTL、`Missing` 有 30s TTL |
+| **③ Redis 全挂时降级** | 若 Redis 直接不可用、读侧的 `redisCli.Ping` 会失败、`cacheAvailable=false`——**所有读请求跳过缓存直接查 MySQL**、写侧的 `INCR + DEL` 无处可写但也不影响 DB 主流程 | `loadVideoEntitiesFromCache` 开头就检查 `cacheAvailable`、`cacheVideoEntityMisses` 里所有 Redis 错误只记日志 |
+
+**这就是版本化缓存"轻量、鲁棒、自愈"的关键——把缓存视为"可以随时全丢"的加速层、任何单点失败都能通过 TTL 或下次写入自愈。**
+
+**统一视角：一句话总结**
+
+**Account 和 Video 两个模块用完全不同的落地形态实现了完全相同的一致性契约**：
+
+- **相同点**：① 读侧永不写脏数据（回填前二次校验版本、不匹配即放弃写入）；② 版本号只由写侧 `INCR` 单调递增（读侧永远只 GET）；③ 发布/删除类事件在 MySQL 事务提交后作废对应缓存；④ 短暂窗口内可能读到过时数据、但绝不会读到"版本不一致的混合数据"；⑤ Redis 全挂时统一走 DB 降级、TTL 到期自然一致；⑥ 缓存作废失败仅记日志不重试、依靠版本号幂等和 TTL 兜底自愈。
+- **不同点**：Account 侧重**读多写极少**（用户资料几周才改一次）+ 对一致性要求较高（改完立刻可见），所以选**多版本 Key 短暂共存 + 两段 Pipeline 二次校验**——用旧 Key 的临时内存和一次多余 Pipeline 换严格一致；Video 侧重**读多写较多**（点赞/评论/发布/删除都要 bump version）+ 允许毫秒最终一致，所以选**单版本 Key 覆盖 + Lua CAS 原子回写**——用写侧 Lua 复杂度和一次可能的脏窗口换低内存和一半的读侧 RTT。**没有优劣，只是场景匹配。**
+
+**这两套方案共同构成了 [[memory:9l16e7mx]] 项目"版本号 + 惰性重算方案 B"的完整实践模板**——后续任何需要"高读并发、允许最终一致"的模块（如 `notification` 未读数走的也是这条路）都可以按需选择"Account 型"或"Video 型"的落地形态、无需重新设计一致性协议。
+
 ---
 
 ### 8.3 Interaction 互动模块
