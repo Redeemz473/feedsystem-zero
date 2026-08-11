@@ -537,6 +537,63 @@ sequenceDiagram
 
 如果**没有**这道校验：读侧会把 A 写到 `profile:100:v:5`；下一次读版本还是 6，去读 `profile:v:6` 是 miss 无害；**但** 如果在两次 `INCR` 之间读侧又读到 5 并回填 A，就可能污染刚被激活的 v:5 槽位——所以这一层 CAS 是必需的。
 
+**读侧回填了什么？—— 只写实体 Key、绝不写 version Key**：
+
+这是整个方案里最容易被忽视但**极其关键**的分工约定。看 `cachePublicProfileMisses` 里唯一的 SET 命令：
+
+```go
+cachePipe.Set(l.ctx,
+    rediskey.AccountPublicProfileKey(userID, expectedVersion), // ← 只写实体 Key: profile:{uid}:v:{n}
+    data, ttl)
+// 全函数中对 AccountPublicProfileVersionKey 只有 GET、没有任何 SET/INCR
+```
+
+全项目对 `AccountPublicProfileVersionKey` 的操作只有 **4 处 GET + 1 处 INCR**：
+
+| 位置 | 操作 | 归属 |
+|---|---|---|
+| `batchgetprofileslogic.go:178`（Pipeline#1 拿版本） | GET | 读侧 |
+| `batchgetprofileslogic.go:209`（Pipeline#2 二次校验） | GET | 读侧 |
+| `batchgetprofileslogic.go:287`（回填前三次校验） | GET | 读侧 |
+| `updateprofilelogic.go:98`（资料更新后 bump） | **INCR** | **写侧独占** |
+| `social_sync` job / social 关注取关（follower_count 变化后 bump） | **INCR** | **写侧独占** |
+
+**核心不变式：version Key 的写入权由写侧独占、读侧永远只 GET 不写**。这是 [[memory:9l16e7mx]] 版本号+惰性重算方案 B 的底层保障。
+
+**为什么读侧绝对不能回填 version Key？** 一个反例说明——假设允许读侧在 `GET version` 得到 `redis.Nil` 时 `SETNX version=0`：
+
+```
+T0: 用户 100 从未被更新过 → version key 不存在
+T1: 写侧 UpdateProfile → INCR version → 变成 1
+    Redis: version=1, profile:100:v:1={真实资料 A}
+T2: version key 因 Redis 内存压力被 evict
+    Redis: version 消失，profile:100:v:1={A} 还在
+T3: 【假想的错误读侧】GET version → nil → SETNX version=0
+    Redis: version=0 ← 错误地"回退"了！
+T4: 后续写侧 UpdateProfile → INCR version 从 0 → 1、2、3...
+    某一刻 version 又回到 1 时
+T5: 读侧拿 expectedVersion=1、命中 profile:100:v:1={A}
+    ⚠️ 返回的其实是 T1 时代的古老快照、被误判为当前版本 → 脏数据
+```
+
+**根因**：`INCR` 的语义是"当前值 +1"，一旦读侧把 version 误设为一个较小值，后续写侧 INCR 会**重演历史值序列**——旧的多版本 Key 里的历史快照会被误判为"当前版本快照"。**只有让 version Key 全时间轴单调递增（永远只由写侧 INCR、读侧永远只 GET、不存在时兜底为 0）**，才能保证"版本号 == 数据时代"这条不变式。
+
+**读侧敢回填实体 Key、不敢回填 version Key 的物理基础**：
+
+实体 Key 之所以能安全地由读侧回填、正是因为它的名字里**已经嵌入了版本号**（`profile:{uid}:v:{n}`）——读侧写进去的 `v:5` 快照**只会被"手里也拿着 expectedVersion=5"的读者读到**、后续任何拿到 `v:6/v:7` 的读者根本不会去访问 `v:5`、那个孤立的旧 Key 只会被 TTL（15min ± 抖动）自然淘汰——**多版本 Key 短暂共存**在物理层面把"读侧回填"隔离到了对当前版本无害的独立槽位。
+
+**当 version Key 不存在时怎么办？** `publicProfileVersionResult` 的兜底：
+
+```go
+if errors.Is(err, redis.Nil) {
+    return 0, nil                        // 从未被更新过 or version 被 evict → 都兜底为 0
+}
+```
+
+把"从未被更新过的用户"和"version Key 丢失的用户"统一走 `expectedVersion=0` 分支——**读侧不介入 version 的写入**、等下一次任何 `UpdateProfile` 的 `INCR` 从 0 → 1 自然重建 version Key。**读侧唯一的责任是识别版本、不承担维护版本的责任**。
+
+（对比看 Video 方案：写侧对 version Key 也是**INCR 独占**、Lua CAS 脚本里对 version Key 也只有 `GET` 没有 `SET/INCR`——**这条"version Key 写侧独占"的铁律两边完全一致**，详见 8.2.5。）
+
 **与 Video `BatchGetVideos` 的对比总览**：
 
 | 维度 | Account `BatchGetProfiles` | Video `BatchGetVideos` |
@@ -1612,6 +1669,43 @@ return 1
 - **防"回源期间被删除"竞态**：T1 读缓存 miss、拿 DB 快照（版本 v=5）；T2 并发删除视频、`INCR Version → 6`；T1 若直接 `SET` 会把已删除视频的旧快照写回。用 Lua 原子比对——`current=6 ≠ ARGV[1]=5` → 放弃写入。
 - **KEYS[1]** 是 version key、**KEYS[2]** 是 entity key（**两个 key 同一 Redis 槽位**才能保证 Lua 原子性——通过 hashtag 一致性设计天然满足）。
 - **注释里明确写道**："Lua 在写缓存时原子比较版本，防止并发删除后旧数据库快照重新写回缓存"。
+
+**读侧回填了什么？—— 只写实体 Key、version Key 依然由写侧独占**：
+
+虽然 Video 方案表面上比 Account 复杂得多（多了 Lua 脚本、多了 CAS），但**"version Key 写侧独占、读侧永远只 GET 不写"这条铁律和 Account 完全一致**——这一点从 Lua 脚本本身就能看出来：
+
+```lua
+local current = redis.call("GET", KEYS[1])   -- KEYS[1] = VideoEntityVersionKey：只 GET
+if not current then current = "0" end
+if current ~= ARGV[1] then
+    return 0
+end
+redis.call("SET", KEYS[2], ARGV[2], "PX", ARGV[3])   -- KEYS[2] = VideoEntityKey：只 SET 实体
+return 1
+```
+
+全项目对 `VideoEntityVersionKey` 的操作只有 **2 处 GET + 1 处 INCR**：
+
+| 位置 | 操作 | 归属 |
+|---|---|---|
+| `batchgetvideoslogic.go:150`（Pipeline 拿版本） | GET | 读侧 |
+| `batchgetvideoslogic.go:276`（Lua CAS 内 `redis.call("GET", KEYS[1])`） | GET | 读侧（在 Lua 里） |
+| `videohelper.go:162`（`invalidateVideoEntityCache` 的 `pipe.Incr`） | **INCR** | **写侧独占**（PublishVideo / DeleteVideo） |
+
+**核心不变式：version Key 的写入权由写侧独占、读侧永远只 GET 不写**——和 Account 的分工约定完全一致（见 8.1.3 的推导反例）。**任何一边一旦允许读侧回填 version Key、就会破坏单调递增不变式、导致后续 INCR 重演历史值、旧实体缓存被误判为当前版本、造成永久性脏数据**。
+
+**Video 与 Account 的真正差异不在"是否回填 version"、而在"回填实体时如何记住这是哪个版本的快照"**：
+
+| 载体 | Account（多版本 Key） | Video（单版本 Key） |
+|---|---|---|
+| 版本数值存在哪里 | **写死在实体 Key 的名字里**（`profile:{uid}:v:5`） | **内嵌在实体 JSON 的 `Version` 字段里**（`entity:{vid}` 内容为 `{"version":5,...}`） |
+| 不同版本的物理位置 | Redis 里是**独立的 Key**、天然物理隔离 | Redis 里是**同一个 Key**、后写覆盖先写 |
+| 回填时如何防止并发覆盖 | 只需回填前再 GET version 比对（一次网络往返即可）——即使发生极窄窗口的"比对通过后并发 INCR"、旧快照写到旧 Key 名、后续读者根本碰不到 | **必须用 Lua 脚本让 `GET version + 比较 + SET entity` 原子执行**——因为写到同一物理位置、必须靠 Redis 服务端原子性防止"版本变了但旧快照仍被写入" |
+| 旧版本快照的命运 | 无人访问、TTL 到期自然淘汰 | 立刻被新写入覆盖 or 被写侧 `DEL` 显式删除 |
+
+**一句话**：**version Key 两边都不让读侧写、都由写侧独占 INCR**；实体 Key 两边都由读侧回填、但因为 Video 用单 Key 让所有版本挤在同一物理位置、必须额外加 Lua CAS 保护、Account 用多 Key 天然物理隔离、简单 SET 即可。**Lua CAS 保护的是"实体写入"、不是"version 写入"**——不要把 Lua 脚本理解成"Video 的读侧在写 version"。
+
+**当 version Key 不存在时怎么办？** Lua 里 `if not current then current = "0" end` 的兜底把 nil 视为 0——和 Account 的 `redis.Nil → return 0` 完全对称。**读侧唯一的责任仍然是识别版本、不承担维护版本的责任**——等下一次任何 `PublishVideo` / `DeleteVideo` 的 `INCR` 从 0 → 1 自然重建 version Key。
 
 **写侧 `invalidateVideoEntityCache`（`videohelper.go:160`）**：
 
