@@ -110,7 +110,7 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 
 	// Redis 命中 liked=false 或 Redis/MySQL 都未点赞时，继续执行点赞。
 	// fallbackLikesCount 仅在 Redis 权威写入失败时作兼容作为展示值：基于当前权威值预估一个"+1"后的合理数。
-	fallbackLikesCount := nonNegative(realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video) + 1)
+	fallbackLikesCount := nonNegative(realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video) + 1) //作为一个保护，防止redis挂了但是mysql写入了的一个保护
 
 	//创建点赞事件并封装
 	eventID, err := newEventID("like")

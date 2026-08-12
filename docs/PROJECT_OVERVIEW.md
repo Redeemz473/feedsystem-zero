@@ -1956,7 +1956,8 @@ sequenceDiagram
 likes_count = HGET fsz:video:stats:auth:{video_id} likes_count
               ├─ 命中：直接返回 Redis 权威值
               └─ 未命中（冷启动）：读 MySQL videos.likes_count 作为基准值，
-                 通过 Lua HSetNX + EXPIRE 原子建立 Hash，然后返回
+                 通过 Lua 脚本原子执行 `EXISTS==0 → HSET 冷备值 → EXPIRE 7d → HMGET`，
+                 然后返回读取到的三元组
 ```
 
 写路径同理：`LikeVideoLogic` / `UnlikeVideoLogic` / `PublishComment` / `DeleteComment` 都通过同一段 Lua 脚本 `bumpVideoStatsAuthScript` 原子完成"若 Hash 不存在则用 DB 冷备值冷启动 → HINCRBY 叠加增量 → EXPIRE 续期"，并直接把 Lua 返回的新值作为响应交给客户端。
@@ -2008,6 +2009,167 @@ likes_count = HGET fsz:video:stats:auth:{video_id} likes_count
 
 1. 版本化缓存的核心不变式"读侧永不写脏数据 + 短暂脏窗口 + TTL 兜底"依然成立（见 §8.2.6），Account/Video 实体缓存仍走这条路——只是统计字段不再套用这套。
 2. 旧 pending/ack 双标记里的"pending 是在线路径留下的凭证，没凭证不能减 delta"是**任何"写回缓存"架构都必须遵守的对账原则**。方案 B 之所以能拆掉它，是因为它根本不做"减回"这个动作——Redis 直接是权威源、只往前叠加、无回头路。
+
+#### 8.3.0-bis 点赞完整流程 · Lua 脚本的必要性 · 权威 Hash 的 TTL 语义
+
+这一节把"用户点一次赞"的服务端全链路 + 两段核心 Lua 脚本 + 权威 Hash 的过期机制讲透，作为 §8.3.0 架构演进的补充。
+
+##### 一、点赞的完整服务端流程（LikeVideo RPC）
+
+代码位置：`apps/interaction/internal/logic/likevideologic.go`。
+
+1. **参数校验与视频存在性检查**：`user_id`、`video_id` 均不能为 0；从 MySQL 读取 `videos` 记录（`status=1 AND deleted_at IS NULL`），顺便拿到 `LikesCount / CommentsCount / Popularity` 三个冷备字段作为 Lua 冷启动的种子。
+2. **点击级短锁**：`SETNX fsz:like:action:lock:{video_id}:{user_id} = 随机 token EX 3s`。防止用户短时间内连点或客户端重试导致的重复写入。锁释放走 `if get==token then del` 的 Lua 兜底，避免误删别人的锁。
+3. **点赞状态预判（幂等）**：
+   - 先查 Redis `LikeStateKey`：命中 `1` → 直接返回"已点赞"（幂等），本次操作不落库；
+   - Redis miss → 兜底查 MySQL `likes` 表，若有 `status=1` 记录也直接返回"已点赞"，并顺手把状态回填 Redis；
+   - 只有"Redis 与 MySQL 都确认未点赞"时，才继续执行真正的写入。
+4. **提前算好 `fallbackLikesCount = realtimeLikesCount + 1`**：在事务开始前用当前 Redis 权威值 +1 记住一个"预估返回值"，作为下一步 Redis 权威写入失败时的接口降级值（保证 proto 契约始终返回一个合理的正数，不因 Redis 抖动返回 0 或报错）。
+5. **MySQL 事务（一次 COMMIT 完成 4 件事）**：
+   - `INSERT likes ON DUPLICATE KEY UPDATE status=1, deleted_at=NULL`：写点赞关系；
+   - `INSERT interaction_events`：事件溯源留痕；
+   - `INSERT outbox_events(topic=interaction.like.events)`：供 outbox dispatcher 投递 Kafka；
+   - 若点赞对象不是自己，再 `INSERT outbox_events(topic=notification.events)`：驱动通知模块。
+   - 4 张表一个事务，MySQL 层保证"要么全成、要么全败"，杜绝"点赞关系已经存在但事件没发出"这种半状态。
+6. **Redis 权威写入（Lua `bumpVideoStatsAuthScript`）**：事务提交成功后调用 `applyRedisLikeState`：
+   - Lua 原子执行"若权威 Hash 不存在则用 DB 冷备值建立基准 → `HINCRBY likes_count +1` → `HINCRBY popularity +likeWeight` → `HINCRBY comments_count +0` → `EXPIRE 7d`"；
+   - 同一个 pipeline 内再更新：`LikeStateKey=1`、`LikeVideoUsersKey` SAdd、`LikeUserVideosKey` SAdd、`HotVideoRealtimeKey` ZIncrBy（热榜）、`LikeUserVideosListVersionKey` INCR（"我点赞的视频"列表失效）。
+7. **响应组装**：
+   - Lua 成功 → `likes_count = Lua 返回的权威新值` 直接返回给前端；
+   - Lua 失败 → 使用第 4 步预算好的 `fallbackLikesCount` 返回，MySQL 已提交 + Kafka 事件会保证最终一致；
+   - 无论走哪条路径，接口对前端的语义都是"点赞成功 + 一个合理的 likes_count"。
+8. **异步链路（不影响读侧）**：outbox_events 被 outbox dispatcher 扫出投递到 Kafka `interaction.like.events`；`interaction_sync` job 消费后按 500 条一个批次 flush 到 MySQL `videos` 冷备字段。**Redis 权威 Hash 不再被 job 回写**，job 的唯一职责是把冷备落地。
+
+> 关键取舍：Step 4 的 `fallbackLikesCount` 只保护"接口契约"这一层——即便 Redis 短暂不可用，接口也不会返回 0 或错误。用户真实看到的数字则由前端乐观 UI 单独兜底（详见 §14.7）。两层保护相互独立。
+
+##### 二、为什么必须用 Lua 脚本？——防竞态的底层原因
+
+点赞路径涉及两段核心 Lua 脚本，全部位于 `apps/interaction/internal/logic/interactionhelper.go`：
+
+**写侧 `bumpVideoStatsAuthScript`**（点赞/取消赞/发/删评论共用）：
+
+```lua
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    redis.call("HSET", KEYS[1],
+        "likes_count", ARGV[1],
+        "comments_count", ARGV[2],
+        "popularity", ARGV[3])
+end
+local likes    = redis.call("HINCRBY", KEYS[1], "likes_count", ARGV[4])
+local comments = redis.call("HINCRBY", KEYS[1], "comments_count", ARGV[5])
+local pop      = redis.call("HINCRBY", KEYS[1], "popularity", ARGV[6])
+redis.call("EXPIRE", KEYS[1], ARGV[7])
+return {likes, comments, pop}
+```
+
+**读侧 `readVideoStatsAuthScript`**（冷启动兜底）：
+
+```lua
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    redis.call("HSET", KEYS[1],
+        "likes_count", ARGV[1],
+        "comments_count", ARGV[2],
+        "popularity", ARGV[3])
+    redis.call("EXPIRE", KEYS[1], ARGV[4])
+end
+return redis.call("HMGET", KEYS[1], "likes_count", "comments_count", "popularity")
+```
+
+**为什么必须封装成 Lua、而不是在 Go 代码里分几次调用 Redis？** Lua 脚本在 Redis 里是**单线程原子执行**的——一段脚本从开始到 `return` 期间，Redis 不会插入执行任何其他命令。这一属性精确解决了以下三种若拆成多命令必然出现的竞态：
+
+1. **冷启动竞态（多个协程同时给同一个视频初始化基准值）**
+
+   假设 Go 侧拆成 `EXISTS → HSET 基准 → HINCRBY`：
+   ```
+   线程 A（第一个点赞）              线程 B（第二个点赞）
+   EXISTS=0（Hash 不存在）
+                                     EXISTS=0（也认为不存在）
+   HSET likes=100                    HSET likes=100（覆盖了 A 的初始化）
+   HINCRBY +1 → 101                  HINCRBY +1 → 102 ❌ 本该是 102 没错，但是……
+   ```
+   看起来正确，但更糟的场景是：
+   ```
+   线程 A：EXISTS=0 → HSET likes=100 → HINCRBY +1 → 101
+   线程 B：EXISTS=1（已经存在）→ HINCRBY +1 → 102 ✓
+
+   线程 A：EXISTS=0
+                                     线程 B：EXISTS=0
+                                     HSET likes=100
+                                     HINCRBY +1 → 101
+   HSET likes=100 ❌ 把 B 的 101 冲回 100
+   HINCRBY +1 → 101 ❌ 最终结果 101，本该 102，丢了 B 的增量
+   ```
+   用 Lua 把"EXISTS + HSET + HINCRBY"锁在一个原子块里，就杜绝了后一种情况。
+
+2. **读写混合竞态（读侧冷启动 vs 写侧点赞并发）**
+
+   ```
+   读线程 A（第一次读）              写线程 B（同时点赞）
+   EXISTS=0
+                                     bumpVideoStatsAuth（Lua）：EXISTS=0 → HSET 100 → HINCRBY +1 → 101
+   HSET likes=100 ❌ 把 B 已完成的 101 冲回 100
+   HMGET → 返回 100（漏了 B 的赞）
+   ```
+   把"EXISTS + HSET + HMGET"打包成 Lua，读侧的初始化就不可能穿插进任何写侧命令中间。
+
+3. **多字段一致性竞态（likes_count 与 popularity 必须一起变）**
+
+   点赞同时影响 `likes_count +1` 与 `popularity +likeWeight`（当前 `likeWeight=2`）。如果分成两条 `HINCRBY` 命令发到 Redis，中间可能被其他命令穿插，导致"某一瞬间的 HGETALL 看到 likes 已加、popularity 未加"的不一致中间态。热榜排序恰好依赖 `popularity` 字段，这种中间态会造成排序抖动。Lua 把两个 HINCRBY 一次执行完，从外部观察永远只有"操作前"或"操作后"两种状态。
+
+**为什么不用 MULTI/EXEC 或 WATCH？**
+
+- `MULTI/EXEC` 只提供"命令批量提交"，中间不能读取上一步的结果做条件判断（比如"EXISTS==0 才 HSET"），做不到"检测 + 分支"；
+- `WATCH` 是乐观锁，冲突时要求客户端重试，热门视频高并发下重试次数指数上升，性能反而更差；
+- Lua 是"服务端事务 + 服务端脚本"的组合，一次 RTT 完成"检测 + 分支 + 多命令"，既原子又高效——这是 Redis 官方文档明确推荐的"读改写"模式。
+
+##### 三、权威 Hash 会不会过期？TTL 语义详解
+
+**答：会。`VideoStatsAuthKey` 有一个 7 天的 TTL（`common/rediskey/video.go` 中定义的 `VideoStatsAuthTTL = 7 * 24 * time.Hour`），但设计成"活跃视频自动续期、冷视频自然淘汰"。**
+
+**TTL 触发规则表**：
+
+| 事件 | 对 TTL 的影响 | 说明 |
+|---|---|---|
+| 视频第一次被点赞/评论 | Lua 内 EXISTS=0 → HSET 基准 → `EXPIRE 7d` | 冷启动时初始化 TTL |
+| 视频后续被点赞/取消赞/发/删评论 | Lua 内 `EXPIRE 7d`（无条件重置） | **每次写入都续期**，热门视频永远不过期 |
+| 视频第一次被读（BatchGetVideoStats 命中 miss） | Lua 内 EXISTS=0 → HSET 基准 → `EXPIRE 7d` | 冷启动时初始化 TTL |
+| 视频后续被读（命中 HGETALL） | **不续期**，只 HMGET | 见下方"为什么读不续期" |
+| 视频被 UP 主删除 / 状态改下架 | 视频服务侧 `invalidateVideoEntityCache` 主动 `DEL` 该 key | 立刻清空，避免读到已删除视频的旧统计 |
+| 7 天内既无写入也无 miss 读 | 到期自动淘汰 | 冷门视频自动腾内存 |
+
+**为什么读命中不续期？**
+
+这是**有意为之**的"自动淘汰"策略。如果每次读都 EXPIRE，那所有历史视频只要偶尔被列表刷到就会永久驻留 Redis，冷门视频永远淘汰不掉，Redis 内存会随视频总数线性增长。当前策略下：
+
+- **有互动的活跃视频**：每次点赞/评论续期，只要每周至少一次互动就常驻 Redis；
+- **只被围观的冷门视频**：一旦 7 天内没有任何互动写入，会自动过期；下次再有人访问时走"HGETALL 返回空 → 冷启动 Lua → 从 MySQL 冷备重建"，因为期间没有互动写入，MySQL 冷备值仍是准的，冷启动**完全无损**；
+- **完全没人看的死视频**：过期后不占内存，只在 MySQL 冷备里保留。
+
+**为什么过期不会导致数据丢失？**
+
+`videos` 表里的 `likes_count / comments_count / popularity` 三个字段被降级为**冷备**：`interaction_sync` job 会持续把 Kafka 消费到的增量落地到冷备字段。这三个字段满足两个不变式：
+
+1. **冷备值一定 ≤ Redis 权威值**：因为 job 有 flush 延迟（正常几百毫秒到几秒），Redis 权威值总是"跑在前面"；
+2. **只要一段时间内没有新的互动写入，冷备就会追平权威值**：Kafka 消费完就是等值的了。
+
+所以 Hash 过期时，只要过期发生在"最近一段时间没有互动写入"这个前提下，冷备就是准确值——冷启动重建的 Hash 与过期前完全等价。**唯一需要担心的边界情况**是：Hash 过期的瞬间恰好有一批 Kafka 事件在途（DB 已消费但还没消费到）——这种极小概率窗口下，冷启动的初始值可能比理论真值少几个赞，但下一次点赞的 HINCRBY 会继续在这个略偏低的基线上叠加，Kafka 消费完后差值也不会再拉大；差值本身也在前端"差值 <2 忽略"的容忍范围内，用户完全无感知。
+
+**万一 Redis 整体宕机？**
+
+- 在线读侧：Lua 冷启动路径失败会降级到直接返回 MySQL `videos.likes_count`（`realtimeLikesCount` 的 error 分支），用户看到冷备值，比重启前略低但不会崩；
+- 在线写侧：MySQL 事务已提交、outbox 事件已入表，Redis 写失败时返回 `fallbackLikesCount = 旧权威值 + 1`；Redis 恢复后，下一次读会重新触发冷启动 Lua 从 MySQL 冷备重建 Hash；
+- 异步链路：outbox dispatcher + Kafka + `interaction_sync` job 不依赖 Redis，continues 把 DB 冷备补齐；Redis 恢复后自动收敛。
+
+##### 四、和其它两段热点 Lua 脚本的对比
+
+| Lua 脚本 | 位置 | 保护的竞态 |
+|---|---|---|
+| `bumpVideoStatsAuthScript` | interactionhelper.go | 冷启动 + 多字段 HINCRBY + EXPIRE 续期 |
+| `readVideoStatsAuthScript` | interactionhelper.go | 冷启动 + HMGET 读取（读侧不续期） |
+| `setVideoEntityCacheIfMatch`（§8.2.5） | batchgetvideoslogic.go | GET version + 比较 + SET entity（防旧快照覆盖新版本） |
+| `applyBumpUnreadVersion`（§8.6） | common/notificationcache | 未读数版本号 INCR + TTL 续期 |
+
+**共同点**：全部都是"读一下 → 判断一下 → 写一下"的模式；全部都靠 Redis 单线程原子性来消除并发穿插。**方案 B 架构下，这类原子操作从旧架构的 7 段 Lua 减少到 2 段**（bump/read），复杂度显著下降。
 
 **点赞流程（新架构）**：
 
@@ -3387,6 +3549,100 @@ return &LikeVideoResp{Liked: true, LikesCount: likesCount}
 - 并发多个 `bump` 调用只会串行叠加，永远不会出现"两个线程同时发现 Hash 不存在 → 都用冷备值 HSET → 各覆盖对方"的竞态。
 
 这就是为什么方案 B 能拆掉旧架构的 4 层并发保护而不损失正确性 —— **Redis 单线程 Lua 原子性 + HINCRBY 加法交换律 + Kafka processed_events 幂等**三者足以覆盖所有并发场景。
+
+### 12.7 版本号（Version Key）总览：为什么每个 Key 都需要它
+
+项目里散落着 **9 个 `*VersionKey`**，形态、粒度、失效范围各不相同，但底层解决的都是同一类问题——**"读侧回源写入"与"写侧数据变更"之间的时序竞态**。本节把每个版本号的**存在原因**串起来讲清楚，作为整个项目缓存一致性设计的总索引。
+
+#### 12.7.1 版本号解决的核心问题
+
+不带版本号的经典 `DEL + 回填` 模式存在如下时序竞态：
+
+```
+T0  写线程 W: UPDATE / INSERT / DELETE MySQL 完成
+T1  读线程 R: 缓存 miss，SELECT MySQL → 拿到"W 变更前"的旧数据
+             （原因：主从延迟、事务隔离、慢查询、SELECT 早于 T0 抓到快照）
+T2  写线程 W: DEL cacheKey
+T3  读线程 R: SET cacheKey = 旧数据            ← ❌ 脏缓存永久驻留（直到 TTL）
+```
+
+关键在于 **T3 那个 SET 发生在 T2 之后**——单纯的 `DEL` 挡不住"晚到的回填"。版本号的作用就是让 T3 变成有条件写入：
+
+```
+T0'  W: INCR version → v(n) → v(n+1)
+T1'  R: GET version = v(n) 之前，记住 versionSnapshot = v(n)
+T2'  W: DEL cacheKey（可选，取决于策略）
+T3'  R: Lua CAS: if GET version == v(n) then SET cacheKey ← ❌ v(n) ≠ v(n+1)，写入被拒绝
+```
+
+这就是"**版本号 = 数据时代戳，回填只允许发生在同一时代内**"这条不变量的完整含义。
+
+#### 12.7.2 项目内 9 个版本号一览
+
+| # | Version Key | 粒度 | INCR 触发点 | 保护什么缓存 | 存在原因 |
+|---|---|---|---|---|---|
+| 1 | `fsz:account:profile:{uid}:version` | 单用户 | Account 侧任何 profile 字段更新（`UpdateProfile`）+ 关注/取关时双方 profile 因 follower/following 计数变化而 INCR（social_sync job） | `fsz:account:profile:{uid}:v:{n}` 多版本快照 | 保护 profile 长 TTL 快照。用户改名、改头像、被关注/取关都会改变对外可见字段，必须让所有已缓存客户端立即感知新版本，同时避免"改名瞬间正在回源的读者把旧名字 SET 回缓存"造成脏读 |
+| 2 | `fsz:video:entity:{videoID}:version` | 单视频 | 只在 `PublishVideo`（首次 + 幂等回读）和 `DeleteVideo` 事务成功后由 `invalidateVideoEntityCache` 调用（[videohelper.go:164](d:\feedsystem-zero-main-git\apps\video\internal\logic\videohelper.go)） | `fsz:video:entity:{vid}` 单版本 JSON 快照（含元数据，不含实时计数） | 保护视频元数据快照。**核心场景是删除瞬间**：热门视频删除时可能有数百个并发读者卡在"MySQL 已 DELETE 但 SELECT 还没回来"的窗口，若无版本号 CAS，任何一个失败的 SELECT 都可能把旧数据 SET 回缓存驻留 15 分钟；发布路径的 INCR 是防御性对称设计（为未来加"编辑视频"预留统一入口） |
+| 3 | `fsz:video:comment:list:{videoID}:version` | 单视频 | 评论创建（`CreateComment`）、删除（`DeleteComment`）在事务提交后通过 `bumpCommentListVersionScript` 更新（[interactionhelper.go:138](d:\feedsystem-zero-main-git\apps\interaction\internal\logic\interactionhelper.go)） | 评论首页 ZSet/List 缓存 `fsz:video:comment:list:{vid}:v:{ver}` | 评论列表是**分页缓存**，删除或新增会导致翻页错位。用版本号把整棵旧列表快照作废、下次读侧重建，避免用户遇到"我删除的评论仍显示、下一页却重复"这种视觉错乱 |
+| 4 | `fsz:like:user:videos:list:{userID}:version` | 单用户 | 用户点赞/取消点赞（`LikeVideo` / `UnlikeVideo`）在 Redis pipeline 中一起 INCR（[interactionhelper.go:440,463](d:\feedsystem-zero-main-git\apps\interaction\internal\logic\interactionhelper.go)） | "我点过赞的视频"列表首页缓存（[listmylikedvideoslogic.go:213](d:\feedsystem-zero-main-git\apps\interaction\internal\logic\listmylikedvideoslogic.go)） | 与 CommentListVersion 同理：点赞/取消点赞会改变列表内容和顺序，用户期望"我刚点的赞立刻出现在我的点赞列表"，靠版本号让旧首页快照瞬间失效 |
+| 5 | `fsz:social:followers:list:{userID}:version` | 单用户 | `Follow` / `Unfollow` 事务提交后（[socialhelper.go:480](d:\feedsystem-zero-main-git\apps\social\internal\logic\socialhelper.go)）+ social_sync job 消费 Kafka 时二次 INCR（[syncconsumer.go:395](d:\feedsystem-zero-main-git\apps\job\social_sync\internal\logic\syncconsumer.go)） | 粉丝列表首页缓存 | 粉丝关系变化必须让"我的粉丝列表""TA 的粉丝列表"立即翻新，防止"刚关注了我却看不到"的直觉不符 |
+| 6 | `fsz:social:followings:list:{userID}:version` | 单用户 | 同上 | 关注列表首页缓存 | 同上，对称设计 |
+| 7 | `fsz:feed:timeline:global:version` | 全局 | feed_timeline job 完成一次全量重建（[timelinewriter.go:450](d:\feedsystem-zero-main-git\apps\job\feed_timeline\internal\logic\timelinewriter.go)）后 INCR | 全局热榜/发现流 Timeline ZSet | job 重建 Timeline 是"整块替换"式，需要一个全局版本号让读侧感知"新一轮 Timeline 已上线"、避免在切换瞬间读到半新半旧的混合数据 |
+| 8 | `fsz:feed:timeline:{userID}:version` | 单用户 | 用户 Timeline 冷启动重建完成后 INCR + 定期 EXPIRE 续期 | 用户个人 Timeline ZSet 与快照缓存 | 单用户 Timeline 有"懒重建"逻辑（inbox + 关注的大 V outbox 合并），版本号用来判定"我这次读到的 ZSet 是否属于当前一致性纪元"，冷启动重建期间旧读者不会污染新缓存 |
+| 9 | `fsz:feed:author:outbox:{authorID}:version` | 单作者 | 大 V 发布视频后 feed_timeline job 追加 outbox 时 INCR（[timelinewriter.go:529](d:\feedsystem-zero-main-git\apps\job\feed_timeline\internal\logic\timelinewriter.go)） | 大 V outbox ZSet | 大 V 在"推拉分离"下只写自己的 outbox，粉丝读侧懒加载合并；版本号保证"我拉到的 outbox 内容与当时那次拉取时快照一致"，避免粉丝读到半推半拉的空档 |
+| 10 | `fsz:notification:unread:{userID}:version` | 单用户 | 任何影响未读数的入口（新建通知、标记已读、标记全部已读、删除未读通知）事务提交后通过 `BumpUnreadVersion` INCR（[notificationcache/unread.go](d:\feedsystem-zero-main-git\common\notificationcache\unread.go)） | `fsz:notification:unread:{uid}:v:{n}` 未读数 int 缓存 | 未读数是**极高频读、中低频写**的典型场景，版本号让"写侧只 INCR、读侧发现新版本就 miss 回源 COUNT"，读多写少下几乎所有读都命中缓存；Redis 挂了直接降级 COUNT，无脏数据风险 |
+
+> 注：#5 和 #6 之所以 **INCR 两次**（socialhelper 一次 + social_sync job 一次），是因为在线路径先本地更新缓存并 INCR，Kafka 消费者再兜底 INCR 一次，保证在线 pipeline 失败时列表缓存仍能被作废——是"两次都 INCR"而不是"两次都 SET"，得益于版本号本身是**单调递增**的、多 INCR 一次只是"跳一版"、不会破坏正确性。
+
+#### 12.7.3 两种版本号落地形态
+
+按 Key 命名的不同，可分成两大流派：
+
+**形态 A：多版本 Key（版本号编入 Key 名）**  
+代表：#1 profile、#3 comment list、#4 liked videos list、#5/#6 social lists、#7/#8/#9 feed、#10 notification unread。
+
+- 数据 Key 长这样：`fsz:xxx:{id}:v:{ver}`
+- 不同 version 是完全独立的 Redis Key，彼此不覆盖
+- 写侧只需 `INCR version` + `DEL` 旧版本 Key（可选、由 Lua 顺带清理）
+- 读侧：`GET version → 拼 v:{ver} → GET data`，miss 就回源写入 `v:{ver}` 快照
+- 优点：**读写完全无锁**，旧版本 Key 靠 TTL 自然淘汰
+- 缺点：Redis 会短时存在多份版本（新老版本共存到 TTL 到期）
+
+**形态 B：单版本 Key + JSON 内嵌版本号**  
+代表：#2 video entity。
+
+- 数据 Key 只有一份：`fsz:video:entity:{vid}`
+- JSON 里带 `version` 字段
+- 写侧：`INCR version` + `DEL` 实体 Key（同一 TxPipeline 原子）
+- 读侧：先 `GET version` 记录 `versionSnapshot`，回源后走 Lua CAS：`if GET version == versionSnapshot then SET entity else NOOP`
+- 优点：Redis 内存占用小，永远只有一份数据
+- 缺点：需要 Lua CAS 脚本，回填代码稍复杂
+
+**为什么 profile 用形态 A、video entity 用形态 B？**  
+- profile 的字段数少（`author_username / avatar / bio / follower_count / following_count`），一份 v 快照几百字节，多版本共存到 TTL 不心疼；
+- video entity 单份可能上 KB（含描述、标签、多路 URL），高频发布/删除下多版本共存会显著推高 Redis 内存，选形态 B 更划算。
+
+#### 12.7.4 版本号能否被"其他机制"替代？
+
+| 替代方案 | 缺陷 | 为什么最终没选 |
+|---|---|---|
+| **只 DEL、不做 CAS** | 挡不住"T3 晚到的回填 SET"，脏缓存驻留一个 TTL | 热门数据 TTL 通常 15 分钟，用户体验和排障成本都不可接受 |
+| **短 TTL（10 秒）+ 只 DEL** | 一致性上限就是 TTL，无法做到"改完立即生效" | Feed / 未读数场景要求秒级一致 |
+| **给回填加锁** | 需要引入分布式锁，读路径性能崩溃 | 高读并发场景（Feed / Profile / Video 详情）根本承受不起 |
+| **Kafka 广播失效消息** | 复杂度爆炸，还要考虑消息乱序 | 不划算，况且 Redis 单机场景连消息中间件都没意义 |
+| **数据库触发器** | MySQL 无法感知 Redis 状态，且引入 DB → Redis 依赖倒置 | 违反架构分层 |
+
+**版本号是**"用一个 8 字节 STRING 换全局一致性不变量"**的极简方案，代价小、覆盖广、可推理性强，是当前项目所有缓存架构的公共基石。**
+
+#### 12.7.5 版本号自身的一致性保证
+
+版本号 Key 本身也是 Redis 数据，会不会"版本号丢了导致所有缓存失效判断都乱套"？——不会，靠三条不变量兜底：
+
+1. **写侧独占 INCR，读侧永远只 GET**：这是所有 9 个版本号的铁律，绝无例外。任何一处对 version key 的 SET / DEL 都会破坏单调性、被视为架构 bug。
+2. **兜底为 0**：读侧 GET 时如果 Key 不存在，一律当作 `version = 0`。第一次写侧 INCR 会把它变成 1，后续单调递增。即使 Redis 集群完全 flush，重启后所有 version 都从 0 开始重来，**每个数据 Key 的 v:{ver} 名字也会重新对应新时代，不会与遗留旧快照冲突**（因为旧快照 v:{n} 会被 TTL 自然淘汰或被形态 B 的 DEL 清掉）。
+3. **INCR 本身是幂等的**：即使某次 pipeline 部分失败、多做一次 INCR 只是让版本号多跳一个数，不影响正确性；漏做一次 INCR 会导致短时脏缓存，但下次任何写入的 INCR 都会自然修复。
+
+**这就是为什么 [[memory:9l16e7mx]] 项目里所有"版本号 + 惰性重算方案 B"的模块（profile / video entity / notification unread / feed timeline / social lists）都能安全地使用同一套设计模板——它的正确性不依赖任何单点组件的可靠性、只依赖 Redis INCR 的原子性与单调性。**
 
 ---
 
