@@ -6,7 +6,6 @@ import (
 	"feedsystem-zero/apps/interaction/interaction"
 	"feedsystem-zero/apps/interaction/internal/svc"
 	"feedsystem-zero/common/eventx"
-	"feedsystem-zero/common/rediskey"
 
 	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
@@ -27,8 +26,10 @@ func NewFlushCommentEventsLogic(ctx context.Context, svcCtx *svc.ServiceContext)
 	}
 }
 
-// 给Kafka consumer调用的
-// 在线路径不会更新videos表，事件投递到Kafka后用这个rpc来消费
+// FlushCommentEvents 消费 Kafka 后把评论事件累加到 MySQL videos 冷备字段。
+//
+// 方案 B 架构下 Redis VideoStatsAuthKey 是用户可见值的权威，此 RPC 仅负责冷备维护，
+// 不再申请 mutation lease、不再 ack Redis 增量。processed_events 唯一键保证幂等。
 func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommentEventsReq) (*interaction.FlushCommentEventsResp, error) {
 	events := in.GetEvents()
 	if err := validateInternalEventBatchSize(len(events)); err != nil {
@@ -38,19 +39,9 @@ func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommen
 		return &interaction.FlushCommentEventsResp{}, nil
 	}
 
-	if leaseKey, leaseToken, acquired, err := l.acquireFlushCommentEventsLease(); err != nil {
-		// Redis 不可用时仍可依赖 processed_events 唯一键和 MySQL 原子增量继续收敛。
-		l.Errorf("acquire flush comment events lease failed, fallback to db idempotency, error:%v", err)
-	} else if !acquired {
-		return nil, status.Error(codes.Aborted, "互动统计重建中，请稍后重试")
-	} else {
-		defer l.releaseFlushCommentEventsLease(leaseKey, leaseToken)
-	}
-
 	resp := &interaction.FlushCommentEventsResp{
 		FailedEventIds: make([]string, 0),
 	}
-	acks := make([]interactionDeltaAck, 0, len(events))
 	dbEvents := make([]interactionFlushDBEvent, 0, len(events))
 
 	for index, event := range events {
@@ -62,13 +53,6 @@ func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommen
 		}
 
 		dbEvents = append(dbEvents, interactionFlushDBEvent{EventID: eventID, VideoID: event.GetVideoId(), Delta: delta})
-		// 重复事件仍要执行 Redis ack，修复“DB 已提交但 Redis 扣减失败”的中断窗口。
-		acks = append(acks, interactionDeltaAck{
-			EventID:         eventID,
-			VideoID:         event.GetVideoId(),
-			Delta:           delta,
-			InvalidationKey: rediskey.CommentListVersionKey(event.GetVideoId()),
-		})
 	}
 
 	if err := applyInteractionFlushBatch(
@@ -79,10 +63,10 @@ func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommen
 		eventx.TopicInteractionCommentEvents,
 	); err != nil {
 		l.Errorf("flush comment event batch failed, size:%d error:%v", len(dbEvents), err)
-		return nil, status.Error(codes.Internal, "批量刷新评论统计失败")
+		return nil, status.Error(codes.Internal, "批量刷新评论冷备失败")
 	}
 
-	l.ackCommentEventDeltas(resp, acks)
+	resp.SuccessCount = int64(len(dbEvents))
 	return resp, nil
 }
 
@@ -110,38 +94,5 @@ func validateCommentFlushEvent(event *interaction.CommentEvent, index int) (stri
 		return eventID, videoStatDelta{CommentDelta: -1, PopularityDelta: -commentPopularityWeight}, nil
 	default:
 		return eventID, videoStatDelta{}, status.Error(codes.InvalidArgument, "未知评论事件类型")
-	}
-}
-
-func (l *FlushCommentEventsLogic) ackCommentEventDeltas(resp *interaction.FlushCommentEventsResp, acks []interactionDeltaAck) {
-	if len(acks) == 0 {
-		return
-	}
-
-	redisCtx, cancel := context.WithTimeout(l.ctx, interactionDeltaAckTimeout)
-	defer cancel()
-
-	failed := acknowledgeInteractionDeltas(redisCtx, l.svcCtx.RedisCli, acks)
-	for _, ack := range acks {
-		if err, ok := failed[ack.EventID]; ok {
-			resp.FailedEventIds = append(resp.FailedEventIds, ack.EventID)
-			l.Errorf("ack redis comment delta failed, event_id:%s video_id:%d error:%v", ack.EventID, ack.VideoID, err)
-			continue
-		}
-		resp.SuccessCount++
-	}
-}
-
-func (l *FlushCommentEventsLogic) acquireFlushCommentEventsLease() (string, string, bool, error) {
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	defer cancel()
-	return acquireInteractionStatsMutationLease(redisCtx, l.svcCtx.RedisCli)
-}
-
-func (l *FlushCommentEventsLogic) releaseFlushCommentEventsLease(leaseKey string, leaseToken string) {
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	defer cancel()
-	if err := releaseInteractionStatsMutationLease(redisCtx, l.svcCtx.RedisCli, leaseKey, leaseToken); err != nil {
-		l.Errorf("release flush comment events lease failed, key:%s error:%v", leaseKey, err)
 	}
 }

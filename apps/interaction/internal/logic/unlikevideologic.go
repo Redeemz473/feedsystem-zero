@@ -55,19 +55,6 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 		return nil, status.Error(codes.Internal, "查询视频失败")
 	}
 
-	leaseKey, leaseToken, leaseAcquired, err := acquireInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli)
-	if err != nil {
-		l.Errorf("acquire interaction mutation lease failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
-	} else if !leaseAcquired {
-		return nil, status.Error(codes.Aborted, "互动统计重建中，请稍后重试")
-	} else {
-		defer func() {
-			if err := releaseInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli, leaseKey, leaseToken); err != nil {
-				l.Errorf("release interaction mutation lease failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
-			}
-		}()
-	}
-
 	// 2. 使用 rediskey.LikeActionLockKey(video_id,user_id) 加短 TTL 锁，和 LikeVideo 共用同一把锁。
 	lockKey := rediskey.LikeActionLockKey(videoID, userID)
 	lockToken, err := randomHex(16)
@@ -246,12 +233,11 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 		return nil, status.Error(codes.Internal, "取消点赞失败")
 	}
 
-	// 6. MySQL 已经成功后，再更新 Redis 实时状态和计数。若失败，核心 MySQL 状态已经成功，仍返回本次操作后的合理计数。
-	likesCount := fallbackLikesCount
-	if err := applyRedisUnlikeState(l.ctx, l.svcCtx.RedisCli, eventID, videoID, userID); err != nil {
+	// 6. MySQL 已经成功后，再更新 Redis 权威计数和实时状态。若写入失败，用 fallback 预估值。
+	likesCount, err := applyRedisUnlikeState(l.ctx, l.svcCtx.RedisCli, videoID, userID, video)
+	if err != nil {
 		l.Errorf("apply redis unlike state failed after mysql committed, video_id: %d, user_id: %d, fallback_likes_count: %d, error: %v", videoID, userID, fallbackLikesCount, err)
-	} else {
-		likesCount = realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video)
+		likesCount = fallbackLikesCount
 	}
 
 	return &interaction.UnlikeVideoResp{

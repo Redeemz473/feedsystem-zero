@@ -34,7 +34,7 @@ func NewLikeVideoLogic(ctx context.Context, svcCtx *svc.ServiceContext) *LikeVid
 }
 
 func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.LikeVideoResp, error) {
-	// 1. 校验 user_id、video_id 都不能为 0；确认视频存在且未删除。
+	// 校验 user_id、video_id 都不能为 0；确认视频存在且未删除。
 	userID := in.GetUserId()
 	if userID == 0 {
 		return nil, status.Error(codes.Unauthenticated, "用户未登录")
@@ -55,20 +55,7 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 		return nil, status.Error(codes.Internal, "查询视频失败")
 	}
 
-	leaseKey, leaseToken, leaseAcquired, err := acquireInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli)
-	if err != nil {
-		l.Errorf("acquire interaction mutation lease failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
-	} else if !leaseAcquired {
-		return nil, status.Error(codes.Aborted, "互动统计重建中，请稍后重试")
-	} else {
-		defer func() {
-			if err := releaseInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli, leaseKey, leaseToken); err != nil {
-				l.Errorf("release interaction mutation lease failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
-			}
-		}()
-	}
-
-	// 2. 使用 rediskey.LikeActionLockKey(video_id,user_id) 加短 TTL 锁，避免用户连续点击导致并发写状态。
+	// 使用 rediskey.LikeActionLockKey(video_id,user_id) 加短 TTL 锁，避免用户连续点击导致并发写状态。
 	lockKey := rediskey.LikeActionLockKey(videoID, userID)
 	lockToken, err := randomHex(16)
 	if err != nil {
@@ -87,7 +74,7 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 		}
 	}()
 
-	// 3. 先查 Redis LikeStateKey：
+	// 先查 Redis LikeStateKey：
 	liked, hit, err := loadLikeStateFromRedis(l.ctx, l.svcCtx.RedisCli, videoID, userID)
 	if err != nil {
 		l.Errorf("get like state from redis failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
@@ -122,6 +109,7 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 	}
 
 	// Redis 命中 liked=false 或 Redis/MySQL 都未点赞时，继续执行点赞。
+	// fallbackLikesCount 仅在 Redis 权威写入失败时作兼容作为展示值：基于当前权威值预估一个"+1"后的合理数。
 	fallbackLikesCount := nonNegative(realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video) + 1)
 
 	//创建点赞事件并封装
@@ -182,7 +170,7 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 		}
 	}
 
-	// 4. MySQL 事务：点赞关系、互动事件、领域 outbox 与通知 outbox 必须一起提交。
+	//MySQL 事务：点赞关系、互动事件、领域 outbox 与通知 outbox 必须一起提交。
 	//开启事务
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
 		like := model.Like{
@@ -242,12 +230,12 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 		return nil, status.Error(codes.Internal, "点赞失败")
 	}
 
-	// 5. 更新 Redis 实时状态和计数。若失败，核心 MySQL 状态已经成功，仍返回本次操作后的合理计数。
-	likesCount := fallbackLikesCount
-	if err := applyRedisLikeState(l.ctx, l.svcCtx.RedisCli, eventID, videoID, userID); err != nil {
+	// 更新 Redis 权威计数和实时状态。若写入成功，直接返回权威值；
+	// 若权威 Hash 写入失败，MySQL 已提交 + Kafka 事件将保证终一致，直接返回预估值。
+	likesCount, err := applyRedisLikeState(l.ctx, l.svcCtx.RedisCli, videoID, userID, video)
+	if err != nil {
 		l.Errorf("apply redis like state failed after mysql committed, video_id: %d, user_id: %d, fallback_likes_count: %d, error: %v", videoID, userID, fallbackLikesCount, err)
-	} else {
-		likesCount = realtimeLikesCount(l.ctx, l.svcCtx.RedisCli, video)
+		likesCount = fallbackLikesCount
 	}
 
 	return &interaction.LikeVideoResp{

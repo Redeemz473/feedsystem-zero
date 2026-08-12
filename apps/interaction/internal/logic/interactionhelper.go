@@ -21,9 +21,15 @@ const (
 	likeActionLockTTL       = 3 * time.Second
 	likeStateTTL            = 7 * 24 * time.Hour
 	commentIdempotencyTTL   = 24 * time.Hour
-	interactionDeltaTTL     = time.Duration(eventx.DefaultProcessedEventTTLDays) * 24 * time.Hour
 	likePopularityWeight    = eventx.LikePopularityWeight
 	commentPopularityWeight = eventx.CommentPopularityWeight
+)
+
+// authStatsFields 是 VideoStatsAuthKey Hash 里的三个统计字段。
+const (
+	authFieldLikes      = "likes_count"
+	authFieldComments   = "comments_count"
+	authFieldPopularity = "popularity"
 )
 
 func randomHex(n int) (string, error) {
@@ -257,7 +263,7 @@ func fillLikedState(ctx context.Context, redisCli *redis.Client, videoID uint64,
 	return err
 }
 
-// fillUnlikedState 把“未点赞”状态回填到 Redis，避免短时间内反复查 MySQL。
+// fillUnlikedState 把"未点赞"状态回填到 Redis，避免短时间内反复查 MySQL。
 func fillUnlikedState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64) error {
 	pipe := redisCli.TxPipeline()
 	pipe.SRem(ctx, rediskey.LikeVideoUsersKey(videoID), strconv.FormatUint(userID, 10))
@@ -267,161 +273,261 @@ func fillUnlikedState(ctx context.Context, redisCli *redis.Client, videoID uint6
 	return err
 }
 
-const applyInteractionDeltaScript = `
-if redis.call("EXISTS", KEYS[2]) == 1 then
-	return 0
+// bumpVideoStatsAuthScript 是权威计数写入的核心 Lua 脚本。
+//
+// 输入：
+//
+//	KEYS[1] = VideoStatsAuthKey(videoID)
+//	ARGV[1] = base_likes（DB 冷备 likes_count，用于冷启动）
+//	ARGV[2] = base_comments
+//	ARGV[3] = base_popularity
+//	ARGV[4] = like_delta（本次操作对 likes_count 的增量）
+//	ARGV[5] = comment_delta
+//	ARGV[6] = popularity_delta
+//	ARGV[7] = ttl_seconds
+//
+// 输出：{likes_count, comments_count, popularity}（本次操作后的权威值）
+//
+// 语义：
+//  1. 若 auth key 不存在，先用 base_* 建立基准值（冷启动，不使用 HSetNX 单字段避免"部分字段存在"问题）。
+//  2. 在基准上原子叠加本次的 delta 并 EXPIRE 续期。
+//  3. 冷启动与叠加放在同一次 Eval 里，避免"两个并发线程都发现 EXISTS=0 → 各自 HSet 覆盖对方"造成的
+//     "基准值丢增量"竞态。策略 X：不做严格单调，用户可见值允许短暂 -1/+1 抖动，由前端乐观 UI 掩盖。
+const bumpVideoStatsAuthScript = `
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	redis.call("HSET", KEYS[1],
+		"likes_count", ARGV[1],
+		"comments_count", ARGV[2],
+		"popularity", ARGV[3])
 end
-local inserted = redis.call("SET", KEYS[1], "1", "NX", "EX", ARGV[5])
-if not inserted then
-	return 0
-end
-if ARGV[2] ~= "0" then
-	redis.call("HINCRBY", KEYS[3], ARGV[1], ARGV[2])
-end
-if ARGV[3] ~= "0" then
-	redis.call("HINCRBY", KEYS[4], ARGV[1], ARGV[3])
-end
-if ARGV[4] ~= "0" then
-	redis.call("HINCRBY", KEYS[5], ARGV[1], ARGV[4])
-end
-redis.call("INCR", KEYS[6])
-redis.call("EXPIRE", KEYS[6], ARGV[5])
-redis.call("DEL", KEYS[7])
-return 1
+local likes = redis.call("HINCRBY", KEYS[1], "likes_count", ARGV[4])
+local comments = redis.call("HINCRBY", KEYS[1], "comments_count", ARGV[5])
+local pop = redis.call("HINCRBY", KEYS[1], "popularity", ARGV[6])
+redis.call("EXPIRE", KEYS[1], ARGV[7])
+return {likes, comments, pop}
 `
 
-// applyInteractionDelta 按 event_id 原子写入尚未落库的实时增量。
-// pending/acked 两个标记让在线请求与 Kafka consumer 无论谁先执行都不会重复计数。
-func applyInteractionDelta(ctx context.Context, redisCli *redis.Client, eventID string, videoID uint64, delta videoStatDelta) error {
-	field := redisHashField(videoID)
-	return redisCli.Eval(
+// videoStatsAuthResult 是 bumpVideoStatsAuthScript 的返回值封装。
+type videoStatsAuthResult struct {
+	LikesCount    int64
+	CommentsCount int64
+	Popularity    int64
+}
+
+// bumpVideoStatsAuth 原子地叠加 Redis 权威 Hash，并返回本次操作后的权威值。
+// baseStats 是 DB 冷备值，只有 auth key 不存在时才使用；一旦 key 已存在，冷备值将被忽略。
+func bumpVideoStatsAuth(
+	ctx context.Context,
+	redisCli *redis.Client,
+	videoID uint64,
+	baseStats videoStatsAuthResult,
+	delta videoStatDelta,
+) (videoStatsAuthResult, error) {
+	values, err := redisCli.Eval(
 		ctx,
-		applyInteractionDeltaScript,
-		[]string{
-			rediskey.InteractionDeltaPendingKey(eventID),
-			rediskey.InteractionDeltaAckKey(eventID),
-			rediskey.VideoLikeDeltaKey(),
-			rediskey.VideoCommentDeltaKey(),
-			rediskey.VideoPopularityDeltaKey(),
-			rediskey.InteractionDeltaPendingCountKey(videoID),
-			rediskey.VideoStatsCacheKey(videoID),
-		},
-		field,
+		bumpVideoStatsAuthScript,
+		[]string{rediskey.VideoStatsAuthKey(videoID)},
+		strconv.FormatInt(baseStats.LikesCount, 10),
+		strconv.FormatInt(baseStats.CommentsCount, 10),
+		strconv.FormatInt(baseStats.Popularity, 10),
 		strconv.FormatInt(delta.LikeDelta, 10),
 		strconv.FormatInt(delta.CommentDelta, 10),
 		strconv.FormatInt(delta.PopularityDelta, 10),
-		strconv.FormatInt(int64(interactionDeltaTTL/time.Second), 10),
-	).Err()
-}
-
-// applyRedisLikeState 写点赞后的 Redis 实时状态和增量计数。
-func applyRedisLikeState(ctx context.Context, redisCli *redis.Client, eventID string, videoID uint64, userID uint64) error {
-	field := redisHashField(videoID)
-	if err := applyInteractionDelta(ctx, redisCli, eventID, videoID, videoStatDelta{
-		LikeDelta:       1,
-		PopularityDelta: likePopularityWeight,
-	}); err != nil {
-		return err
+		strconv.FormatInt(int64(rediskey.VideoStatsAuthTTL/time.Second), 10),
+	).Slice()
+	if err != nil {
+		return videoStatsAuthResult{}, err
 	}
 
+	return parseVideoStatsAuthResult(values), nil
+}
+
+// parseVideoStatsAuthResult 解析 Lua 返回的 {likes, comments, popularity} 数组。
+// Redis Lua 数字返回值在 go-redis 中可能是 int64 或 string，两种情况都需要兼容。
+func parseVideoStatsAuthResult(values []any) videoStatsAuthResult {
+	getAt := func(i int) int64 {
+		if i < 0 || i >= len(values) {
+			return 0
+		}
+		switch v := values[i].(type) {
+		case int64:
+			return v
+		case int:
+			return int64(v)
+		case string:
+			n, _ := strconv.ParseInt(v, 10, 64)
+			return n
+		default:
+			return 0
+		}
+	}
+	return videoStatsAuthResult{
+		LikesCount:    getAt(0),
+		CommentsCount: getAt(1),
+		Popularity:    getAt(2),
+	}
+}
+
+// readVideoStatsAuthScript 从权威 Hash 读取，不存在时用 DB 冷备值原子建立基准并 EXPIRE 续期。
+//
+// 输入：
+//
+//	KEYS[1] = VideoStatsAuthKey(videoID)
+//	ARGV[1..3] = base_likes/comments/popularity（冷启动初始值，来自 MySQL videos 冷备）
+//	ARGV[4]   = ttl_seconds
+//
+// 输出：{likes_count, comments_count, popularity}
+const readVideoStatsAuthScript = `
+if redis.call("EXISTS", KEYS[1]) == 0 then
+	redis.call("HSET", KEYS[1],
+		"likes_count", ARGV[1],
+		"comments_count", ARGV[2],
+		"popularity", ARGV[3])
+	redis.call("EXPIRE", KEYS[1], ARGV[4])
+end
+return redis.call("HMGET", KEYS[1], "likes_count", "comments_count", "popularity")
+`
+
+// readVideoStatsAuthWithBase 读权威 Hash，miss 时用 DB 冷备做冷启动。
+func readVideoStatsAuthWithBase(
+	ctx context.Context,
+	redisCli *redis.Client,
+	videoID uint64,
+	baseStats videoStatsAuthResult,
+) (videoStatsAuthResult, error) {
+	values, err := redisCli.Eval(
+		ctx,
+		readVideoStatsAuthScript,
+		[]string{rediskey.VideoStatsAuthKey(videoID)},
+		strconv.FormatInt(baseStats.LikesCount, 10),
+		strconv.FormatInt(baseStats.CommentsCount, 10),
+		strconv.FormatInt(baseStats.Popularity, 10),
+		strconv.FormatInt(int64(rediskey.VideoStatsAuthTTL/time.Second), 10),
+	).Slice()
+	if err != nil {
+		return videoStatsAuthResult{}, err
+	}
+
+	return parseVideoStatsAuthResult(values), nil
+}
+
+// videoBaseStatsFromDB 把 model.Video 冷备字段转换为 Redis 冷启动基准。
+func videoBaseStatsFromDB(video model.Video) videoStatsAuthResult {
+	return videoStatsAuthResult{
+		LikesCount:    nonNegative(video.LikesCount),
+		CommentsCount: nonNegative(video.CommentsCount),
+		Popularity:    nonNegative(video.Popularity),
+	}
+}
+
+// applyRedisLikeState 写点赞后的 Redis 实时状态，同时用 Lua 原子叠加权威 Hash。
+// 返回值是操作后 Redis 权威点赞数（用户可见值）。
+func applyRedisLikeState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64, video model.Video) (int64, error) {
+	authStats, err := bumpVideoStatsAuth(ctx, redisCli, videoID, videoBaseStatsFromDB(video), videoStatDelta{
+		LikeDelta:       1,
+		PopularityDelta: likePopularityWeight,
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	field := redisHashField(videoID)
 	pipe := redisCli.TxPipeline()
 	pipe.SAdd(ctx, rediskey.LikeVideoUsersKey(videoID), strconv.FormatUint(userID, 10))
 	pipe.SAdd(ctx, rediskey.LikeUserVideosKey(userID), strconv.FormatUint(videoID, 10))
 	pipe.Set(ctx, rediskey.LikeStateKey(videoID, userID), "1", likeStateTTL)
 	pipe.ZIncrBy(ctx, rediskey.HotVideoRealtimeKey(), float64(likePopularityWeight), field)
 	pipe.Incr(ctx, rediskey.LikeUserVideosListVersionKey(userID))
-	_, err := pipe.Exec(ctx)
-	return err
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nonNegative(authStats.LikesCount), err
+	}
+	return nonNegative(authStats.LikesCount), nil
 }
 
-// applyRedisUnlikeState 写取消点赞后的 Redis 实时状态和增量计数。
-func applyRedisUnlikeState(ctx context.Context, redisCli *redis.Client, eventID string, videoID uint64, userID uint64) error {
-	field := redisHashField(videoID)
-	if err := applyInteractionDelta(ctx, redisCli, eventID, videoID, videoStatDelta{
+// applyRedisUnlikeState 写取消点赞后的 Redis 实时状态，同时用 Lua 原子扣减权威 Hash。
+func applyRedisUnlikeState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64, video model.Video) (int64, error) {
+	authStats, err := bumpVideoStatsAuth(ctx, redisCli, videoID, videoBaseStatsFromDB(video), videoStatDelta{
 		LikeDelta:       -1,
 		PopularityDelta: -likePopularityWeight,
-	}); err != nil {
-		return err
+	})
+	if err != nil {
+		return 0, err
 	}
 
+	field := redisHashField(videoID)
 	pipe := redisCli.TxPipeline()
 	pipe.SRem(ctx, rediskey.LikeVideoUsersKey(videoID), strconv.FormatUint(userID, 10))
 	pipe.SRem(ctx, rediskey.LikeUserVideosKey(userID), strconv.FormatUint(videoID, 10))
 	pipe.Set(ctx, rediskey.LikeStateKey(videoID, userID), "0", likeStateTTL)
 	pipe.ZIncrBy(ctx, rediskey.HotVideoRealtimeKey(), -float64(likePopularityWeight), field)
 	pipe.Incr(ctx, rediskey.LikeUserVideosListVersionKey(userID))
-	_, err := pipe.Exec(ctx)
-	return err
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nonNegative(authStats.LikesCount), err
+	}
+	return nonNegative(authStats.LikesCount), nil
 }
 
-// realtimeLikesCount 返回 MySQL 基准点赞数 + Redis 尚未刷库的增量。
+// realtimeLikesCount 返回 Redis 权威点赞数；权威 Hash miss 时用 DB 冷备做冷启动。
 func realtimeLikesCount(ctx context.Context, redisCli *redis.Client, video model.Video) int64 {
-	delta, err := redisCli.HGet(ctx, rediskey.VideoLikeDeltaKey(), redisHashField(video.ID)).Int64()
-	if err != nil && !errors.Is(err, redis.Nil) {
+	authStats, err := readVideoStatsAuthWithBase(ctx, redisCli, video.ID, videoBaseStatsFromDB(video))
+	if err != nil {
 		return nonNegative(video.LikesCount)
 	}
-	return nonNegative(video.LikesCount + delta)
+	return nonNegative(authStats.LikesCount)
 }
 
-// applyRedisCommentCreatedState 写评论发布后的 Redis 实时状态和增量计数，并返回最新评论数 delta。
-func applyRedisCommentCreatedState(ctx context.Context, redisCli *redis.Client, eventID string, videoID uint64, userID uint64, commentID uint64, requestID string) (int64, error) {
-	field := redisHashField(videoID)
-	if err := applyInteractionDelta(ctx, redisCli, eventID, videoID, videoStatDelta{
+// applyRedisCommentCreatedState 写评论发布后的 Redis 实时状态，同时用 Lua 原子叠加权威 Hash。
+// 返回操作后 Redis 权威评论数（用户可见值）。
+func applyRedisCommentCreatedState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64, commentID uint64, requestID string, video model.Video) (int64, error) {
+	authStats, err := bumpVideoStatsAuth(ctx, redisCli, videoID, videoBaseStatsFromDB(video), videoStatDelta{
 		CommentDelta:    1,
 		PopularityDelta: commentPopularityWeight,
-	}); err != nil {
+	})
+	if err != nil {
 		return 0, err
 	}
 
+	field := redisHashField(videoID)
 	pipe := redisCli.TxPipeline()
 	queueBumpCommentListVersion(ctx, pipe, videoID)
-	commentDeltaCmd := pipe.HGet(ctx, rediskey.VideoCommentDeltaKey(), field)
 	pipe.ZIncrBy(ctx, rediskey.HotVideoRealtimeKey(), float64(commentPopularityWeight), field)
 	if requestID != "" {
 		pipe.Set(ctx, rediskey.CommentIdempotencyKey(userID, requestID), strconv.FormatUint(commentID, 10), commentIdempotencyTTL)
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		return 0, err
+		return nonNegative(authStats.CommentsCount), err
 	}
-	commentDelta, err := commentDeltaCmd.Int64()
-	if errors.Is(err, redis.Nil) {
-		return 0, nil
-	}
-	return commentDelta, err
+	return nonNegative(authStats.CommentsCount), nil
 }
 
-// applyRedisCommentDeletedState 写评论删除后的 Redis 实时状态和增量计数，并返回最新评论数 delta。
-func applyRedisCommentDeletedState(ctx context.Context, redisCli *redis.Client, eventID string, videoID uint64, userID uint64, commentID uint64, requestID string) (int64, error) {
-	field := redisHashField(videoID)
-	if err := applyInteractionDelta(ctx, redisCli, eventID, videoID, videoStatDelta{
+// applyRedisCommentDeletedState 写评论删除后的 Redis 实时状态，同时用 Lua 原子扣减权威 Hash。
+func applyRedisCommentDeletedState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64, requestID string, video model.Video) (int64, error) {
+	authStats, err := bumpVideoStatsAuth(ctx, redisCli, videoID, videoBaseStatsFromDB(video), videoStatDelta{
 		CommentDelta:    -1,
 		PopularityDelta: -commentPopularityWeight,
-	}); err != nil {
+	})
+	if err != nil {
 		return 0, err
 	}
 
+	field := redisHashField(videoID)
 	pipe := redisCli.TxPipeline()
 	queueBumpCommentListVersion(ctx, pipe, videoID)
-	commentDeltaCmd := pipe.HGet(ctx, rediskey.VideoCommentDeltaKey(), field)
 	pipe.ZIncrBy(ctx, rediskey.HotVideoRealtimeKey(), -float64(commentPopularityWeight), field)
 	if requestID != "" {
 		pipe.Del(ctx, rediskey.CommentIdempotencyKey(userID, requestID))
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
-		return 0, err
+		return nonNegative(authStats.CommentsCount), err
 	}
-	commentDelta, err := commentDeltaCmd.Int64()
-	if errors.Is(err, redis.Nil) {
-		return 0, nil
-	}
-	return commentDelta, err
+	return nonNegative(authStats.CommentsCount), nil
 }
 
-// realtimeCommentsCount 返回 MySQL 基准评论数 + Redis 尚未刷库的增量。
+// realtimeCommentsCount 返回 Redis 权威评论数；权威 Hash miss 时用 DB 冷备做冷启动。
 func realtimeCommentsCount(ctx context.Context, redisCli *redis.Client, video model.Video) int64 {
-	delta, err := redisCli.HGet(ctx, rediskey.VideoCommentDeltaKey(), redisHashField(video.ID)).Int64()
-	if err != nil && !errors.Is(err, redis.Nil) {
+	authStats, err := readVideoStatsAuthWithBase(ctx, redisCli, video.ID, videoBaseStatsFromDB(video))
+	if err != nil {
 		return nonNegative(video.CommentsCount)
 	}
-	return nonNegative(video.CommentsCount + delta)
+	return nonNegative(authStats.CommentsCount)
 }

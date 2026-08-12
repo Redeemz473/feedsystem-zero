@@ -5,10 +5,10 @@ import { toast } from "sonner";
 import { ArrowLeft, Heart, MessageCircle, Trash2 } from "lucide-react";
 
 import { getVideo, deleteVideo } from "@/api/video";
-import { likeVideo, unlikeVideo } from "@/api/interaction";
 import { isFollowing as apiIsFollowing } from "@/api/social";
 import { extractErrMsg } from "@/api/request";
 import { useCurrentUser } from "@/hooks/useCurrentUser";
+import { useOptimisticLike } from "@/hooks/useOptimisticLike";
 import UserAvatar from "@/components/UserAvatar";
 import FollowButton from "@/components/FollowButton";
 import CommentSection from "@/components/CommentSection";
@@ -40,18 +40,23 @@ export default function VideoDetailPage() {
   const following =
     followingLocal ?? Boolean(followingQuery.data?.following);
 
-  const [likedLocal, setLikedLocal] = useState<boolean | null>(null);
-  const [likesLocal, setLikesLocal] = useState<number | null>(null);
-  const isLikedFinal = likedLocal ?? (video?.is_liked ?? false);
-  const likesFinal = likesLocal ?? (video?.likes_count ?? 0);
-
-  const likeMutation = useMutation({
-    mutationFn: async () => (isLikedFinal ? unlikeVideo(videoID) : likeVideo(videoID)),
-    onSuccess: (data) => {
-      setLikedLocal(data.liked);
-      setLikesLocal(data.likes_count);
+  // Optimistic like: click updates UI immediately, backend value only kicks
+  // in when drift is large enough for the user to notice inconsistency.
+  const {
+    liked: isLikedFinal,
+    likesCount: likesFinal,
+    pending: likePending,
+    toggle: toggleLike,
+  } = useOptimisticLike({
+    videoID,
+    initialLiked: video?.is_liked ?? false,
+    initialCount: video?.likes_count ?? 0,
+    loggedIn: Boolean(me),
+    onSuccess: () => {
+      // Refresh the personal liked-videos list on the profile page so it
+      // reflects the new like/unlike next time the user opens it.
+      qc.invalidateQueries({ queryKey: ["my-liked-videos"] });
     },
-    onError: (err) => toast.error(extractErrMsg(err, "操作失败")),
   });
 
   const deleteMutation = useMutation({
@@ -168,14 +173,8 @@ export default function VideoDetailPage() {
       {/* 互动栏 */}
       <div className="mt-4 flex items-center gap-4">
         <button
-          onClick={() => {
-            if (!me) {
-              toast.info("请先登录");
-              return;
-            }
-            likeMutation.mutate();
-          }}
-          disabled={likeMutation.isPending}
+          onClick={toggleLike}
+          disabled={likePending}
           className="inline-flex items-center gap-1 text-sm text-gray-700 hover:text-red-500 disabled:opacity-60"
         >
           <Heart

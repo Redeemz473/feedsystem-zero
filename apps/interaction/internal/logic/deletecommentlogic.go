@@ -60,19 +60,6 @@ func (l *DeleteCommentLogic) DeleteComment(in *interaction.DeleteCommentReq) (*i
 		}, nil
 	}
 
-	leaseKey, leaseToken, leaseAcquired, err := acquireInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli)
-	if err != nil {
-		l.Errorf("acquire interaction mutation lease failed, comment_id: %d, user_id: %d, error: %v", commentID, userID, err)
-	} else if !leaseAcquired {
-		return nil, status.Error(codes.Aborted, "互动统计重建中，请稍后重试")
-	} else {
-		defer func() {
-			if err := releaseInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli, leaseKey, leaseToken); err != nil {
-				l.Errorf("release interaction mutation lease failed, comment_id: %d, user_id: %d, error: %v", commentID, userID, err)
-			}
-		}()
-	}
-
 	eventID, err := newEventID("deleteComment")
 	if err != nil {
 		return nil, status.Error(codes.Internal, "生成事件ID失败")
@@ -197,12 +184,12 @@ func (l *DeleteCommentLogic) DeleteComment(in *interaction.DeleteCommentReq) (*i
 
 	commentsCount := nonNegative(video.CommentsCount - 1)
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	commentDelta, err := applyRedisCommentDeletedState(redisCtx, l.svcCtx.RedisCli, eventID, video.ID, userID, comment.ID, comment.RequestID)
+	authCommentsCount, err := applyRedisCommentDeletedState(redisCtx, l.svcCtx.RedisCli, video.ID, userID, comment.RequestID, video)
 	cancel()
 	if err != nil {
 		l.Errorf("apply redis comment deleted state failed, video_id: %d, user_id: %d, comment_id: %d, error: %v", video.ID, userID, comment.ID, err)
 	} else {
-		commentsCount = nonNegative(video.CommentsCount + commentDelta)
+		commentsCount = authCommentsCount
 	}
 
 	return &interaction.DeleteCommentResp{

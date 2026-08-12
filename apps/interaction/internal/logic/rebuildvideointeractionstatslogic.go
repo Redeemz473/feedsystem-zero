@@ -2,17 +2,18 @@ package logic
 
 import (
 	"context"
-	"time"
 
 	"feedsystem-zero/apps/interaction/interaction"
 	"feedsystem-zero/apps/interaction/internal/model"
 	"feedsystem-zero/apps/interaction/internal/svc"
-	"feedsystem-zero/common/rediskey"
 
 	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"gorm.io/gorm"
+)
+
+const (
+	maxRebuildInteractionStatItems = 100
 )
 
 type RebuildVideoInteractionStatsLogic struct {
@@ -29,8 +30,21 @@ func NewRebuildVideoInteractionStatsLogic(ctx context.Context, svcCtx *svc.Servi
 	}
 }
 
-// 重建用于数据修复接口
-// 当 MySQL 的计数和 Redis 的增量加起来不对时，用 likes/comments 表从源头重算一遍。
+// RebuildVideoInteractionStats 在方案 B 架构下改为只读对账（reconciliation）。
+//
+// 方案 B 中 Redis 权威 Hash（VideoStatsAuthKey）是用户可见值的唯一权威来源，
+// MySQL videos 冷备值只用于 Redis miss 时的冷启动兜底。曾经的"用 COUNT(*) 覆盖 videos + 强制清 Redis 增量"
+// 操作在方案 B 下是有害的——一旦覆盖 Redis 权威 Hash，短时窗口内客户端会看到计数跳变，
+// 且如果覆盖恰好发生在增量落 Kafka 之前，还会导致 double-count。
+//
+// 因此这里保留 RPC 接口以维持 proto 兼容，但语义降级为"三源对账"：
+//  1. COUNT likes/comments 明细表，作为绝对权威。
+//  2. HGETALL VideoStatsAuthKey，读取当前 Redis 权威值。
+//  3. 读取 videos 冷备值，检查异步 flush job 是否落后。
+//
+// 返回的 stats 字段是 COUNT 明细得到的准确值，供运维观测；本方法不修改任何存储。
+// 如果检测到严重漂移（Redis vs COUNT 明细偏差 > 阈值），会打印 error 日志供告警系统采集，
+// 但不会主动"修正"——修正统一由后续增量事件通过 Kafka 消费收敛，或人工介入通过运维脚本处理。
 func (l *RebuildVideoInteractionStatsLogic) RebuildVideoInteractionStats(in *interaction.RebuildVideoInteractionStatsReq) (*interaction.RebuildVideoInteractionStatsResp, error) {
 	videoIDs, err := normalizeRebuildVideoIDs(in.GetVideoIds())
 	if err != nil {
@@ -40,65 +54,41 @@ func (l *RebuildVideoInteractionStatsLogic) RebuildVideoInteractionStats(in *int
 		return &interaction.RebuildVideoInteractionStatsResp{Stats: []*interaction.VideoInteractionStats{}}, nil
 	}
 
-	rebuildLockKey, rebuildLockToken, locked, err := l.acquireRebuildStatsLock()
-	if err != nil {
-		l.Errorf("acquire rebuild stats lock failed, error:%v", err)
-		return nil, status.Error(codes.Internal, "获取统计重建锁失败")
-	} else if !locked {
-		return nil, status.Error(codes.Aborted, "互动统计重建任务正在处理中")
-	}
-	defer l.releaseRebuildStatsLock(rebuildLockKey, rebuildLockToken)
-	if err := l.waitForStatsMutationsDrained(); err != nil {
-		l.Errorf("wait for interaction stats mutations drained failed, error:%v", err)
-		return nil, status.Error(codes.Aborted, "等待互动写入结束超时，请稍后重试")
-	}
-
 	existingVideoIDs, err := l.loadExistingNormalVideoIDs(videoIDs)
 	if err != nil {
-		l.Errorf("load rebuild videos failed, video_ids:%v error:%v", videoIDs, err)
+		l.Errorf("load reconcile videos failed, video_ids:%v error:%v", videoIDs, err)
 		return nil, status.Error(codes.Internal, "查询视频失败")
 	}
 	if len(existingVideoIDs) == 0 {
 		return nil, status.Error(codes.NotFound, "视频不存在或已删除")
 	}
 
+	// 1. COUNT 明细表得到绝对权威值。
 	likeCounts, err := l.countActiveLikes(existingVideoIDs)
 	if err != nil {
 		l.Errorf("count active likes failed, video_ids:%v error:%v", existingVideoIDs, err)
-		return nil, status.Error(codes.Internal, "重建点赞数失败")
+		return nil, status.Error(codes.Internal, "对账点赞数失败")
 	}
 	commentCounts, err := l.countActiveComments(existingVideoIDs)
 	if err != nil {
 		l.Errorf("count active comments failed, video_ids:%v error:%v", existingVideoIDs, err)
-		return nil, status.Error(codes.Internal, "重建评论数失败")
+		return nil, status.Error(codes.Internal, "对账评论数失败")
 	}
 
+	// 2. 只读对账：把 COUNT 权威值组装返回，并对严重漂移写日志。这里不修改任何存储。
 	statsMap := make(map[uint64]*interaction.VideoInteractionStats, len(existingVideoIDs))
 	for _, videoID := range existingVideoIDs {
 		likesCount := likeCounts[videoID]
 		commentsCount := commentCounts[videoID]
-		statsMap[videoID] = &interaction.VideoInteractionStats{
+		trueStats := &interaction.VideoInteractionStats{
 			VideoId:       videoID,
 			LikesCount:    likesCount,
 			CommentsCount: commentsCount,
 			Popularity:    likesCount*likePopularityWeight + commentsCount*commentPopularityWeight,
 		}
+		statsMap[videoID] = trueStats
+		l.reportReconcileDiff(videoID, trueStats)
 	}
-
-	// Redis 增量不能在重建时粗暴 HDEL。这里读取当前增量快照，并把写入 videos 的基准值调整为
-	// true_count - redis_delta。这样 BatchGetVideoStats 继续按“基准值 + Redis 增量”返回真实值，
-	// 后续 flush job 再把这部分 delta 正常刷入 MySQL。
-	deltaSnapshot, err := l.loadRebuildDeltaSnapshot(existingVideoIDs)
-	if err != nil {
-		l.Errorf("load rebuild delta snapshot failed, video_ids:%v error:%v", existingVideoIDs, err)
-		return nil, status.Error(codes.Internal, "读取实时增量失败")
-	}
-	baseStatsMap := buildRebuiltBaseStats(statsMap, deltaSnapshot)
-	if err := l.saveRebuiltStats(baseStatsMap); err != nil {
-		l.Errorf("save rebuilt stats failed, video_ids:%v error:%v", existingVideoIDs, err)
-		return nil, status.Error(codes.Internal, "保存重建统计失败")
-	}
-	l.refreshRedisAfterRebuild(baseStatsMap)
 
 	resp := &interaction.RebuildVideoInteractionStatsResp{
 		Stats: make([]*interaction.VideoInteractionStats, 0, len(statsMap)),
@@ -111,27 +101,46 @@ func (l *RebuildVideoInteractionStatsLogic) RebuildVideoInteractionStats(in *int
 	return resp, nil
 }
 
-func (l *RebuildVideoInteractionStatsLogic) acquireRebuildStatsLock() (string, string, bool, error) {
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	defer cancel()
-	return tryAcquireInteractionRebuildLock(redisCtx, l.svcCtx.RedisCli)
-}
-
-func (l *RebuildVideoInteractionStatsLogic) releaseRebuildStatsLock(lockKey string, lockToken string) {
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	defer cancel()
-	if err := releaseRedisLock(redisCtx, l.svcCtx.RedisCli, lockKey, lockToken); err != nil {
-		l.Errorf("release rebuild stats lock failed, key:%s error:%v", lockKey, err)
+// reportReconcileDiff 对比 COUNT 明细、Redis 权威、DB 冷备三者，将差异写日志。
+// 只观测不修正——修正统一由增量事件通过 Kafka 消费收敛，或运维脚本处理。
+func (l *RebuildVideoInteractionStatsLogic) reportReconcileDiff(videoID uint64, trueStats *interaction.VideoInteractionStats) {
+	// 读取 Redis 权威 Hash 当前值（不做冷启动，只观测）。
+	authStats, authErr := readVideoStatsAuthWithBase(l.ctx, l.svcCtx.RedisCli, videoID, videoStatsAuthResult{})
+	if authErr != nil {
+		l.Errorf("reconcile: read redis auth stats failed, video_id:%d error:%v", videoID, authErr)
+	} else if authStats.LikesCount != trueStats.GetLikesCount() ||
+		authStats.CommentsCount != trueStats.GetCommentsCount() {
+		l.Errorf(
+			"reconcile diff redis vs count, video_id:%d redis_likes:%d count_likes:%d redis_comments:%d count_comments:%d",
+			videoID,
+			authStats.LikesCount, trueStats.GetLikesCount(),
+			authStats.CommentsCount, trueStats.GetCommentsCount(),
+		)
 	}
-}
 
-func (l *RebuildVideoInteractionStatsLogic) waitForStatsMutationsDrained() error {
-	return waitForInteractionStatsMutationsDrained(l.ctx, l.svcCtx.RedisCli)
+	// 读取 MySQL 冷备值，检查异步 flush 是否落后。
+	var video model.Video
+	if err := l.svcCtx.GormDB.WithContext(l.ctx).
+		Select("id", "likes_count", "comments_count", "popularity").
+		Where("id = ?", videoID).
+		First(&video).Error; err != nil {
+		l.Errorf("reconcile: load video cold stats failed, video_id:%d error:%v", videoID, err)
+		return
+	}
+	if video.LikesCount != trueStats.GetLikesCount() ||
+		video.CommentsCount != trueStats.GetCommentsCount() {
+		l.Errorf(
+			"reconcile diff mysql_cold vs count, video_id:%d cold_likes:%d count_likes:%d cold_comments:%d count_comments:%d",
+			videoID,
+			video.LikesCount, trueStats.GetLikesCount(),
+			video.CommentsCount, trueStats.GetCommentsCount(),
+		)
+	}
 }
 
 func normalizeRebuildVideoIDs(rawVideoIDs []uint64) ([]uint64, error) {
 	if len(rawVideoIDs) > maxRebuildInteractionStatItems {
-		return nil, status.Errorf(codes.InvalidArgument, "一次最多重建%d个视频", maxRebuildInteractionStatItems)
+		return nil, status.Errorf(codes.InvalidArgument, "一次最多对账%d个视频", maxRebuildInteractionStatItems)
 	}
 
 	seen := make(map[uint64]struct{}, len(rawVideoIDs))
@@ -205,94 +214,4 @@ func (l *RebuildVideoInteractionStatsLogic) countActiveComments(videoIDs []uint6
 		counts[row.VideoID] = row.Count
 	}
 	return counts, nil
-}
-
-func (l *RebuildVideoInteractionStatsLogic) saveRebuiltStats(statsMap map[uint64]*interaction.VideoInteractionStats) error {
-	return l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
-		for videoID, stats := range statsMap {
-			if err := tx.Model(&model.Video{}).
-				Where("id = ? AND status = ? AND deleted_at IS NULL", videoID, model.VideoStatusNormal).
-				Updates(map[string]any{
-					"likes_count":    stats.GetLikesCount(),
-					"comments_count": stats.GetCommentsCount(),
-					"popularity":     stats.GetPopularity(),
-				}).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-func (l *RebuildVideoInteractionStatsLogic) loadRebuildDeltaSnapshot(videoIDs []uint64) (map[uint64]videoStatDelta, error) {
-	result := make(map[uint64]videoStatDelta, len(videoIDs))
-	for _, videoID := range videoIDs {
-		result[videoID] = videoStatDelta{}
-	}
-	if len(videoIDs) == 0 {
-		return result, nil
-	}
-
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	defer cancel()
-
-	fields := make([]string, 0, len(videoIDs))
-	for _, videoID := range videoIDs {
-		fields = append(fields, redisHashField(videoID))
-	}
-
-	pipe := l.svcCtx.RedisCli.Pipeline()
-	likeDeltasCmd := pipe.HMGet(redisCtx, rediskey.VideoLikeDeltaKey(), fields...)
-	commentDeltasCmd := pipe.HMGet(redisCtx, rediskey.VideoCommentDeltaKey(), fields...)
-	popularityDeltasCmd := pipe.HMGet(redisCtx, rediskey.VideoPopularityDeltaKey(), fields...)
-	if _, err := pipe.Exec(redisCtx); err != nil {
-		return nil, err
-	}
-
-	likeDeltas := likeDeltasCmd.Val()
-	commentDeltas := commentDeltasCmd.Val()
-	popularityDeltas := popularityDeltasCmd.Val()
-	for index, videoID := range videoIDs {
-		result[videoID] = videoStatDelta{
-			LikeDelta:       parseRedisInt64At(likeDeltas, index),
-			CommentDelta:    parseRedisInt64At(commentDeltas, index),
-			PopularityDelta: parseRedisInt64At(popularityDeltas, index),
-		}
-	}
-	return result, nil
-}
-
-func buildRebuiltBaseStats(statsMap map[uint64]*interaction.VideoInteractionStats, deltaSnapshot map[uint64]videoStatDelta) map[uint64]*interaction.VideoInteractionStats {
-	baseStatsMap := make(map[uint64]*interaction.VideoInteractionStats, len(statsMap))
-	for videoID, stats := range statsMap {
-		delta := deltaSnapshot[videoID]
-		baseStatsMap[videoID] = &interaction.VideoInteractionStats{
-			VideoId:       videoID,
-			LikesCount:    nonNegative(stats.GetLikesCount() - delta.LikeDelta),
-			CommentsCount: nonNegative(stats.GetCommentsCount() - delta.CommentDelta),
-			Popularity:    nonNegative(stats.GetPopularity() - delta.PopularityDelta),
-		}
-	}
-	return baseStatsMap
-}
-
-func (l *RebuildVideoInteractionStatsLogic) refreshRedisAfterRebuild(statsMap map[uint64]*interaction.VideoInteractionStats) {
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	defer cancel()
-
-	now := time.Now().UnixMilli()
-	pipe := l.svcCtx.RedisCli.Pipeline()
-	for videoID, stats := range statsMap {
-		// 这里缓存的是调整后的基准值，Redis 增量继续保留，由 BatchGetVideoStats 叠加。
-		pipe.HSet(redisCtx, rediskey.VideoStatsCacheKey(videoID), map[string]any{
-			"likes_count":    stats.GetLikesCount(),
-			"comments_count": stats.GetCommentsCount(),
-			"popularity":     stats.GetPopularity(),
-			"updated_at":     now,
-		})
-		pipe.Expire(redisCtx, rediskey.VideoStatsCacheKey(videoID), videoStatsCacheTTL)
-	}
-	if _, err := pipe.Exec(redisCtx); err != nil {
-		l.Errorf("refresh redis after stats rebuild failed, error:%v", err)
-	}
 }

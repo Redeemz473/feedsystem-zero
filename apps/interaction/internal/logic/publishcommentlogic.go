@@ -97,19 +97,6 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 		return nil, status.Error(codes.Internal, "查询视频失败")
 	}
 
-	leaseKey, leaseToken, leaseAcquired, err := acquireInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli)
-	if err != nil {
-		l.Errorf("acquire interaction mutation lease failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
-	} else if !leaseAcquired {
-		return nil, status.Error(codes.Aborted, "互动统计重建中，请稍后重试")
-	} else {
-		defer func() {
-			if err := releaseInteractionStatsMutationLease(l.ctx, l.svcCtx.RedisCli, leaseKey, leaseToken); err != nil {
-				l.Errorf("release interaction mutation lease failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
-			}
-		}()
-	}
-
 	// 4. 对真正的新评论做短 TTL 限流。
 	//    锁 token 化：SetNX 用随机 token 而非固定 "1"，释放时通过 Lua CAS 只删自己写入的那把锁。
 	//    这样即便本次请求处理耗时超过 TTL、TTL 自动过期后被下一个请求 A 拿到，本次 defer 也不会误删 A 的锁。
@@ -253,18 +240,17 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 	}
 	keepRateLimit = true
 
-	// 6. Redis 更新：评论列表版本、评论数增量、热度增量、统计缓存失效、request_id 幂等缓存。
-	//发布评论改为只更新版本号，不去DEL缓存，让缓存自动TTL过期，防止在DEL和更新版本号之间有请求，白建缓存
+	// 6. Redis 更新：评论列表版本、评论权威计数、热度增量、request_id 幂等缓存。
+	// 评论发布直接原子叠加 Redis 权威 Hash，返回值就是用户可见的权威评论数。
 	commentsCount := nonNegative(video.CommentsCount + 1)
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
-	commentDelta, err := applyRedisCommentCreatedState(redisCtx, l.svcCtx.RedisCli, eventID, videoID, userID, comment.ID, requestID)
+	authCommentsCount, err := applyRedisCommentCreatedState(redisCtx, l.svcCtx.RedisCli, videoID, userID, comment.ID, requestID, video)
 	cancel()
 	if err != nil {
 		l.Errorf("apply redis comment created state failed, video_id: %d, user_id: %d, comment_id: %d, error: %v", videoID, userID, comment.ID, err)
 	} else {
-		commentsCount = nonNegative(video.CommentsCount + commentDelta)
+		commentsCount = authCommentsCount
 	}
-
 	commentInfo := &interaction.CommentInfo{
 		CommentId: comment.ID,
 		VideoId:   videoID,

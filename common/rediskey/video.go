@@ -11,6 +11,9 @@ const (
 	VideoEntityCacheTTL = 10 * time.Minute
 	// VideoEntityMissingTTL 是不存在、已删除或已下架视频的短期负缓存有效期。
 	VideoEntityMissingTTL = 30 * time.Second
+	// VideoStatsAuthTTL 是 Redis 权威互动统计的滑动过期时间。
+	// 每次读写都会 EXPIRE 续期，热视频常驻内存；冷视频过期后由下次访问从 MySQL 冷备重建。
+	VideoStatsAuthTTL = 7 * 24 * time.Hour
 )
 
 // ========================================
@@ -43,66 +46,19 @@ func VideoDetailKey(videoID uint64) string {
 }
 
 // ========================================
-// 视频互动统计增量缓冲
+// 视频互动统计权威缓存（Redis 权威 + MySQL 冷备架构）
 // ========================================
 
-// VideoLikeDeltaKey 视频点赞数增量缓冲。
+// VideoStatsAuthKey 视频互动统计的 Redis 权威计数。
 // 数据结构: HASH
-// key: fsz:video:like_delta  field=videoID, value=delta
-// 用途: 在线点赞/取消点赞先原子更新此 delta，interaction_sync job 定期 flush 到 MySQL 后清零。
-func VideoLikeDeltaKey() string {
-	return fmt.Sprintf("%s:video:like_delta", prefix)
-}
-
-// VideoCommentDeltaKey 视频评论数增量缓冲。
-// 数据结构: HASH
-// key: fsz:video:comment_delta  field=videoID, value=delta
-// 用途: 在线发/删评论先原子更新此 delta，interaction_sync job 定期 flush 到 MySQL 后清零。
-func VideoCommentDeltaKey() string {
-	return fmt.Sprintf("%s:video:comment_delta", prefix)
-}
-
-// VideoPopularityDeltaKey 视频热度增量缓冲。
-// 数据结构: HASH
-// key: fsz:video:popularity_delta  field=videoID, value=delta
-// 用途: 在线互动按权重叠加热度分，hotrank job 消费后累加到分钟窗口 ZSET 并清零。
-func VideoPopularityDeltaKey() string {
-	return fmt.Sprintf("%s:video:popularity_delta", prefix)
-}
-
-// VideoStatsCacheKey 视频互动统计缓存。
-// 数据结构: HASH
-// key: fsz:video:stats:{videoID}  fields: likes_count / comments_count / popularity / updated_at
-// 用途: 读侧展示实时统计；写侧由 interaction_sync 落库后回填，保证与 MySQL 最终一致。
-func VideoStatsCacheKey(videoID uint64) string {
-	return fmt.Sprintf("%s:video:stats:%d", prefix, videoID)
-}
-
-// InteractionDeltaPendingKey 标记某个互动事件的实时增量已写入 Redis、尚未确认落库。
-// 数据结构: STRING
-// key: fsz:interaction:delta:pending:{eventID}  value: 1
-// 用途: consumer 只有看到该标记时才扣减对应增量；避免"Kafka 先消费 → 在线请求后写 Redis"
-// 造成计数被永久重复计算。TTL 过期后 consumer 直接跳过扣减，保持逻辑闭环。
-func InteractionDeltaPendingKey(eventID string) string {
-	return fmt.Sprintf("%s:interaction:delta:pending:%s", prefix, eventID)
-}
-
-// InteractionDeltaAckKey 标记某个互动事件已完成 MySQL 聚合并处理过 Redis 增量。
-// 数据结构: STRING
-// key: fsz:interaction:delta:acked:{eventID}  value: 1
-// 用途: 在线请求发现此标记时不再写实时增量，consumer 重试时也不会重复扣减，
-// 与 pending 一起构成双标记幂等闭环。
-func InteractionDeltaAckKey(eventID string) string {
-	return fmt.Sprintf("%s:interaction:delta:acked:%s", prefix, eventID)
-}
-
-// InteractionDeltaPendingCountKey 记录某个视频尚未被 consumer 确认的实时增量事件数。
-// 数据结构: STRING (int64)
-// key: fsz:interaction:delta:pending_count:{videoID}
-// 用途: 最后一个 pending 事件完成时强制删除该视频的三类增量字段，作为逐事件
-// 加减之外的收敛不变量，避免高并发交错后留下没有 pending 所属关系的孤立增量。
-func InteractionDeltaPendingCountKey(videoID uint64) string {
-	return fmt.Sprintf("%s:interaction:delta:pending_count:%d", prefix, videoID)
+// key: fsz:video:stats:auth:{videoID}  fields: likes_count / comments_count / popularity
+// 用途: 在线路径直接 HINCRBY 该 Hash 得到用户可见的最终计数；
+// 读侧 HGetAll 直接返回；miss 时从 MySQL videos 冷备读取基准值 HSetNX 建立后再 HINCRBY 累加，
+// 通过一段 Lua 脚本保证"冷启动 + 增量"原子执行，避免并发下基准值覆盖新增量。
+// MySQL videos.{likes_count,comments_count,popularity} 由 interaction_sync job 异步维护，
+// 仅作为 Redis 冷启动兜底，不再是读侧权威。
+func VideoStatsAuthKey(videoID uint64) string {
+	return fmt.Sprintf("%s:video:stats:auth:%d", prefix, videoID)
 }
 
 // HotVideoRealtimeKey 实时热榜。
