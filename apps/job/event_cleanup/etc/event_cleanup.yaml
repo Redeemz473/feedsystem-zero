@@ -1,0 +1,17 @@
+Name: event-cleanup.job
+
+Mysql:
+  DataSource: root:123456@tcp(127.0.0.1:3308)/feedsystem_zero?charset=utf8mb4&parseTime=true&loc=Local
+
+EventCleanup:
+  # 每条 DELETE 都是小批次；批间主动让出数据库，单轮还有 30 秒硬预算。
+  BatchSize: 100
+  MaxBatchesPerRun: 20
+  PollIntervalSeconds: 300
+  DeleteTimeoutMs: 5000
+  BatchIntervalMs: 200
+  MaxRunSeconds: 30
+  # 已成功投递的 Outbox 保留 7 天，便于问题追查。
+  OutboxSentRetentionHours: 168
+  # 0 表示死信永久保留，完成审计/归档方案后可设置为 720（30 天）等值。
+  DeadLetterRetentionHours: 0

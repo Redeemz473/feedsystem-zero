@@ -20,7 +20,7 @@ SEED_FILE_BUCKETS="${SEED_FILE_BUCKETS:-100}"
 
 SERVICE_NAMES=(
   account video interaction social feed notification-rpc gateway
-  outbox interaction-sync social-sync feed-timeline hotrank notification-job asset-cleanup
+  outbox interaction-sync social-sync feed-timeline hotrank notification-job asset-cleanup event-cleanup
 )
 
 usage() {
@@ -225,6 +225,7 @@ build_all() {
   build_binary hotrank ./apps/job/hotrank
   build_binary notification-job ./apps/job/notification
   build_binary asset-cleanup ./apps/job/asset_cleanup
+  build_binary event-cleanup ./apps/job/event_cleanup
 }
 
 start_dependencies() {
@@ -283,6 +284,7 @@ start_backend() {
   start_process hotrank "${BIN_DIR}/hotrank" "${ROOT_DIR}/apps/job/hotrank/etc/hotrank.yaml"
   start_process notification-job "${BIN_DIR}/notification-job" "${ROOT_DIR}/apps/job/notification/etc/notification.yaml"
   start_process asset-cleanup "${BIN_DIR}/asset-cleanup" "${ROOT_DIR}/apps/job/asset_cleanup/etc/asset_cleanup.yaml"
+  start_process event-cleanup "${BIN_DIR}/event-cleanup" "${ROOT_DIR}/apps/job/event_cleanup/etc/event_cleanup.yaml"
 
   sleep 3
   assert_all_running

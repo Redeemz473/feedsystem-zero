@@ -3,6 +3,7 @@ package logic
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -173,7 +174,7 @@ func (d *Dispatcher) claimDueOutboxEvents(ctx context.Context) ([]model.OutboxEv
 			return fmt.Errorf("claim outbox batch affected %d rows, want %d", result.RowsAffected, len(events))
 		}
 		return nil
-	})
+	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, err
 	}

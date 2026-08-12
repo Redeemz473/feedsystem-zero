@@ -6,6 +6,7 @@ import (
 	"feedsystem-zero/apps/interaction/interaction"
 	"feedsystem-zero/apps/interaction/internal/model"
 	"feedsystem-zero/apps/interaction/internal/svc"
+	"feedsystem-zero/common/rediskey"
 
 	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc/codes"
@@ -30,21 +31,16 @@ func NewRebuildVideoInteractionStatsLogic(ctx context.Context, svcCtx *svc.Servi
 	}
 }
 
-// RebuildVideoInteractionStats 在方案 B 架构下改为只读对账（reconciliation）。
+// RebuildVideoInteractionStats 对比明细表、MySQL 持久快照和 Redis 投影。
 //
-// 方案 B 中 Redis 权威 Hash（VideoStatsAuthKey）是用户可见值的唯一权威来源，
-// MySQL videos 冷备值只用于 Redis miss 时的冷启动兜底。曾经的"用 COUNT(*) 覆盖 videos + 强制清 Redis 增量"
-// 操作在方案 B 下是有害的——一旦覆盖 Redis 权威 Hash，短时窗口内客户端会看到计数跳变，
-// 且如果覆盖恰好发生在增量落 Kafka 之前，还会导致 double-count。
-//
-// 因此这里保留 RPC 接口以维持 proto 兼容，但语义降级为"三源对账"：
+// 这里保留 RPC 接口以维持 proto 兼容，语义是"三源对账 + 安全投影修复"：
 //  1. COUNT likes/comments 明细表，作为绝对权威。
-//  2. HGETALL VideoStatsAuthKey，读取当前 Redis 权威值。
-//  3. 读取 videos 冷备值，检查异步 flush job 是否落后。
+//  2. 读取 videos 持久快照，检查异步 flush job 是否落后。
+//  3. 纯 HGETALL 读取 Redis，不允许因观测 miss 创建零值 key。
+//  4. Redis key 缺失或版本落后时，用 MySQL 快照做 CAS 投影修复。
 //
-// 返回的 stats 字段是 COUNT 明细得到的准确值，供运维观测；本方法不修改任何存储。
-// 如果检测到严重漂移（Redis vs COUNT 明细偏差 > 阈值），会打印 error 日志供告警系统采集，
-// 但不会主动"修正"——修正统一由后续增量事件通过 Kafka 消费收敛，或人工介入通过运维脚本处理。
+// 本方法不会直接用 COUNT 覆盖 videos：未消费事件可能已写入明细表，直接覆盖后再消费 delta 会重复计数。
+// DB 与明细漂移只告警，待 Kafka 追平后再由运维确认；Redis 失写则可通过版本快照安全修复。
 func (l *RebuildVideoInteractionStatsLogic) RebuildVideoInteractionStats(in *interaction.RebuildVideoInteractionStatsReq) (*interaction.RebuildVideoInteractionStatsResp, error) {
 	videoIDs, err := normalizeRebuildVideoIDs(in.GetVideoIds())
 	if err != nil {
@@ -101,39 +97,56 @@ func (l *RebuildVideoInteractionStatsLogic) RebuildVideoInteractionStats(in *int
 	return resp, nil
 }
 
-// reportReconcileDiff 对比 COUNT 明细、Redis 权威、DB 冷备三者，将差异写日志。
-// 只观测不修正——修正统一由增量事件通过 Kafka 消费收敛，或运维脚本处理。
+// reportReconcileDiff 对比 COUNT 明细、Redis 投影、DB 持久快照，并修复缺失/落后的 Redis 投影。
 func (l *RebuildVideoInteractionStatsLogic) reportReconcileDiff(videoID uint64, trueStats *interaction.VideoInteractionStats) {
-	// 读取 Redis 权威 Hash 当前值（不做冷启动，只观测）。
-	authStats, authErr := readVideoStatsAuthWithBase(l.ctx, l.svcCtx.RedisCli, videoID, videoStatsAuthResult{})
-	if authErr != nil {
-		l.Errorf("reconcile: read redis auth stats failed, video_id:%d error:%v", videoID, authErr)
-	} else if authStats.LikesCount != trueStats.GetLikesCount() ||
-		authStats.CommentsCount != trueStats.GetCommentsCount() {
-		l.Errorf(
-			"reconcile diff redis vs count, video_id:%d redis_likes:%d count_likes:%d redis_comments:%d count_comments:%d",
-			videoID,
-			authStats.LikesCount, trueStats.GetLikesCount(),
-			authStats.CommentsCount, trueStats.GetCommentsCount(),
-		)
-	}
-
-	// 读取 MySQL 冷备值，检查异步 flush 是否落后。
+	// 先读取 MySQL 持久快照，作为 Redis 可安全恢复的基准。
 	var video model.Video
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).
-		Select("id", "likes_count", "comments_count", "popularity").
+		Select("id", "likes_count", "comments_count", "popularity", "stats_version").
 		Where("id = ?", videoID).
 		First(&video).Error; err != nil {
-		l.Errorf("reconcile: load video cold stats failed, video_id:%d error:%v", videoID, err)
+		l.Errorf("reconcile: load video stats snapshot failed, video_id:%d error:%v", videoID, err)
 		return
 	}
 	if video.LikesCount != trueStats.GetLikesCount() ||
 		video.CommentsCount != trueStats.GetCommentsCount() {
 		l.Errorf(
-			"reconcile diff mysql_cold vs count, video_id:%d cold_likes:%d count_likes:%d cold_comments:%d count_comments:%d",
+			"reconcile diff mysql vs count, video_id:%d mysql_likes:%d count_likes:%d mysql_comments:%d count_comments:%d",
 			videoID,
 			video.LikesCount, trueStats.GetLikesCount(),
 			video.CommentsCount, trueStats.GetCommentsCount(),
+		)
+	}
+
+	// 纯读 Redis。旧格式、缺失或版本落后时用 MySQL 快照修复；不会写入零值基准。
+	hashValues, authErr := l.svcCtx.RedisCli.HGetAll(l.ctx, rediskey.VideoStatsAuthKey(videoID)).Result()
+	authStats, authOK := parseVideoStatsAuthHash(hashValues)
+	if authErr != nil {
+		l.Errorf("reconcile: read redis stats projection failed, video_id:%d error:%v", videoID, authErr)
+		return
+	}
+	if _, legacyOK := parseLegacyVideoStatsAuthHash(hashValues); legacyOK {
+		// 滚动升级期间不覆盖旧 Hash 中可能尚未消费的在线增量；正常读写 Lua 会只补版本字段。
+		l.Infof("reconcile: legacy redis stats hash awaits lazy version upgrade, video_id:%d", videoID)
+		return
+	}
+	if !authOK || authStats.StatsVersion < video.StatsVersion {
+		if err := projectVideoStatsBatch(l.ctx, l.svcCtx.RedisCli, []videoStatsProjection{{
+			VideoID: videoID,
+			Stats:   videoBaseStatsFromDB(video),
+		}}); err != nil {
+			l.Errorf("reconcile: repair redis stats projection failed, video_id:%d error:%v", videoID, err)
+		}
+		return
+	}
+	if authStats.LikesCount != trueStats.GetLikesCount() ||
+		authStats.CommentsCount != trueStats.GetCommentsCount() {
+		l.Errorf(
+			"reconcile diff redis vs count, video_id:%d redis_likes:%d count_likes:%d redis_comments:%d count_comments:%d redis_version:%d mysql_version:%d",
+			videoID,
+			authStats.LikesCount, trueStats.GetLikesCount(),
+			authStats.CommentsCount, trueStats.GetCommentsCount(),
+			authStats.StatsVersion, video.StatsVersion,
 		)
 	}
 }

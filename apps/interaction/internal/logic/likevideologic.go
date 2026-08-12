@@ -172,7 +172,7 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 
 	//MySQL 事务：点赞关系、互动事件、领域 outbox 与通知 outbox 必须一起提交。
 	//开启事务
-	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+	if err := runInteractionWriteTransaction(l.ctx, l.svcCtx.GormDB, func(tx *gorm.DB) error {
 		like := model.Like{
 			VideoID: videoID,
 			UserID:  userID,
@@ -222,7 +222,9 @@ func (l *LikeVideoLogic) LikeVideo(in *interaction.LikeVideoReq) (*interaction.L
 			return err
 		}
 		if notificationOutbox != nil {
-			return tx.Create(notificationOutbox).Error
+			attemptNotification := *notificationOutbox
+			attemptNotification.ID = 0
+			return tx.Create(&attemptNotification).Error
 		}
 		return nil
 	}); err != nil {

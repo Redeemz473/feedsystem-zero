@@ -273,7 +273,7 @@ func fillUnlikedState(ctx context.Context, redisCli *redis.Client, videoID uint6
 	return err
 }
 
-// bumpVideoStatsAuthScript 是权威计数写入的核心 Lua 脚本。
+// bumpVideoStatsAuthScript 在在线写链路中乐观更新统计投影。
 //
 // 输入：
 //
@@ -281,10 +281,11 @@ func fillUnlikedState(ctx context.Context, redisCli *redis.Client, videoID uint6
 //	ARGV[1] = base_likes（DB 冷备 likes_count，用于冷启动）
 //	ARGV[2] = base_comments
 //	ARGV[3] = base_popularity
-//	ARGV[4] = like_delta（本次操作对 likes_count 的增量）
-//	ARGV[5] = comment_delta
-//	ARGV[6] = popularity_delta
-//	ARGV[7] = ttl_seconds
+//	ARGV[4] = base_stats_version
+//	ARGV[5] = like_delta（本次操作对 likes_count 的增量）
+//	ARGV[6] = comment_delta
+//	ARGV[7] = popularity_delta
+//	ARGV[8] = ttl_seconds
 //
 // 输出：{likes_count, comments_count, popularity}（本次操作后的权威值）
 //
@@ -298,13 +299,18 @@ if redis.call("EXISTS", KEYS[1]) == 0 then
 	redis.call("HSET", KEYS[1],
 		"likes_count", ARGV[1],
 		"comments_count", ARGV[2],
-		"popularity", ARGV[3])
+		"popularity", ARGV[3],
+		"stats_version", ARGV[4])
+elseif not tonumber(redis.call("HGET", KEYS[1], "stats_version")) then
+	-- 兼容升级前已经存在的三字段 Hash，不覆盖其中尚未消费的实时计数。
+	redis.call("HSET", KEYS[1], "stats_version", ARGV[4])
 end
-local likes = redis.call("HINCRBY", KEYS[1], "likes_count", ARGV[4])
-local comments = redis.call("HINCRBY", KEYS[1], "comments_count", ARGV[5])
-local pop = redis.call("HINCRBY", KEYS[1], "popularity", ARGV[6])
-redis.call("EXPIRE", KEYS[1], ARGV[7])
-return {likes, comments, pop}
+local likes = redis.call("HINCRBY", KEYS[1], "likes_count", ARGV[5])
+local comments = redis.call("HINCRBY", KEYS[1], "comments_count", ARGV[6])
+local pop = redis.call("HINCRBY", KEYS[1], "popularity", ARGV[7])
+local version = redis.call("HGET", KEYS[1], "stats_version")
+redis.call("EXPIRE", KEYS[1], ARGV[8])
+return {likes, comments, pop, version}
 `
 
 // videoStatsAuthResult 是 bumpVideoStatsAuthScript 的返回值封装。
@@ -312,6 +318,7 @@ type videoStatsAuthResult struct {
 	LikesCount    int64
 	CommentsCount int64
 	Popularity    int64
+	StatsVersion  uint64
 }
 
 // bumpVideoStatsAuth 原子地叠加 Redis 权威 Hash，并返回本次操作后的权威值。
@@ -330,6 +337,7 @@ func bumpVideoStatsAuth(
 		strconv.FormatInt(baseStats.LikesCount, 10),
 		strconv.FormatInt(baseStats.CommentsCount, 10),
 		strconv.FormatInt(baseStats.Popularity, 10),
+		strconv.FormatUint(baseStats.StatsVersion, 10),
 		strconv.FormatInt(delta.LikeDelta, 10),
 		strconv.FormatInt(delta.CommentDelta, 10),
 		strconv.FormatInt(delta.PopularityDelta, 10),
@@ -365,27 +373,99 @@ func parseVideoStatsAuthResult(values []any) videoStatsAuthResult {
 		LikesCount:    getAt(0),
 		CommentsCount: getAt(1),
 		Popularity:    getAt(2),
+		StatsVersion:  uint64(nonNegative(getAt(3))),
 	}
 }
 
-// readVideoStatsAuthScript 从权威 Hash 读取，不存在时用 DB 冷备值原子建立基准并 EXPIRE 续期。
+func parseVideoStatsAuthHash(values map[string]string) (videoStatsAuthResult, bool) {
+	likesRaw, likesOK := values["likes_count"]
+	commentsRaw, commentsOK := values["comments_count"]
+	popularityRaw, popularityOK := values["popularity"]
+	versionRaw, versionOK := values["stats_version"]
+	if !likesOK || !commentsOK || !popularityOK || !versionOK {
+		return videoStatsAuthResult{}, false
+	}
+
+	likes, err := strconv.ParseInt(likesRaw, 10, 64)
+	if err != nil {
+		return videoStatsAuthResult{}, false
+	}
+	comments, err := strconv.ParseInt(commentsRaw, 10, 64)
+	if err != nil {
+		return videoStatsAuthResult{}, false
+	}
+	popularity, err := strconv.ParseInt(popularityRaw, 10, 64)
+	if err != nil {
+		return videoStatsAuthResult{}, false
+	}
+	version, err := strconv.ParseUint(versionRaw, 10, 64)
+	if err != nil {
+		return videoStatsAuthResult{}, false
+	}
+
+	return videoStatsAuthResult{
+		LikesCount:    likes,
+		CommentsCount: comments,
+		Popularity:    popularity,
+		StatsVersion:  version,
+	}, true
+}
+
+func parseLegacyVideoStatsAuthHash(values map[string]string) (videoStatsAuthResult, bool) {
+	if _, hasVersion := values["stats_version"]; hasVersion {
+		return videoStatsAuthResult{}, false
+	}
+	likes, err := strconv.ParseInt(values["likes_count"], 10, 64)
+	if err != nil {
+		return videoStatsAuthResult{}, false
+	}
+	comments, err := strconv.ParseInt(values["comments_count"], 10, 64)
+	if err != nil {
+		return videoStatsAuthResult{}, false
+	}
+	popularity, err := strconv.ParseInt(values["popularity"], 10, 64)
+	if err != nil {
+		return videoStatsAuthResult{}, false
+	}
+	return videoStatsAuthResult{
+		LikesCount: likes, CommentsCount: comments, Popularity: popularity,
+	}, true
+}
+
+// readVideoStatsAuthScript 读取统计投影。key 缺失、字段不完整或 DB 版本更新时，
+// 用 MySQL 快照原子重建；命中时也刷新 TTL。
 //
 // 输入：
 //
 //	KEYS[1] = VideoStatsAuthKey(videoID)
-//	ARGV[1..3] = base_likes/comments/popularity（冷启动初始值，来自 MySQL videos 冷备）
-//	ARGV[4]   = ttl_seconds
+//	ARGV[1..3] = base_likes/comments/popularity（冷启动初始值，来自 MySQL videos）
+//	ARGV[4]   = base_stats_version
+//	ARGV[5]   = ttl_seconds
 //
-// 输出：{likes_count, comments_count, popularity}
+// 输出：{likes_count, comments_count, popularity, stats_version}
 const readVideoStatsAuthScript = `
-if redis.call("EXISTS", KEYS[1]) == 0 then
+local values = redis.call("HMGET", KEYS[1], "likes_count", "comments_count", "popularity", "stats_version")
+local current_version = values[4]
+local current_likes = tonumber(values[1])
+local current_comments = tonumber(values[2])
+local current_popularity = tonumber(values[3])
+local current_version_number = tonumber(current_version)
+if not current_version and current_likes and current_comments and current_popularity then
+	-- 滚动升级兼容：旧三字段 Hash 可能包含尚未消费的在线增量，只补版本，不覆盖计数。
+	redis.call("HSET", KEYS[1], "stats_version", ARGV[4])
+elseif not current_version_number
+		or not current_likes
+		or not current_comments
+		or not current_popularity
+		or current_version_number < tonumber(ARGV[4]) then
 	redis.call("HSET", KEYS[1],
 		"likes_count", ARGV[1],
 		"comments_count", ARGV[2],
-		"popularity", ARGV[3])
-	redis.call("EXPIRE", KEYS[1], ARGV[4])
+		"popularity", ARGV[3],
+		"stats_version", ARGV[4])
 end
-return redis.call("HMGET", KEYS[1], "likes_count", "comments_count", "popularity")
+redis.call("EXPIRE", KEYS[1], ARGV[5])
+return redis.call("HMGET", KEYS[1], "likes_count", "comments_count", "popularity", "stats_version")
 `
 
 // readVideoStatsAuthWithBase 读权威 Hash，miss 时用 DB 冷备做冷启动。
@@ -402,6 +482,7 @@ func readVideoStatsAuthWithBase(
 		strconv.FormatInt(baseStats.LikesCount, 10),
 		strconv.FormatInt(baseStats.CommentsCount, 10),
 		strconv.FormatInt(baseStats.Popularity, 10),
+		strconv.FormatUint(baseStats.StatsVersion, 10),
 		strconv.FormatInt(int64(rediskey.VideoStatsAuthTTL/time.Second), 10),
 	).Slice()
 	if err != nil {
@@ -417,7 +498,57 @@ func videoBaseStatsFromDB(video model.Video) videoStatsAuthResult {
 		LikesCount:    nonNegative(video.LikesCount),
 		CommentsCount: nonNegative(video.CommentsCount),
 		Popularity:    nonNegative(video.Popularity),
+		StatsVersion:  video.StatsVersion,
 	}
+}
+
+// projectVideoStatsScript 由 Kafka Consumer 把 MySQL 持久快照投影到 Redis。
+// 只有版本不旧于 Redis 当前版本时才覆盖，避免并发 Consumer 把新快照回滚成旧快照；
+// 相同版本允许重复写，从而让 Kafka 重放修复上一次 Redis 写失败。
+const projectVideoStatsScript = `
+local current_version = redis.call("HGET", KEYS[1], "stats_version")
+local current_version_number = tonumber(current_version)
+if not current_version_number or tonumber(ARGV[1]) >= current_version_number then
+	redis.call("HSET", KEYS[1],
+		"stats_version", ARGV[1],
+		"likes_count", ARGV[2],
+		"comments_count", ARGV[3],
+		"popularity", ARGV[4])
+	redis.call("EXPIRE", KEYS[1], ARGV[5])
+	return 1
+end
+return 0
+`
+
+type videoStatsProjection struct {
+	VideoID uint64
+	Stats   videoStatsAuthResult
+}
+
+// projectVideoStatsBatch 用一条 Redis Pipeline 投影整个 Flush 批次。
+// 任一命令失败都会让 RPC 失败，Kafka 将重试同一批；processed_events 会跳过 DB 增量，
+// 但 Flush 仍会重新读取并投影最新快照，因此不会重复计数。
+func projectVideoStatsBatch(ctx context.Context, redisCli *redis.Client, projections []videoStatsProjection) error {
+	if len(projections) == 0 {
+		return nil
+	}
+
+	pipe := redisCli.Pipeline()
+	for _, projection := range projections {
+		stats := projection.Stats
+		pipe.Eval(
+			ctx,
+			projectVideoStatsScript,
+			[]string{rediskey.VideoStatsAuthKey(projection.VideoID)},
+			strconv.FormatUint(stats.StatsVersion, 10),
+			strconv.FormatInt(stats.LikesCount, 10),
+			strconv.FormatInt(stats.CommentsCount, 10),
+			strconv.FormatInt(stats.Popularity, 10),
+			strconv.FormatInt(int64(rediskey.VideoStatsAuthTTL/time.Second), 10),
+		)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 // applyRedisLikeState 写点赞后的 Redis 实时状态，同时用 Lua 原子叠加权威 Hash。

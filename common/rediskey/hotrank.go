@@ -41,3 +41,21 @@ func HotVideoMergeBuildLockKey(asOf string) string {
 func HotVideoMergeTempKey(asOf string, token string) string {
 	return fmt.Sprintf("%s:hot:merge:%s:tmp:%s", prefix, asOf, token)
 }
+
+// GatewayAnonymousHotFeedPageCacheKey 游客热榜完整视频卡片的短 TTL 成品缓存。
+// snapshotKey 对首页请求是当前 UTC 分钟 Unix 秒，对历史翻页是客户端携带的 snapshot_at。
+// 登录用户包含个性化 is_liked，不允许使用此共享缓存。
+func GatewayAnonymousHotFeedPageCacheKey(snapshotKey int64, offset int64, pageSize int64) string {
+	return fmt.Sprintf(
+		"%s:gateway:hot:anonymous:v1:%d:%d:%d",
+		prefix,
+		snapshotKey,
+		offset,
+		pageSize,
+	)
+}
+
+// GatewayAnonymousHotFeedPageBuildLockKey 跨 Gateway 实例合并同一热榜页的缓存回源。
+func GatewayAnonymousHotFeedPageBuildLockKey(cacheKey string) string {
+	return cacheKey + ":lock"
+}

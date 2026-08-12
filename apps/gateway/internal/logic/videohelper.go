@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"feedsystem-zero/apps/account/accountclient"
@@ -211,18 +212,63 @@ func loadHTTPVideosByIDs(
 		}
 	}
 
-	if enrichedVideos, err := enrichHTTPVideoInteractions(ctx, interactionRpc, viewerID, videos); err == nil {
-		videos = enrichedVideos
-	}
-	if enrichedVideos, err := enrichHTTPVideoAuthors(ctx, accountRpc, videos); err == nil {
-		videos = enrichedVideos
-	}
+	videos = enrichHTTPVideoCardsConcurrently(ctx, accountRpc, interactionRpc, viewerID, videos)
 
 	videoMap := make(map[uint64]types.VideoInfo, len(videos))
 	for _, video := range videos {
 		videoMap[video.Videoid] = video
 	}
 	return videoMap, nil
+}
+
+// enrichHTTPVideoCardsConcurrently 在视频实体就绪后并行补齐两个彼此独立的数据源。
+// 任一补充 RPC 失败时保留基础视频及另一路成功结果，延续列表接口的降级语义。
+func enrichHTTPVideoCardsConcurrently(
+	ctx context.Context,
+	accountRpc accountclient.Account,
+	interactionRpc interactionclient.Interaction,
+	viewerID uint64,
+	videos []types.VideoInfo,
+) []types.VideoInfo {
+	if len(videos) == 0 {
+		return videos
+	}
+
+	interactionVideos := append([]types.VideoInfo(nil), videos...)
+	authorVideos := append([]types.VideoInfo(nil), videos...)
+	var interactionErr, authorErr error
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		interactionVideos, interactionErr = enrichHTTPVideoInteractions(
+			ctx,
+			interactionRpc,
+			viewerID,
+			interactionVideos,
+		)
+	}()
+	go func() {
+		defer wg.Done()
+		authorVideos, authorErr = enrichHTTPVideoAuthors(ctx, accountRpc, authorVideos)
+	}()
+	wg.Wait()
+
+	if interactionErr == nil {
+		for i := range videos {
+			videos[i].Likescount = interactionVideos[i].Likescount
+			videos[i].Commentscount = interactionVideos[i].Commentscount
+			videos[i].Popularity = interactionVideos[i].Popularity
+			videos[i].Isliked = interactionVideos[i].Isliked
+		}
+	}
+	if authorErr == nil {
+		for i := range videos {
+			videos[i].Authorusername = authorVideos[i].Authorusername
+		}
+	}
+	return videos
 }
 
 func enrichHTTPVideoAuthors(

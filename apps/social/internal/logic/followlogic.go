@@ -48,20 +48,46 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 		return nil, status.Error(codes.InvalidArgument, "用户不能关注自己")
 	}
 
-	var now time.Time
+	// 事件构造不依赖事务内数据，提前完成可缩短账户行锁持有时间；
+	// 若事务因死锁重试，同一请求仍复用同一组 event_id。
+	now := time.Now()
+	eventID, err := newSocialEventID("follow")
+	if err != nil {
+		return nil, status.Error(codes.Internal, "生成关注事件ID失败")
+	}
+	outboxEvent, err := buildFollowOutboxEvent(eventID, followerID, followingID, eventx.FollowActionFollow, now)
+	if err != nil {
+		return nil, err
+	}
+	notificationEventID, err := newSocialEventID("notifyFollow")
+	if err != nil {
+		return nil, status.Error(codes.Internal, "生成关注通知事件ID失败")
+	}
+	notificationOutbox, err := buildFollowNotificationOutbox(
+		notificationEventID,
+		eventID,
+		followerID,
+		followingID,
+		eventx.FollowActionFollow,
+		now,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	stateChanged := false
 	if err := runSocialWriteTransaction(l.ctx, l.svcCtx.GormDB, func(tx *gorm.DB) error {
 		// 重试必须丢弃上一轮已回滚事务的局部状态。
-		now = time.Now()
 		stateChanged = false
-		if err := lockFollowAccounts(l.ctx, tx, followerID, followingID); err != nil {
+		followingAccount, err := lockFollowAccounts(l.ctx, tx, followerID, followingID)
+		if err != nil {
 			return err
 		}
 
 		var follow model.Follow
 		// 双方账户行已经充当该关注关系的事务互斥锁。这里使用普通查询，避免
 		// 对不存在的联合唯一键加 gap lock，随后 INSERT 时形成插入意向死锁。
-		err := tx.
+		err = tx.
 			Where("follower_id = ? AND following_id = ?", followerID, followingID).
 			Take(&follow).Error
 
@@ -133,66 +159,16 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 			return nil
 		}
 
-		// 维护 accounts 表冗余计数：被关注者粉丝数 +1，关注者关注数 +1。
-		// 与关注关系写在同一个事务里，保证计数与关系强一致。
-		if err := tx.Model(&model.Account{}).
-			Where("id = ?", followingID).
-			UpdateColumn("follower_count", gorm.Expr("follower_count + 1")).Error; err != nil {
-			return err
-		}
-		if err := tx.Model(&model.Account{}).
-			Where("id = ?", followerID).
-			UpdateColumn("following_count", gorm.Expr("following_count + 1")).Error; err != nil {
-			return err
-		}
-
-		// 大 V 只升不降标记维护：读回被关注者的最新粉丝数与 is_big_v，
-		// 若首次达到阈值则在同事务内把 is_big_v 置 1。
-		// 使用 WHERE is_big_v = 0 的条件 UPDATE 保持并发幂等，
-		// 多个并发关注请求最多只有一个会真正把 0 改为 1。
-		var followingAccount model.Account
-		if err := tx.Model(&model.Account{}).
-			Select("id", "follower_count", "is_big_v").
-			Where("id = ?", followingID).
-			Take(&followingAccount).Error; err != nil {
-			return err
-		}
-		if feedx.ShouldPromoteBigCreator(followingAccount.FollowerCount, followingAccount.IsBigV) {
-			if err := tx.Model(&model.Account{}).
-				Where("id = ? AND is_big_v = ?", followingID, false).
-				UpdateColumn("is_big_v", true).Error; err != nil {
-				return err
-			}
-		}
-
-		eventID, err := newSocialEventID("follow")
-		if err != nil {
-			return err
-		}
-		outboxEvent, err := buildFollowOutboxEvent(eventID, followerID, followingID, eventx.FollowActionFollow, now)
-		if err != nil {
-			return err
-		}
-		if err := tx.Create(outboxEvent).Error; err != nil {
-			return err
-		}
-
-		notificationEventID, err := newSocialEventID("notifyFollow")
-		if err != nil {
-			return err
-		}
-		notificationOutbox, err := buildFollowNotificationOutbox(
-			notificationEventID,
-			eventID,
-			followerID,
-			followingID,
-			eventx.FollowActionFollow,
-			now,
+		// 一条 UPDATE 同时维护双方计数，并基于已锁定快照完成大 V 只升不降晋升。
+		promoteBigCreator := feedx.ShouldPromoteBigCreator(
+			followingAccount.FollowerCount+1,
+			followingAccount.IsBigV,
 		)
-		if err != nil {
+		if err := updateFollowAccountCounters(tx, followerID, followingID, 1, promoteBigCreator); err != nil {
 			return err
 		}
-		return tx.Create(notificationOutbox).Error
+
+		return createSocialOutboxEvents(tx, outboxEvent, notificationOutbox)
 	}); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, status.Error(codes.NotFound, "目标用户不存在")

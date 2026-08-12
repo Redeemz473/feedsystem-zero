@@ -46,12 +46,36 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 		return nil, status.Error(codes.InvalidArgument, "用户不能取消关注自己")
 	}
 
-	var now time.Time
+	// 提前构造事件以缩短事务内账户锁持有时间，并在死锁重试时复用 event_id。
+	now := time.Now()
+	eventID, err := newSocialEventID("unfollow")
+	if err != nil {
+		return nil, status.Error(codes.Internal, "生成取消关注事件ID失败")
+	}
+	outboxEvent, err := buildFollowOutboxEvent(eventID, followerID, followingID, eventx.FollowActionUnfollow, now)
+	if err != nil {
+		return nil, err
+	}
+	notificationEventID, err := newSocialEventID("notifyUnfollow")
+	if err != nil {
+		return nil, status.Error(codes.Internal, "生成取消关注通知事件ID失败")
+	}
+	notificationOutbox, err := buildFollowNotificationOutbox(
+		notificationEventID,
+		eventID,
+		followerID,
+		followingID,
+		eventx.FollowActionUnfollow,
+		now,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	stateChanged := false
 	if err := runSocialWriteTransaction(l.ctx, l.svcCtx.GormDB, func(tx *gorm.DB) error {
-		now = time.Now()
 		stateChanged = false
-		if err := lockFollowAccounts(l.ctx, tx, followerID, followingID); err != nil {
+		if _, err := lockFollowAccounts(l.ctx, tx, followerID, followingID); err != nil {
 			return err
 		}
 
@@ -91,47 +115,12 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 			return nil
 		}
 
-		// 维护 accounts 表冗余计数：被关注者粉丝数 -1，关注者关注数 -1。
-		// 用 GREATEST(..., 0) 防止并发异常导致计数变成负数。
-		if err := tx.Model(&model.Account{}).
-			Where("id = ?", followingID).
-			UpdateColumn("follower_count", gorm.Expr("GREATEST(follower_count - 1, 0)")).Error; err != nil {
-			return err
-		}
-		if err := tx.Model(&model.Account{}).
-			Where("id = ?", followerID).
-			UpdateColumn("following_count", gorm.Expr("GREATEST(following_count - 1, 0)")).Error; err != nil {
+		// 一条 UPDATE 同时维护双方计数；大 V 标记只升不降，取关不修改。
+		if err := updateFollowAccountCounters(tx, followerID, followingID, -1, false); err != nil {
 			return err
 		}
 
-		eventID, err := newSocialEventID("unfollow")
-		if err != nil {
-			return err
-		}
-		outboxEvent, err := buildFollowOutboxEvent(eventID, followerID, followingID, eventx.FollowActionUnfollow, now)
-		if err != nil {
-			return err
-		}
-		if err := tx.Create(outboxEvent).Error; err != nil {
-			return err
-		}
-
-		notificationEventID, err := newSocialEventID("notifyUnfollow")
-		if err != nil {
-			return err
-		}
-		notificationOutbox, err := buildFollowNotificationOutbox(
-			notificationEventID,
-			eventID,
-			followerID,
-			followingID,
-			eventx.FollowActionUnfollow,
-			now,
-		)
-		if err != nil {
-			return err
-		}
-		return tx.Create(notificationOutbox).Error
+		return createSocialOutboxEvents(tx, outboxEvent, notificationOutbox)
 	}); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, status.Error(codes.NotFound, "目标用户不存在")

@@ -90,7 +90,7 @@ func (l *DeleteCommentLogic) DeleteComment(in *interaction.DeleteCommentReq) (*i
 		}
 	}
 
-	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+	if err := runInteractionWriteTransaction(l.ctx, l.svcCtx.GormDB, func(tx *gorm.DB) error {
 		result := tx.Model(&model.Comment{}).
 			Where("id = ? AND status = ? AND deleted_at IS NULL", comment.ID, model.CommentStatusNormal).
 			Updates(map[string]any{
@@ -166,7 +166,9 @@ func (l *DeleteCommentLogic) DeleteComment(in *interaction.DeleteCommentReq) (*i
 			return err
 		}
 		if notificationOutbox != nil {
-			return tx.Create(notificationOutbox).Error
+			attemptNotification := *notificationOutbox
+			attemptNotification.ID = 0
+			return tx.Create(&attemptNotification).Error
 		}
 		return nil
 	}); err != nil {

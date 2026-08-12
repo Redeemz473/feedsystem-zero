@@ -20,6 +20,7 @@ type Config struct {
 	BizRedis        RedisConf
 	Mysql           MysqlConf
 	Upload          UploadConf
+	HotFeedCache    HotFeedCacheConf
 }
 
 type AuthConf struct {
@@ -48,4 +49,13 @@ type UploadConf struct {
 	UploadedFileTTLSeconds  int64  `json:",default=604800"`
 	EnableInstantUpload     bool   `json:",default=true"`
 	EnableChunkHashValidate bool   `json:",default=true"`
+}
+
+// HotFeedCacheConf 只缓存游客热榜的完整响应。登录用户需要实时 is_liked，始终绕过该缓存。
+type HotFeedCacheConf struct {
+	Enabled                  bool  `json:",default=true"`
+	AnonymousTTLMilliseconds int64 `json:",default=2000"`
+	RedisOpTimeoutMs         int64 `json:",default=300"`
+	BuildLockTTLMilliseconds int64 `json:",default=2000"`
+	BuildWaitMs              int64 `json:",default=250"`
 }

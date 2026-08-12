@@ -47,10 +47,10 @@ redis.call("SET", KEYS[2], ARGV[2], "PX", ARGV[3])
 return 1
 `
 
-// lockFollowAccounts 按主键升序锁住关注双方的账户行。
+// lockFollowAccounts 按主键升序锁住关注双方的账户行，并返回被关注者快照。
 // A 关注 B 与 B 关注 A 必须使用相同的加锁顺序，否则两个事务分别先锁
 // 对方账户时会形成经典的锁顺序反转。
-func lockFollowAccounts(ctx context.Context, tx *gorm.DB, followerID, followingID uint64) error {
+func lockFollowAccounts(ctx context.Context, tx *gorm.DB, followerID, followingID uint64) (model.Account, error) {
 	firstID, secondID := followerID, followingID
 	if firstID > secondID {
 		firstID, secondID = secondID, firstID
@@ -59,16 +59,89 @@ func lockFollowAccounts(ctx context.Context, tx *gorm.DB, followerID, followingI
 	var accounts []model.Account
 	if err := tx.WithContext(ctx).
 		Clauses(clause.Locking{Strength: "UPDATE"}).
-		Select("id").
+		Select("id", "follower_count", "following_count", "is_big_v").
 		Where("id IN ?", []uint64{firstID, secondID}).
 		Order("id ASC").
 		Find(&accounts).Error; err != nil {
-		return err
+		return model.Account{}, err
 	}
 	if len(accounts) != 2 {
-		return gorm.ErrRecordNotFound
+		return model.Account{}, gorm.ErrRecordNotFound
 	}
-	return nil
+	for _, account := range accounts {
+		if account.ID == followingID {
+			return account, nil
+		}
+	}
+	return model.Account{}, gorm.ErrRecordNotFound
+}
+
+// updateFollowAccountCounters 用一条 UPDATE 同时维护关注双方的冗余计数。
+// 两行此前已按主键顺序锁定，因此这里既不会丢更新，也不会形成锁顺序反转。
+// promoteBigCreator 由锁内快照计算，只升不降，不依赖同一 UPDATE 的字段赋值顺序。
+func updateFollowAccountCounters(
+	tx *gorm.DB,
+	followerID uint64,
+	followingID uint64,
+	delta int64,
+	promoteBigCreator bool,
+) error {
+	if delta != 1 && delta != -1 {
+		return fmt.Errorf("unsupported follow counter delta: %d", delta)
+	}
+
+	promote := 0
+	if promoteBigCreator {
+		promote = 1
+	}
+
+	return tx.Exec(`UPDATE accounts
+		SET follower_count = CASE
+				WHEN id = ? THEN GREATEST(CAST(follower_count AS SIGNED) + ?, 0)
+				ELSE follower_count
+			END,
+			following_count = CASE
+				WHEN id = ? THEN GREATEST(CAST(following_count AS SIGNED) + ?, 0)
+				ELSE following_count
+			END,
+			is_big_v = CASE
+				WHEN id = ? AND ? = 1 THEN 1
+				ELSE is_big_v
+			END
+		WHERE id IN (?, ?)`,
+		followingID,
+		delta,
+		followerID,
+		delta,
+		followingID,
+		promote,
+		followerID,
+		followingID,
+	).Error
+}
+
+// createSocialOutboxEvents 将同一次关注状态变化产生的领域事件与通知事件
+// 合并为一次多值 INSERT，减少事务内数据库往返。复制结构体可避免事务重试时
+// 复用 GORM 已回填的自增 ID。
+func createSocialOutboxEvents(tx *gorm.DB, events ...*model.OutboxEvent) error {
+	rows := socialOutboxRows(events...)
+	if len(rows) == 0 {
+		return nil
+	}
+	return tx.Create(&rows).Error
+}
+
+func socialOutboxRows(events ...*model.OutboxEvent) []model.OutboxEvent {
+	rows := make([]model.OutboxEvent, 0, len(events))
+	for _, event := range events {
+		if event == nil {
+			continue
+		}
+		row := *event
+		row.ID = 0
+		rows = append(rows, row)
+	}
+	return rows
 }
 
 // runSocialWriteTransaction 对整个关注写事务做有限重试。MySQL 发生 1213 时

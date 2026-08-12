@@ -148,7 +148,11 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 		RequestID: requestID,
 		Status:    model.CommentStatusNormal,
 	}
-	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+	if err := runInteractionWriteTransaction(l.ctx, l.svcCtx.GormDB, func(tx *gorm.DB) error {
+		// 前一次失败尝试可能已经被 GORM 回填自增 ID；重试必须重新申请主键。
+		comment.ID = 0
+		comment.CreatedAt = time.Time{}
+		comment.UpdatedAt = time.Time{}
 		if err := tx.Create(&comment).Error; err != nil {
 			return err
 		}

@@ -69,10 +69,9 @@ func insertProcessedEvent(ctx context.Context, tx *gorm.DB, eventID string, cons
 	return result.RowsAffected > 0, nil
 }
 
-// applyVideoStatDelta 更新 MySQL videos 表的冷备统计字段。
-// 方案 B 架构下，videos.likes_count/comments_count/popularity 只作为 Redis 权威计数的冷备份，
-// interaction_sync job 消费 Kafka 后异步维护；读侧永远读 Redis 权威 Hash，只在 Redis miss 时把
-// 冷备值作为初始基准 HSetNX 到 Redis。
+// applyVideoStatDelta 更新 MySQL videos 表的持久统计快照。
+// 同一个视频在一个 Flush 事务内只更新一次，同时递增 stats_version；Redis Consumer 投影会用
+// 这个版本做 CAS，防止并发批次把新快照覆盖成旧快照。
 func applyVideoStatDelta(ctx context.Context, tx *gorm.DB, videoID uint64, delta videoStatDelta) error {
 	updates := videoStatDeltaUpdates(delta)
 
@@ -89,16 +88,17 @@ func applyVideoStatDelta(ctx context.Context, tx *gorm.DB, videoID uint64, delta
 }
 
 // applyInteractionFlushBatch 将一个 RPC 批次放进同一个事务：先写消费幂等记录，
-// 再把首次消费事件按 video_id 聚合并按主键升序更新，减少事务提交和行锁死锁。
+// 再把首次消费事件按 video_id 聚合并按主键升序更新。事务提交后会读取批次涉及视频的
+// 最新持久快照；即使所有事件都是重放，调用方仍可重新投影 Redis，修复上一次失写。
 func applyInteractionFlushBatch(
 	ctx context.Context,
 	db *gorm.DB,
 	events []interactionFlushDBEvent,
 	consumerName string,
 	topic string,
-) error {
+) ([]videoStatsProjection, error) {
 	if len(events) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	orderedEvents := append([]interactionFlushDBEvent(nil), events...)
@@ -106,8 +106,13 @@ func applyInteractionFlushBatch(
 		return orderedEvents[i].EventID < orderedEvents[j].EventID
 	})
 
+	videoIDSet := make(map[uint64]struct{}, len(events))
+	for _, event := range events {
+		videoIDSet[event.VideoID] = struct{}{}
+	}
+
 	now := time.Now()
-	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		deltasByVideo := make(map[uint64]videoStatDelta)
 		for _, event := range orderedEvents {
 			inserted, err := insertProcessedEvent(ctx, tx, event.EventID, consumerName, topic, now)
@@ -135,6 +140,40 @@ func applyInteractionFlushBatch(
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	videoIDs := make([]uint64, 0, len(videoIDSet))
+	for videoID := range videoIDSet {
+		videoIDs = append(videoIDs, videoID)
+	}
+	sort.Slice(videoIDs, func(i, j int) bool { return videoIDs[i] < videoIDs[j] })
+	return loadVideoStatsProjections(ctx, db, videoIDs)
+}
+
+func loadVideoStatsProjections(ctx context.Context, db *gorm.DB, videoIDs []uint64) ([]videoStatsProjection, error) {
+	if len(videoIDs) == 0 {
+		return nil, nil
+	}
+
+	videos := make([]model.Video, 0, len(videoIDs))
+	if err := db.WithContext(ctx).
+		Select("id", "likes_count", "comments_count", "popularity", "stats_version").
+		Where("id IN ? AND status = ? AND deleted_at IS NULL", videoIDs, model.VideoStatusNormal).
+		Order("id ASC").
+		Find(&videos).Error; err != nil {
+		return nil, err
+	}
+
+	projections := make([]videoStatsProjection, 0, len(videos))
+	for _, video := range videos {
+		projections = append(projections, videoStatsProjection{
+			VideoID: video.ID,
+			Stats:   videoBaseStatsFromDB(video),
+		})
+	}
+	return projections, nil
 }
 
 func mergeVideoStatDelta(current videoStatDelta, delta videoStatDelta) videoStatDelta {
@@ -157,9 +196,10 @@ func videoStatDeltaUpdates(delta videoStatDelta) map[string]any {
 	// 聚合基准必须保留有符号增量。Kafka 是 at-least-once，历史消息也可能因
 	// dispatcher 并发、重试或人工重放暂时反序；若每一步都 GREATEST(..., 0)，
 	// "先 -1、后 +1"会错误收敛到 1。普通加法具备交换性，最终能按事件净和收敛。
-	// 用户可见值直接来自 Redis 权威 Hash；DB 冷备值只用于 Redis miss 时的冷启动兜底。
+	// 用户可见值优先来自 Redis 投影；MySQL 持久快照通过 stats_version CAS 同步到 Redis。
 	updates := map[string]any{
-		"popularity": gorm.Expr("popularity + ?", delta.PopularityDelta),
+		"popularity":    gorm.Expr("popularity + ?", delta.PopularityDelta),
+		"stats_version": gorm.Expr("stats_version + 1"),
 	}
 	if delta.LikeDelta != 0 {
 		updates["likes_count"] = gorm.Expr("likes_count + ?", delta.LikeDelta)

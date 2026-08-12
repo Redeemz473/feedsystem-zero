@@ -63,6 +63,7 @@ type Video struct {
 	LikesCount    int64      `gorm:"column:likes_count"`
 	CommentsCount int64      `gorm:"column:comments_count"`
 	Popularity    int64      `gorm:"column:popularity"`
+	StatsVersion  uint64     `gorm:"column:stats_version"`
 	Status        int32      `gorm:"column:status"`
 	DeletedAt     *time.Time `gorm:"column:deleted_at"`
 	CreatedAt     time.Time  `gorm:"column:created_at"`

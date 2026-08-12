@@ -26,10 +26,8 @@ func NewFlushCommentEventsLogic(ctx context.Context, svcCtx *svc.ServiceContext)
 	}
 }
 
-// FlushCommentEvents 消费 Kafka 后把评论事件累加到 MySQL videos 冷备字段。
-//
-// 方案 B 架构下 Redis VideoStatsAuthKey 是用户可见值的权威，此 RPC 仅负责冷备维护，
-// 不再申请 mutation lease、不再 ack Redis 增量。processed_events 唯一键保证幂等。
+// FlushCommentEvents 消费 Kafka 后更新 MySQL 持久统计，并把版本化快照投影到 Redis。
+// Redis 投影失败会触发 Kafka 重放；重复事件不会再次累计 DB，但会重新执行投影。
 func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommentEventsReq) (*interaction.FlushCommentEventsResp, error) {
 	events := in.GetEvents()
 	if err := validateInternalEventBatchSize(len(events)); err != nil {
@@ -55,15 +53,20 @@ func (l *FlushCommentEventsLogic) FlushCommentEvents(in *interaction.FlushCommen
 		dbEvents = append(dbEvents, interactionFlushDBEvent{EventID: eventID, VideoID: event.GetVideoId(), Delta: delta})
 	}
 
-	if err := applyInteractionFlushBatch(
+	projections, err := applyInteractionFlushBatch(
 		l.ctx,
 		l.svcCtx.GormDB,
 		dbEvents,
 		eventx.ConsumerCommentSync,
 		eventx.TopicInteractionCommentEvents,
-	); err != nil {
+	)
+	if err != nil {
 		l.Errorf("flush comment event batch failed, size:%d error:%v", len(dbEvents), err)
-		return nil, status.Error(codes.Internal, "批量刷新评论冷备失败")
+		return nil, status.Error(codes.Internal, "批量刷新评论统计失败")
+	}
+	if err := projectVideoStatsBatch(l.ctx, l.svcCtx.RedisCli, projections); err != nil {
+		l.Errorf("project comment stats to redis failed, videos:%d error:%v", len(projections), err)
+		return nil, status.Error(codes.Internal, "投影评论统计失败")
 	}
 
 	resp.SuccessCount = int64(len(dbEvents))

@@ -168,7 +168,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 	}
 
 	// 5. MySQL 事务：软删除点赞关系，并写 interaction、领域 outbox 和通知 outbox。
-	if err := l.svcCtx.GormDB.WithContext(l.ctx).Transaction(func(tx *gorm.DB) error {
+	if err := runInteractionWriteTransaction(l.ctx, l.svcCtx.GormDB, func(tx *gorm.DB) error {
 		result := tx.Model(&model.Like{}).
 			Where(
 				"video_id = ? AND user_id = ? AND status = ? AND deleted_at IS NULL",
@@ -215,7 +215,9 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 			return err
 		}
 		if notificationOutbox != nil {
-			return tx.Create(notificationOutbox).Error
+			attemptNotification := *notificationOutbox
+			attemptNotification.ID = 0
+			return tx.Create(&attemptNotification).Error
 		}
 		return nil
 	}); err != nil {

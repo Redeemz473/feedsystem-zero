@@ -13,6 +13,15 @@ BizRedis:
 Mysql:
   DataSource: root:123456@tcp(127.0.0.1:3308)/feedsystem_zero?charset=utf8mb4&parseTime=true&loc=Local
 
+# 游客热榜按分钟快照和分页参数缓存完整视频卡片，短 TTL 控制统计与资料的可见延迟。
+# 登录用户仍实时查询互动统计，避免共享 is_liked 个性化状态。
+HotFeedCache:
+  Enabled: true
+  AnonymousTTLMilliseconds: 2000
+  RedisOpTimeoutMs: 300
+  BuildLockTTLMilliseconds: 2000
+  BuildWaitMs: 250
+
 AccountRpc:
   Etcd:
     Hosts:

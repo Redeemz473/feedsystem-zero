@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS videos (
   likes_count BIGINT NOT NULL DEFAULT 0,
   comments_count BIGINT NOT NULL DEFAULT 0,
   popularity BIGINT NOT NULL DEFAULT 0,
+  stats_version BIGINT UNSIGNED NOT NULL DEFAULT 0,
   status TINYINT NOT NULL DEFAULT 1,
   deleted_at DATETIME NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -147,7 +148,8 @@ CREATE TABLE IF NOT EXISTS outbox_events (
   KEY idx_status_locked (status, locked_at, id),
   KEY idx_topic_status (topic, status, id),
   KEY idx_aggregate (aggregate_type, aggregate_id, id),
-  KEY idx_aggregate_status_id (aggregate_type, aggregate_id, status, id)
+  KEY idx_aggregate_status_id (aggregate_type, aggregate_id, status, id),
+  KEY idx_status_sent_id (status, sent_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS processed_events (
@@ -161,7 +163,8 @@ CREATE TABLE IF NOT EXISTS processed_events (
   expire_at DATETIME NULL,
   UNIQUE KEY uk_event_consumer (event_id, consumer_name),
   KEY idx_consumer_processed (consumer_name, processed_at),
-  KEY idx_expire_at (expire_at)
+  KEY idx_expire_at (expire_at),
+  KEY idx_expire_id (expire_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS dead_letter_events (
@@ -181,5 +184,6 @@ CREATE TABLE IF NOT EXISTS dead_letter_events (
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uk_consumer_message (consumer_name, topic, partition_no, offset_no),
   KEY idx_event_id (event_id),
-  KEY idx_topic_created (topic, created_at, id)
+  KEY idx_topic_created (topic, created_at, id),
+  KEY idx_created_id (created_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

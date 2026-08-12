@@ -1,6 +1,6 @@
 # feedsystem-zero
 
-> 从零重建的**短视频信息流后端**，参考抖音/B 站的读写分离架构。用 Go 单仓多服务的方式，把"账号 / 视频 / 互动 / 社交 / 通知 / Feed"六个业务域拆成独立 RPC，配套 7 个 Job Worker 处理派生数据的最终一致性。
+> 从零重建的**短视频信息流后端**，参考抖音/B 站的读写分离架构。用 Go 单仓多服务的方式，把"账号 / 视频 / 互动 / 社交 / 通知 / Feed"六个业务域拆成独立 RPC，配套 8 个 Job Worker 处理派生数据的最终一致性。
 
 <p align="left">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.25-00ADD8?logo=go">
@@ -16,13 +16,16 @@
 ## 一、项目亮点
 
 - 🧱 **单仓多服务**：`apps/{gateway, account, video, interaction, social, notification, feed}` + `apps/job/*`，同一个 Go module 内共享 `common/*` 与 `model/*`，避免多仓依赖同步的痛苦。
-- 🔗 **强一致写路径**：业务写入与派生事件在同一 MySQL 事务中落 `outbox_events`，由 outbox job 通过 `SKIP LOCKED` 抢占后发布到 Kafka，**禁止在业务代码里直接生产消息**。
+- 🔗 **强一致写路径**：业务写入与派生事件在同一 MySQL 事务中落 `outbox_events`；outbox job 使用 `READ COMMITTED + SKIP LOCKED` 短事务认领、租约超时接管和指数退避后发布到 Kafka，**禁止在业务代码里直接生产消息**。
 - 🌊 **最终一致派生数据**：Timeline / 未读数 / 视频计数 / 热榜等全部走 Kafka 事件驱动，消费者用 `processed_events` 唯一键保证幂等，失败进 `dead_letter_events` 旁路，不阻塞 partition。
-- ⚙️ **互动事件批量同步**：`interaction_sync` 按 topic+partition 组内保序、组间并发，每 500 条一个幂等事务；事件按视频聚合后升序更新，配合 Redis pending/acked/pending_count 保证最终收敛。
+- ⚙️ **互动事件批量同步**：`interaction_sync` 按 topic+partition 组内保序、组间并发，每 500 条一个幂等事务；事件按视频聚合后升序更新 MySQL 持久快照和 `stats_version`，再用 Lua CAS 批量投影 Redis。投影失败由 Kafka 重放自动修复，DB 不会重复计数。
+- 🔁 **热点写事务可恢复**：互动和关注写事务只对 MySQL `1213/1205` 做有限指数退避重试；事件 ID 在事务外固定，重试不会制造重复事件。Social 在固定顺序锁住双账户后，用一条 CASE UPDATE 维护双方计数、一次批量 INSERT 写两条 Outbox，缩短锁持有时间。
 - 🚀 **Feed 推拉分离**：小 V 走 fanout 写扩散到粉丝 inbox，大 V（`is_big_v` 只升不降）只写自己的 outbox，读侧懒加载合并 inbox 与关注的大 V outbox。
-- 🧠 **可控降级**：Redis 只作为加速层，Profile / Timeline / 未读数 / 评论首页均采用"版本号 + 惰性重算"，任何时刻 Redis 挂掉都能降级到 MySQL 直查。
+- 🧠 **可控降级**：Redis 作为高性能服务投影，Profile / Timeline / 未读数 / 评论首页均采用"版本号 + 惰性重算"；互动统计额外使用 MySQL `stats_version` 防旧快照覆盖，Redis 故障时可降级到 MySQL 持久快照。
+- 🔥 **Gateway 聚合加速**：视频卡片的 Account 与 Interaction 批量 RPC 并发执行；匿名热榜使用 2 秒完整响应缓存，并以本地 SingleFlight + Redis 分布式锁合并回源。登录用户绕过成品缓存，保证 `is_liked` 实时准确。
 - 📦 **文件秒传 + 一致性巡检**：分片上传 + 全局 file_hash 秒传；发布前批量校验唯一物理文件，事务内通过条件原子更新维护 `ref_count`，asset_cleanup 负责延迟物理删除、引用复活和 Active 资产对账。
-- 📊 **可复现压测**：内置造数、HTTP 压测和 E2E 工具，已完成 10000 用户、5000 视频规模验证，并对 Outbox、Kafka lag、Redis 增量和 MySQL 聚合做最终一致性验收。
+- 🧹 **事件数据生命周期治理**：独立 `event_cleanup` Job 通过覆盖索引先选 ID、再按主键小批删除 sent Outbox 和过期消费幂等记录；带批间节流、单轮预算和单批超时，死信默认永久保留。
+- 📊 **可复现压测**：内置造数、HTTP 压测和 E2E 工具，已完成 10000 用户、5000 视频规模验证，并对 Outbox、Kafka lag、Redis 版本投影和 MySQL 聚合做最终一致性验收。
 - 🎨 **配套前端**：`web/` 目录内是 Vite + React 18 + TS + Tailwind + TanStack Query 实现的完整前端，覆盖登录、上传、播放、点赞、评论、关注、通知全流程。
 
 ---
@@ -36,13 +39,13 @@ flowchart LR
     Gateway -->|gRPC| RPCs["Account · Video · Interaction<br/>Social · Notification · Feed"]
 
     RPCs --> MySQL[("MySQL<br/>业务表 + outbox_events<br/>+ processed_events + dead_letter")]
-    RPCs --> Redis[("Redis<br/>版本号缓存 / Timeline ZSet<br/>热榜 / 未读数 / 秒传全局哈希")]
+    RPCs --> Redis[("Redis<br/>版本号缓存 / 统计服务投影<br/>Timeline / 热榜 / 未读数 / 秒传哈希")]
 
     MySQL -.outbox.-> OutboxJob["outbox job"]
     OutboxJob -->|publish| Kafka[("Kafka · 6 topics")]
 
     Kafka --> Jobs["interaction_sync · social_sync<br/>feed_timeline · hotrank · notification"]
-    MySQL -.轮询.-> AssetCleanup["asset_cleanup job"]
+    MySQL -.轮询.-> CleanupJobs["asset_cleanup · event_cleanup"]
 
     Jobs --> Redis
     Jobs --> MySQL
@@ -69,13 +72,14 @@ flowchart LR
 
 | Job | 消费 topic | 主要动作 |
 |---|---|---|
-| **outbox** | — | 扫描 `outbox_events`，SKIP LOCKED 抢占后投递到 Kafka |
-| **interaction_sync** | `interaction.like.events` / `interaction.comment.events` | topic+partition 并发；500 条批量幂等落库 → Redis eventID ack |
+| **outbox** | — | `READ COMMITTED + SKIP LOCKED` 短事务认领，租约保护并发投递、失败退避重试 |
+| **interaction_sync** | `interaction.like.events` / `interaction.comment.events` | topic+partition 并发；500 条批量幂等更新 MySQL + `stats_version` → Redis 版本 CAS 投影 |
 | **social_sync** | `social.follow.events` | 关注状态缓存 & Profile 版本号 bump |
 | **feed_timeline** | `feed.video.events` / `social.follow.events` | 推拉分离扇出，ready 丢失时主动 bootstrap |
 | **hotrank** | `interaction.like.events` / `interaction.comment.events` | 独立维护 UTC 分钟窗口，Feed 按需构建衰减快照 |
 | **notification** | `notification.events` | 通知落库、未读数 version bump、死信旁路 |
 | **asset_cleanup** | 无（轮询扫库） | 延迟物理清理 file_assets，校准 ref_count，巡检磁盘缺失资产 |
+| **event_cleanup** | 无（轮询扫库） | 带批间节流和单轮时间预算地清理已发送 Outbox、过期消费幂等记录；死信默认保留 |
 
 ---
 
@@ -94,7 +98,13 @@ docker-compose up -d
 # Kafka localhost:9094
 ```
 
-建表 SQL 通过 `docker-entrypoint-initdb.d` 首次启动自动执行 `deploy/sql/001_*.sql ~ 016_*.sql`。
+建表 SQL 通过 `docker-entrypoint-initdb.d` 首次启动自动执行 `deploy/sql/001_*.sql ~ 017_*.sql`。已有数据库升级时需单独执行：
+
+```bash
+sudo docker exec -i feedsystem-zero-mysql \
+  mysql -uroot -p123456 feedsystem_zero \
+  < deploy/sql/017_stats_projection_and_event_cleanup.sql
+```
 
 ### 4.2 建 Kafka Topic
 
@@ -135,6 +145,7 @@ go run apps/job/feed_timeline/feed_timeline.go       -f apps/job/feed_timeline/e
 go run apps/job/hotrank/hotrank.go                   -f apps/job/hotrank/etc/hotrank.yaml
 go run apps/job/notification/notification.go        -f apps/job/notification/etc/notification.yaml
 go run apps/job/asset_cleanup/asset_cleanup.go       -f apps/job/asset_cleanup/etc/asset_cleanup.yaml
+go run apps/job/event_cleanup/event_cleanup.go       -f apps/job/event_cleanup/etc/event_cleanup.yaml
 ```
 
 ### 4.4 起前端
@@ -187,7 +198,8 @@ feedsystem-zero/
 │       ├── feed_timeline/          # 推拉分离 Timeline 扇出
 │       ├── hotrank/                # 热榜聚合
 │       ├── notification/           # 通知落库 & 未读数 bump
-│       └── asset_cleanup/          # 文件资产延迟物理清理
+│       ├── asset_cleanup/          # 文件资产延迟物理清理
+│       └── event_cleanup/          # Outbox / 消费幂等 / 死信分批清理
 ├── common/
 │   ├── eventx/             # Kafka topic、envelope、payload schema
 │   ├── feedx/              # Timeline member 编码 & 大 V 判定
@@ -199,7 +211,7 @@ feedsystem-zero/
 │   └── emailx/             # 邮件（注册验证码）
 ├── deploy/
 │   ├── docker-compose.yml  # MySQL / Redis / etcd / Kafka 一键起
-│   ├── sql/                # 001 ~ 016 建表、索引与迁移脚本
+│   ├── sql/                # 001 ~ 017 建表、索引与迁移脚本
 │   └── kafka/              # topic 创建脚本
 ├── model/                  # 事件与 GORM 表共享模型
 ├── docs/                   # 项目文档
@@ -227,20 +239,21 @@ go run ./tests/cmd/loadtest \
 
 | 场景 | 参数 | 成功率 | QPS | P99 |
 |---|---|---:|---:|---:|
-| 发布视频（当前优化，3 轮中位数） | 5 并发 / 10s | 100% | 302.2 | 25ms |
-| 发布视频（当前优化，并发回归） | 20 并发 / 30s | 100% | 542.1 | 60ms |
-| 发布视频（强一致初版饱和压力） | 50 并发 / 60s | 100% | 568.2 | 286ms |
-| 关注 | 10 并发 / 10s | 100% | 354.7 | 54ms |
-| 关注流 | 20 并发 / 30s | 100% | 1076.8 | 30ms |
-| 热榜缓存命中 | 50 并发 / 30s | 100% | 7503.4 | 16ms |
-| 热榜冷快照构建 | 50 并发 / 30s | 100% | 1428.1 | 54ms |
-| 点赞正式规模 | 50 并发 / 60s | 100% | 260.4 次循环/s | 374ms |
+| 发布视频（3 轮中位数） | 5 并发 / 10s | 100% | 294.2 | 26ms |
+| 发布视频（并发回归） | 20 并发 / 30s | 100% | 543.8 | 62ms |
+| 发布视频（饱和压力） | 50 并发 / 60s | 100% | 572.9 | 182ms |
+| 关注（3 轮中位数） | 10 并发 / 10s | 100% | 316.4 | 54ms |
+| 关注流（3 轮中位数） | 20 并发 / 30s | 100% | 1160.8 | 28ms |
+| 非空匿名热榜缓存命中（3 轮中位数） | 50 并发 / 30s | 100% | 8468.8 | 15ms |
+| 点赞正式规模 | 50 并发 / 60s | 100% | 318.0 次循环/s | 325ms |
 
-> 点赞场景一次循环包含 Like + Unlike 两个写请求，`260.4 次循环/s` 约等于 `520.8 HTTP 写请求/s`。优化后的 Kafka 消息在压测结束约 7 秒后排空；最终未投递 Outbox、互动死信、Kafka lag、Redis delta/pending 和三类 MySQL 对账差异均为 0。
+热榜冷快照使用单请求口径测试：显式删除当前分钟的 merge 快照、ready 标记和 Gateway 成品缓存后连续重建 3 次，均返回 20 条数据，耗时分别为 `15.856ms / 8.799ms / 10.646ms`，平均 **11.77ms**、最大 **15.86ms**。
 
-> 强一致初版采用 `file_assets SELECT FOR UPDATE` 后在锁内校验 `storage_path`，`c=5` QPS 从无校验基线 318.7 降至 288.2。当前实现改为“事务外批量预检 + 事务内条件原子 UPDATE”，并消除正常幂等 miss 的错误日志；最终三轮 QPS 为 `302.2 / 304.8 / 299.9`，中位数 302.2：相比强一致初版回升约 4.9%，收回约 46% 的吞吐损失；相比无校验基线仍低约 5.2%。成功率保持 100%，排空后未投递 Outbox 和资产引用差异均为 0。
+> 点赞场景一次循环包含 Like + Unlike 两个写请求，`318.0 次循环/s` 约等于 `636 HTTP 写请求/s`。压测后的 Outbox 与 Kafka lag 均收敛为 0，旧 delta/pending key 无残留，Redis 版本投影、视频互动聚合、社交计数和文件资产引用对账差异也均为 0。
 
-关键包已通过 `go test -race`，`go vet` 无输出。完整命令、优化前后对照和一致性 SQL 见 [完整测试记录](./docs/PROJECT_OVERVIEW.md#146-测试压测与一致性验收2026-08-03发布链路回归于-2026-08-07)。E2E 冒烟目前唯一的环境限制是 `@loadtest.local` 虚构邮箱无法通过真实 163 SMTP 接收验证码。
+> 发布视频链路包含真实文件存在性校验、资产引用条件原子更新和 Outbox 写入。最终 `c=5` 三轮 QPS 为 `293.4 / 294.2 / 296.6`，中位数 294.2；`c=50` 压力下仍保持 100% 成功率，P99 由上一轮强一致实现的 286ms 降至 182ms。排空后未投递 Outbox、Feed Kafka lag 和资产引用差异均为 0。
+
+关键包已通过 `go test -race`，`go vet` 无输出。完整命令、三轮原始结果、测试口径和一致性 SQL 见 [完整测试记录](./docs/PROJECT_OVERVIEW.md#146-测试压测与一致性验收2026-08-13-最终回归)。E2E 冒烟目前唯一的环境限制是 `@loadtest.local` 虚构邮箱无法通过真实 163 SMTP 接收验证码。
 
 ---
 

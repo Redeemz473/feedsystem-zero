@@ -3,6 +3,7 @@ package logic
 import (
 	"context"
 	"strconv"
+	"time"
 
 	"feedsystem-zero/apps/interaction/interaction"
 	imodel "feedsystem-zero/apps/interaction/internal/model"
@@ -23,6 +24,7 @@ type videoBaseStats struct {
 	LikesCount    int64
 	CommentsCount int64
 	Popularity    int64
+	StatsVersion  uint64
 }
 
 type BatchGetVideoStatsLogic struct {
@@ -39,8 +41,8 @@ func NewBatchGetVideoStatsLogic(ctx context.Context, svcCtx *svc.ServiceContext)
 	}
 }
 
-// BatchGetVideoStats 读侧完全以 Redis 权威 Hash（VideoStatsAuthKey）为准。
-// 命中即返回，miss 时用 MySQL videos 冷备值调 Lua 冷启动 auth key，之后所有读者都直接读 Redis。
+// BatchGetVideoStats 优先读取 Redis 版本化统计投影；miss 时批量读取 MySQL 持久快照，
+// 再用一条 Pipeline 原子冷启动全部 key。Redis 故障时直接降级返回 MySQL 快照。
 func (l *BatchGetVideoStatsLogic) BatchGetVideoStats(in *interaction.BatchGetVideoStatsReq) (*interaction.BatchGetVideoStatsResp, error) {
 	// 1. 校验 video_ids，并去重保序；限制单次批量数量，避免大请求压垮 Redis/MySQL。
 	viewerID := in.GetViewerId()
@@ -118,13 +120,15 @@ func normalizeBatchVideoIDs(rawVideoIDs []uint64) ([]uint64, error) {
 	return videoIDs, nil
 }
 
-// loadAuthStats 用 Pipeline 批量 HGetAll 权威 Hash。命中的视频写入 statsMap，
-// 未命中的返回给调用方后续走 DB 冷启动。
+// loadAuthStats 用 Pipeline 批量 HGetAll 并刷新 TTL。字段不完整的旧 key 视为 miss，
+// 后续会用带 stats_version 的 MySQL 快照重建。
 func (l *BatchGetVideoStatsLogic) loadAuthStats(videoIDs []uint64, statsMap map[uint64]videoBaseStats) []uint64 {
 	pipe := l.svcCtx.RedisCli.Pipeline()
 	cmdMap := make(map[uint64]*redis.MapStringStringCmd, len(videoIDs))
 	for _, videoID := range videoIDs {
-		cmdMap[videoID] = pipe.HGetAll(l.ctx, rediskey.VideoStatsAuthKey(videoID))
+		key := rediskey.VideoStatsAuthKey(videoID)
+		cmdMap[videoID] = pipe.HGetAll(l.ctx, key)
+		pipe.Expire(l.ctx, key, rediskey.VideoStatsAuthTTL)
 	}
 
 	if _, err := pipe.Exec(l.ctx); err != nil {
@@ -141,56 +145,76 @@ func (l *BatchGetVideoStatsLogic) loadAuthStats(videoIDs []uint64, statsMap map[
 			missVideoIDs = append(missVideoIDs, videoID)
 			continue
 		}
-		if len(hashMap) == 0 {
+		authStats, ok := parseVideoStatsAuthHash(hashMap)
+		if !ok {
 			missVideoIDs = append(missVideoIDs, videoID)
 			continue
 		}
 
 		statsMap[videoID] = videoBaseStats{
-			LikesCount:    parseInt64(hashMap["likes_count"]),
-			CommentsCount: parseInt64(hashMap["comments_count"]),
-			Popularity:    parseInt64(hashMap["popularity"]),
+			LikesCount:    authStats.LikesCount,
+			CommentsCount: authStats.CommentsCount,
+			Popularity:    authStats.Popularity,
+			StatsVersion:  authStats.StatsVersion,
 		}
 	}
 
 	return missVideoIDs
 }
 
-// coldStartAuthStats 一次性从 MySQL 读取 miss 视频的冷备统计，
-// 然后逐个视频通过 readVideoStatsAuthScript 原子建立 auth key（并发安全）。
+// coldStartAuthStats 一次性从 MySQL 读取 miss 视频的持久统计，
+// 再通过单条 Pipeline 批量执行版本化冷启动 Lua，避免每个视频一次网络往返。
 // 已被删除的视频保持 statsMap 里的零值，读侧对外仍返回 0。
 func (l *BatchGetVideoStatsLogic) coldStartAuthStats(videoIDs []uint64, statsMap map[uint64]videoBaseStats) error {
 	var videos []imodel.Video
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).
-		Select("id", "likes_count", "comments_count", "popularity").
+		Select("id", "likes_count", "comments_count", "popularity", "stats_version").
 		Where("id IN ? AND status = ? AND deleted_at IS NULL", videoIDs, imodel.VideoStatusNormal).
 		Find(&videos).Error; err != nil {
 		return err
 	}
 
+	pipe := l.svcCtx.RedisCli.Pipeline()
+	cmdMap := make(map[uint64]*redis.Cmd, len(videos))
 	for _, video := range videos {
 		base := videoBaseStatsFromDB(video)
-		authStats, err := readVideoStatsAuthWithBase(l.ctx, l.svcCtx.RedisCli, video.ID, base)
+		// 先写入 DB 降级值；Pipeline 整体失败时无需再串行重试 Redis。
+		statsMap[video.ID] = videoBaseStats{
+			LikesCount:    base.LikesCount,
+			CommentsCount: base.CommentsCount,
+			Popularity:    base.Popularity,
+			StatsVersion:  base.StatsVersion,
+		}
+		cmdMap[video.ID] = pipe.Eval(
+			l.ctx,
+			readVideoStatsAuthScript,
+			[]string{rediskey.VideoStatsAuthKey(video.ID)},
+			strconv.FormatInt(base.LikesCount, 10),
+			strconv.FormatInt(base.CommentsCount, 10),
+			strconv.FormatInt(base.Popularity, 10),
+			strconv.FormatUint(base.StatsVersion, 10),
+			strconv.FormatInt(int64(rediskey.VideoStatsAuthTTL/time.Second), 10),
+		)
+	}
+
+	if _, err := pipe.Exec(l.ctx); err != nil {
+		l.Errorf("batch cold start auth stats failed, videos:%d err:%v", len(videos), err)
+		return nil
+	}
+
+	for _, video := range videos {
+		values, err := cmdMap[video.ID].Slice()
 		if err != nil {
-			// Redis 不可用时降级：直接把 DB 冷备值写入 statsMap，读侧返回冷备快照。
-			l.Errorf("cold start read auth stats failed, video_id:%d err:%v", video.ID, err)
-			statsMap[video.ID] = videoBaseStats{
-				LikesCount:    base.LikesCount,
-				CommentsCount: base.CommentsCount,
-				Popularity:    base.Popularity,
-			}
+			l.Errorf("parse cold start auth stats failed, video_id:%d err:%v", video.ID, err)
 			continue
 		}
+		authStats := parseVideoStatsAuthResult(values)
 		statsMap[video.ID] = videoBaseStats{
 			LikesCount:    authStats.LikesCount,
 			CommentsCount: authStats.CommentsCount,
 			Popularity:    authStats.Popularity,
+			StatsVersion:  authStats.StatsVersion,
 		}
 	}
 	return nil
-}
-
-func parseInt64(value string) int64 {
-	n, _ := strconv.ParseInt(value, 10, 64)
-	return n
 }

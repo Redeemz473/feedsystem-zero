@@ -30,7 +30,13 @@ func NewGetHotFeedLogic(ctx context.Context, svcCtx *svc.ServiceContext) *GetHot
 func (l *GetHotFeedLogic) GetHotFeed(req *types.GetHotFeedReq) (resp *types.GetHotFeedResp, err error) {
 	// 未登录也可访问，viewerID=0 表示游客。
 	viewerID := optionalUserIDFromCtx(l.ctx)
+	if viewerID == 0 && l.svcCtx.Config.HotFeedCache.Enabled {
+		return l.getCachedAnonymousHotFeed(req)
+	}
+	return l.buildHotFeed(req, viewerID)
+}
 
+func (l *GetHotFeedLogic) buildHotFeed(req *types.GetHotFeedReq, viewerID uint64) (*types.GetHotFeedResp, error) {
 	rpcResp, err := l.svcCtx.FeedRpc.GetHotFeed(l.ctx, &feedclient.GetHotFeedReq{
 		ViewerId:   viewerID,
 		SnapshotAt: req.Snapshotat,

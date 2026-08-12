@@ -27,11 +27,9 @@ func NewFlushLikeEventsLogic(ctx context.Context, svcCtx *svc.ServiceContext) *F
 	}
 }
 
-// FlushLikeEvents 消费 Kafka 后把点赞事件累加到 MySQL videos 冷备字段。
-//
-// 方案 B 架构下 Redis VideoStatsAuthKey 是用户可见值的权威，此 RPC 仅负责冷备维护，
-// 不再申请 mutation lease、不再 ack Redis 增量。processed_events 唯一键保证 at-least-once
-// 消费的幂等性；即使 Kafka 重投递、丢失一段时间后追赶，videos 冷备也能靠有符号增量最终收敛。
+// FlushLikeEvents 消费 Kafka 后更新 MySQL 持久统计，并把版本化快照投影到 Redis。
+// processed_events 保证 DB 增量幂等；Redis 投影失败时 RPC 返回失败，Kafka 重放会跳过 DB 增量，
+// 但仍重新投影最新快照，实现失写自动恢复。
 func (l *FlushLikeEventsLogic) FlushLikeEvents(in *interaction.FlushLikeEventsReq) (*interaction.FlushLikeEventsResp, error) {
 	events := in.GetEvents()
 	if err := validateInternalEventBatchSize(len(events)); err != nil {
@@ -57,15 +55,20 @@ func (l *FlushLikeEventsLogic) FlushLikeEvents(in *interaction.FlushLikeEventsRe
 		dbEvents = append(dbEvents, interactionFlushDBEvent{EventID: eventID, VideoID: event.GetVideoId(), Delta: delta})
 	}
 
-	if err := applyInteractionFlushBatch(
+	projections, err := applyInteractionFlushBatch(
 		l.ctx,
 		l.svcCtx.GormDB,
 		dbEvents,
 		eventx.ConsumerLikeSync,
 		eventx.TopicInteractionLikeEvents,
-	); err != nil {
+	)
+	if err != nil {
 		l.Errorf("flush like event batch failed, size:%d error:%v", len(dbEvents), err)
-		return nil, status.Error(codes.Internal, "批量刷新点赞冷备失败")
+		return nil, status.Error(codes.Internal, "批量刷新点赞统计失败")
+	}
+	if err := projectVideoStatsBatch(l.ctx, l.svcCtx.RedisCli, projections); err != nil {
+		l.Errorf("project like stats to redis failed, videos:%d error:%v", len(projections), err)
+		return nil, status.Error(codes.Internal, "投影点赞统计失败")
 	}
 
 	resp.SuccessCount = int64(len(dbEvents))
