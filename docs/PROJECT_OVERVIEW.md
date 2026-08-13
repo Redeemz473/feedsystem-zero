@@ -2211,6 +2211,274 @@ sequenceDiagram
     Note over IS,R: Redis 失败则 Kafka 重放；<br/>processed_events 跳过 DB 增量但仍重投影。
 ```
 
+##### 五、`stats_version` 到底是什么？以及批处理时序抖动为何被接受
+
+前面几节反复出现的 `stats_version` 字段是这套双写体系的“新旧仲裁锚”。这里把常见的误解和临界时序一次讲透。
+
+###### 5.1 版本号只有一份，MySQL 是唯一生产者
+
+一个很容易踩的误解：“Redis 里存了一份 Redis 自己的版本号，MySQL 里存了另一份 MySQL 自己的版本号，两边各自 +1”。
+
+**实际上 `stats_version` 只是同一个逻辑版本号在两个存储里的两份镜像**：
+
+| 存储 | 字段 | 谁写它 | 何时变化 |
+|---|---|---|---|
+| MySQL `videos` 表 | `stats_version` | interaction_sync Consumer 的 Flush 事务：`stats_version = stats_version + 1` | **每次 Flush 事务提交时 +1** |
+| Redis `VideoStatsAuthKey` Hash | `stats_version` 字段 | Consumer 的 `projectVideoStatsScript` 用 MySQL 的新版本号覆盖过来 | 只在 Consumer 投影时被写入；**用户同步点赞的 `HINCRBY` 不改这个字段** |
+
+也就是说：
+
+- **用户点赞 → Redis `HINCRBY likes_count +1`**，此时 Redis 的 `stats_version` **保持不变**；
+- **Kafka Consumer Flush → MySQL 事务里 `stats_version += 1` → 用新版本号投影 Redis**，此时 Redis 的 `stats_version` 才会推进到新值。
+
+把版本号理解成“MySQL 快照的时间戳”——它标记的是“Redis 里这份数据最近一次被哪一版 MySQL 快照覆盖过”。
+
+###### 5.2 每次 Flush 都会覆盖 Redis，这是设计意图
+
+按 §5.1 的定义，任意一次 Flush 之后必然满足 `new_mysql_version > current_redis_version`，所以 `projectVideoStatsScript` 的版本比较总是通过的：**每一次 Flush 都会覆盖 Redis 的四个字段**。
+
+这一点乍看反直觉——“既然每次都覆盖，那版本号还有什么用？”
+
+关键在于：**在正常路径下，MySQL Flush 完的 `likes_count` 值就等于 Redis 已经通过 HINCRBY 增到的值**，覆盖前后 Redis 的字段值不变，动作幂等无害。举例：
+
+```
+初始:  MySQL.likes=100, MySQL.version=5, Redis.likes=100, Redis.version=5
+
+用户 A~E 5 人点赞：
+  同步 HINCRBY：Redis.likes = 105, Redis.version 保持 5
+  5 条 outbox 事件排队
+
+Consumer Flush（拿到这 5 条）：
+  MySQL.likes = 100 + 5 = 105，MySQL.version = 5 + 1 = 6
+  投影 Redis：new_version=6 ≥ 5，覆盖
+  Redis.likes = 105（值没变），Redis.version = 6
+```
+
+版本号真正防的是**下面三种异常路径**，而不是正常覆盖：
+
+| 异常场景 | 版本号的作用 |
+|---|---|
+| Kafka 消息重试/延迟送达一份旧 Flush 快照 | 旧 batch 携带的版本号 < Redis 现有版本号，Lua 直接返回 0，不覆盖 |
+| Consumer 多实例、rebalance 后进度乱序 | 落后实例的快照版本旧于 Redis 现有版本，被拦下 |
+| Redis 权威 Hash 意外过期后被冷启动重建 | 后续更高版本的 Flush 快照能顺利覆盖冷启动占位，保证收敛 |
+
+一句话：**版本号不是用来阻止 Consumer 正常覆盖 Redis 的，而是给覆盖动作排序、防止“过期快照回滚新数据”。**
+
+###### 5.3 临界时序：Flush 窗口内的新点赞会造成短暂负向抖动
+
+现在到了最微妙的一个场景。考虑下面这一串时间线：
+
+```
+初始:  MySQL.likes=100 / version=5，Redis.likes=100 / version=5
+       outbox 排队 100 条 pending 点赞事件
+
+t=0    Consumer 开始 Flush：
+       SELECT outbox WHERE status=pending → 拿到这 100 条
+       （此瞬间 outbox 里还没有更多新事件）
+
+t=1    ⚡ 用户 X 发起一次新的点赞：
+       MySQL 事务：INSERT likes、INSERT outbox_events(第 101 条)、COMMIT ✓
+       同步 HINCRBY：Redis.likes = 201
+
+t=2    Consumer 完成 MySQL Flush（本批只含前 100 条）：
+       UPDATE videos SET likes_count = 100 + 100 = 200,
+                         stats_version = 5 + 1 = 6
+       事务提交 ✓                                      ← ⚠️ 少了用户 X 的 +1
+
+t=3    Consumer 投影 Redis：
+       new_version=6 ≥ Redis.version=5，覆盖
+       Redis.likes = 200，Redis.version = 6           ← ⚠️ 从 201 短暂回退到 200
+```
+
+**用户 X 会看到自己刚点的赞在 1~3 秒内被“抹掉一次”，然后又回来。** 这不是 bug，是本架构明确接受的一次抖动，原因如下：
+
+- **窗口极短**：outbox dispatcher 轮询 + Consumer Flush 攒批，抖动窗口大约 `1~3 秒`；
+- **幅度极小**：抖动幅度等于“错过本班车的那几条点赞事件”，通常 ±几，不会出现从 1000 掉回 500 这种视觉灾难；
+- **自愈收敛**：用户 X 的 outbox 事件仍是 `pending`，会随下一批 Flush 更新 MySQL 到 201、`stats_version = 7`，再次覆盖 Redis 到 201，永久保持正确；
+- **前端可屏蔽**：客户端只需实现“显示值只增不减、以本次会话内的最大值为准”即可屏蔽这段抖动；
+- **替代方案代价高**：任何试图消除这段抖动的方案（在 Flush 上加 `SELECT ... FOR UPDATE` 阻塞新点赞、放弃批量 Flush、Redis 侧再分“base / delta”双字段等）都会显著牺牲吞吐或提升系统复杂度。
+
+用心智模型看得更清楚：
+
+```
+Redis.likes  =  MySQL_last_flushed_snapshot  +  pending_hincrby_delta
+                （前半：Consumer 投影覆盖）    （后半：同步 HINCRBY 累加）
+```
+
+Consumer 投影本质上是“刷新前半、把后半清零”。多数时候 pending_hincrby_delta ≈ 0，覆盖无感；只有恰好在 Flush 窗口内产生的新点赞会被“临时清零”，随后由下一批 Flush 补回。
+
+###### 5.4 什么错误版本号也救不了？——反过来说明它的边界
+
+版本号只保证“Redis 的四字段快照单调按版本推进”。它**不保证**：
+
+- Redis 里的实时值总是等于 MySQL 里的持久值（异步链路必然有秒级窗口偏差）；
+- 单次 Consumer 投影“无漏地包含所有已发生的点赞”（Flush 窗口内的新事件会推迟到下一批）；
+- 客户端每次刷新看到的数字单调递增（前端需自行做“只增不减”策略）。
+
+它**保证**：
+
+- 相同或更新版本可以覆盖 Redis，旧版本永远不能回滚 Redis 快照；
+- Kafka 重放/Consumer 乱序不会把 Redis 已推进的快照踩回旧值；
+- Redis 冷启动或过期重建后能被更新版本的 Flush 快照顺利收敛；
+- 从长期看，Redis `likes_count = MySQL.likes_count = Σ 所有已消费 like 事件的 delta`，最终一致。
+
+**版本号 + Lua CAS + outbox at-least-once + processed_events 幂等**，共同构成“允许短暂抖动、绝不永久错位”的最终一致语义。
+
+###### 5.5 用户点赞后拿到的返回值是什么？——Lua 原子性与并发排队
+
+前面几节回答的是"Redis 里存的值怎么演化"。这一节回答的是"每一次 `LikeVideo` RPC 具体返回给客户端一个什么数字"。
+
+回顾 `bumpVideoStatsAuthScript` 的核心 4 行：
+
+```lua
+local likes    = redis.call("HINCRBY", KEYS[1], "likes_count", ARGV[5])
+local comments = redis.call("HINCRBY", KEYS[1], "comments_count", ARGV[6])
+local pop      = redis.call("HINCRBY", KEYS[1], "popularity",   ARGV[7])
+redis.call("EXPIRE", KEYS[1], ARGV[8])
+return {likes, comments, pop, redis.call("HGET", KEYS[1], "stats_version")}
+```
+
+**`HINCRBY` 返回的是"执行完本次自增之后的最新值"**，所以 `likes` 变量拿到的就是：
+
+> 从冷启动基准建立起、到本次 `+1` 原子落地那一瞬间为止，Redis 权威 Hash 里 `likes_count` 字段的**实时累计总和**。
+
+拆开看这个总和的组成：
+
+```
+返回值 = 冷启动基准（首次从 MySQL 快照 HSET 进来的 likes_count）
+       + 从冷启动到现在，之前所有同步点赞 HINCRBY 的累加
+       + 期间 Consumer projectVideoStatsScript CAS 覆盖过的 MySQL 快照增量
+       + 本次调用的 +1
+```
+
+**并发点赞的排队语义**：Redis 单线程 + Lua 原子块共同保证——即使两个协程同一微秒调用 `EVAL`，Redis 也会串行执行两次脚本，绝不并行。举例：
+
+```
+Redis 内部串行执行序列：
+  用户 A 的 Lua：HINCRBY likes +1 → 101，返回给 A
+  用户 B 的 Lua：HINCRBY likes +1 → 102，返回给 B
+  用户 C 的 Lua：HINCRBY likes +1 → 103，返回给 C
+```
+
+结论：**任何两个并发用户都不可能拿到同一个返回值，也不会出现"我 +1 却读回旧值"的 lost update**——这正是 Lua/`HINCRBY` 取代"客户端 `GET → +1 → SET`"的核心价值。
+
+**几个需要留意的边界情况**：
+
+- **返回值可能领先 MySQL**：你此刻拿到 205，MySQL 里可能还是 100，Kafka 消息还没消费到——这是正常的，Redis 是实时视图、MySQL 是最终一致视图。
+- **返回值不承诺全局单调**：参见 §5.3，Consumer 用旧 batch 快照覆盖 Redis 时，**其他观察者**接下来读到的值可能一次性回退 1~几；但**你自己这次调用返回给客户端的数字永远是准确的**，抖动只影响后续观察者。
+- **冷启动 + 首次点赞**：如果 Hash 不存在，Lua 会先用 MySQL `videos` 表中的 `likes_count` 快照建立基准，再在此基础上 `+1`——所以第一个点赞的用户拿到的是"MySQL 已存快照 + 1"，不会漏也不会重（详见 §5.6）。
+
+**为什么 `HINCRBY`/`Lua` 是必要的、而不是 Go 层 `GET → +1 → SET`**：
+
+| 方案 | 高并发下的行为 |
+|---|---|
+| Go 层 `GET → +1 → SET` | 两个协程都 GET=100 → 各自算成 101 → 各自 SET=101，**丢失一次点赞**（经典 lost update） |
+| Redis `INCR` / `HINCRBY` | 命令内部原子，两次调用必然拿到不同的返回值 |
+| Lua 脚本封装 | 在 `HINCRBY` 之上再叠加"冷启动 + 多字段 + EXPIRE"的整体原子性，杜绝跨字段中间态与冷启动竞态 |
+
+###### 5.6 冷启动详解：为什么需要冷启动、以及冷启动是怎么做的
+
+**"冷启动"** 特指：`VideoStatsAuthKey` 权威 Hash 在 Redis 中**不存在**时，第一次触碰它的那次调用必须先把 MySQL 快照"拉起"，在此基础上执行本次读或写。
+
+**为什么会出现 Hash 不存在的场景？**
+
+| 触发原因 | 举例 |
+|---|---|
+| 视频从未被互动过 | 刚发布的新视频，`videos` 表已经落了初始快照（可能为 0，也可能是历史迁移进来的非零值），但没人点赞/评论过，Redis 里从来没写过这个 key |
+| Hash 到期自动淘汰 | 参照 §8.3.3 三节的 TTL 规则，`VideoStatsAuthTTL = 7 天`，7 天内既没读也没写就会自动过期，冷门视频会自然掉出 Redis |
+| Redis `maxmemory` 触发 LRU 淘汰 | 内存紧张时 Redis 主动逐出旧 key，即使 TTL 未到也可能失踪 |
+| Redis 实例重启/主从切换 | 若持久化配置不足，重启后大量 key 消失，属于批量冷启动场景 |
+| 视频被 UP 主删除后主动 `DEL` 又意外恢复 | 边界情况，一般不会发生 |
+
+**为什么冷启动必须小心？**
+
+如果 Hash 不存在时不做任何基准初始化，而是**直接** `HINCRBY likes_count +1`，Redis 会把不存在的字段视为 0，得到 `likes_count = 1`——这**把 MySQL 已经积累的历史点赞数（可能是 500、1000、10000）全部丢失**。用户看到的就是"这个视频点赞数从几千瞬间掉到 1"，且这个错误值还会被下一次 Consumer 投影覆盖修正，中间造成明显闪烁。
+
+**冷启动怎么做？——写侧路径（`bumpVideoStatsAuthScript`）**
+
+看代码：
+
+```lua
+if redis.call("EXISTS", KEYS[1]) == 0 then
+    redis.call("HSET", KEYS[1],
+        "likes_count",    ARGV[1],   -- DB 快照 likes_count
+        "comments_count", ARGV[2],   -- DB 快照 comments_count
+        "popularity",     ARGV[3],   -- DB 快照 popularity
+        "stats_version",  ARGV[4])   -- DB 快照 stats_version
+elseif not tonumber(redis.call("HGET", KEYS[1], "stats_version")) then
+    -- 兼容滚动升级：老版本只有三字段没有 stats_version
+    redis.call("HSET", KEYS[1], "stats_version", ARGV[4])
+end
+local likes    = redis.call("HINCRBY", KEYS[1], "likes_count",    ARGV[5])
+local comments = redis.call("HINCRBY", KEYS[1], "comments_count", ARGV[6])
+local pop      = redis.call("HINCRBY", KEYS[1], "popularity",     ARGV[7])
+redis.call("EXPIRE", KEYS[1], ARGV[8])
+return {likes, comments, pop, redis.call("HGET", KEYS[1], "stats_version")}
+```
+
+三条关键规则：
+
+1. **基准值来源是调用方从 MySQL 读取的 `videos` 行**。调用侧 `applyRedisLikeState` → `bumpVideoStatsAuth(..., baseStats)` 会在进入 Lua 之前先 `SELECT id, likes_count, comments_count, popularity, stats_version FROM videos WHERE id=?`，把这四个值原样传进 `ARGV[1..4]`。这是"权威 Hash 的种子"。
+2. **`EXISTS` 判断和 `HSET` 基准、`HINCRBY` 增量必须在同一个 Lua 里**。如果拆开成"Go 侧 `EXISTS` → `HSET` → `HINCRBY`" 三步，两个并发线程都可能判为不存在→各自 `HSET` 覆盖对方增量→丢失点赞。Lua 的整体原子性把这个竞态彻底关掉（`interactionhelper.go` 里的三条注释也明确说明了这一点）。
+3. **`ARGV[4]` 是 DB 快照的 `stats_version`，不是 0**。这样冷启动写入 Redis 的基准和 MySQL 完全对齐；后续 Consumer 只有携带更高版本号的 Flush 才会覆盖 Redis，符合 §5.2 的版本单调推进语义。
+
+冷启动 + 本次 `+1` 的结果：
+
+```
+Redis 冷启动前:  key 不存在
+MySQL 当前值:    likes=500, comments=30, popularity=1550, version=42
+
+Lua 原子执行:
+  EXISTS=0 → HSET (500, 30, 1550, 42)
+  HINCRBY likes +1 → 501
+  HINCRBY comments +0 → 30
+  HINCRBY popularity +3 → 1553  （likeWeight=3）
+  EXPIRE 7d
+  return (501, 30, 1553, 42)
+
+用户拿到:        likes_count = 501  ✓ 不会漏掉历史 500 次点赞
+```
+
+**冷启动怎么做？——读侧路径（`readVideoStatsAuthScript`）**
+
+读侧场景（如 `BatchGetVideoStats`）同样会遇到冷启动，但不涉及增量、只做基准建立：
+
+```lua
+local values = redis.call("HMGET", KEYS[1],
+    "likes_count", "comments_count", "popularity", "stats_version")
+local current_version = tonumber(values[4])
+if not current_version or current_version < tonumber(ARGV[4]) then
+    -- key 不存在、字段损坏、或 Redis 版本落后于 DB 快照 → 用 DB 快照覆盖
+    redis.call("HSET", KEYS[1],
+        "likes_count",    ARGV[1],
+        "comments_count", ARGV[2],
+        "popularity",     ARGV[3],
+        "stats_version",  ARGV[4])
+end
+redis.call("EXPIRE", KEYS[1], ARGV[5])
+return redis.call("HMGET", KEYS[1],
+    "likes_count", "comments_count", "popularity", "stats_version")
+```
+
+读侧比写侧多一层版本比较：只有"Redis 里没有版本号 或 Redis 版本 < DB 快照版本"时才覆盖，避免用一个滞后的 DB 快照踩掉 Redis 中已经通过 Consumer 投影推进过的更新版本。
+
+**批量冷启动的优化**：`BatchGetVideoStats` 一次要读几十个视频卡片的统计。当前实现是**一次批量 SQL 拿到所有 miss 视频的 DB 快照 + 一条 Redis Pipeline 批量下发 `readVideoStatsAuthScript`**，把冷启动 RTT 从"最多 50 次串行 Eval"压缩到"1 次 SQL + 1 条 Pipeline"，这是 §17 changelog 2026-08-13 条目里记录过的一次专门优化。
+
+**冷启动为什么是安全的（不会重复计数）**
+
+关键在于："DB 快照本身就已经吸收了所有此前已 Kafka 消费的点赞事件"。举例：
+
+- 视频历史有 500 次点赞，其中前 495 次已经被 Consumer Flush 消费掉，写入 `videos.likes_count = 495`，剩 5 条 outbox 事件正在 Kafka 里排队。
+- 冷启动那一刻 Redis 用 DB 快照建立基准 → `likes_count = 495`。
+- 剩下 5 条 Kafka 消息被 Consumer 消费时，`processed_events` 唯一键会保证它们**只更新 MySQL 一次**（幂等去重），然后再次投影 Redis。
+- 若 Redis 已经通过后续同步 `HINCRBY` 达到了 500（新用户点赞），那 Consumer 投影带的版本号一定 > 冷启动种子版本，覆盖时值一致（500 vs 500）或值相符（详见 §5.2）。
+
+**总结冷启动的三条原则**：
+
+1. **Hash 缺失时用 MySQL 快照 + `stats_version` 建立基准**（永不用 0 起步），保证不丢历史累计。
+2. **基准建立与后续操作打包成一个 Lua**（用 `EXISTS` + `HSET` + `HINCRBY` 或 `HSET` + `HMGET`），杜绝并发穿插造成的"基准值丢增量"。
+3. **`processed_events` 幂等 + Consumer 版本 CAS**，保证冷启动后 Kafka 里可能重复到达的旧事件不会重复累计 MySQL，也不会用滞后快照回滚 Redis。
+
 #### 8.3.4 点赞抗压分析：削峰、批量聚合与可持续吞吐
 
 朴素方案在每次点赞请求中直接更新 `videos.likes_count`，热门视频会形成单行锁热点。当前实现把用户关系事实与派生计数拆开：在线事务只完成 `likes / interaction_events / outbox_events` 等事实写入，Redis 立即维护用户可见增量；Kafka 消费端再批量更新 `videos` 聚合字段。
@@ -2926,7 +3194,7 @@ FOR UPDATE SKIP LOCKED;
   >
   > 此外，为什么 outbox 需要 FOR UPDATE 加锁而不是普通 SELECT？—— 因为紧接着还要在**同一事务里** UPDATE 这批行的 `status/lock_token/locked_by`；如果不加锁，另一个实例可能在中间也 SELECT 到同一批行然后一起 UPDATE，就会出现两个实例都以为自己"独占"了这批消息，从而重复投递。加了 `FOR UPDATE`，行级 X 锁会一直持有到事务提交，其他事务想读同一行时只能选择等待或 `SKIP LOCKED` 跳过。
 
-- **为什么显式用 `READ COMMITTED`**：Outbox claim 是任务队列扫描，不需要在同一事务里保持可重复读快照。相较 MySQL 默认 `REPEATABLE READ`，`READ COMMITTED` 让每条语句读取已提交数据，并减少范围扫描长期保留快照和 next-key/gap lock 的机会；配合短事务和 `SKIP LOCKED`，更适合多实例高频认领。这里的隔离级别只覆盖 claim 事务，Kafka 发布仍在提交后执行，不会把数据库锁带到网络 I/O 阶段。
+- **为什么显式用 `READ COMMITTED`**：Outbox claim 是任务队列扫描，不需要在同一事务里保持可重复读快照。相较 MySQL 默认 `REPEATABLE READ`，`READ COMMITTED` 让每条语句读取已提交数据，并减少范围扫描长期保留快照和 next-key/gap lock 的机会；配合短事务和 `SKIP LOCKED`，更适合多实例高频认领。这里的隔离级别只覆盖 claim 事务，Kafka 发布仍在提交后执行，不会把数据库锁带到网络 I/O 阶段。详细分析（gap lock 如何损害 `SKIP LOCKED` 精度、与业务侧 INSERT 的死锁风险、以及降级为 RC 为什么安全）见 §9.1.3 末尾"claim 事务的隔离级别"。
 
 - **`NOT EXISTS` 前序子句**：同一 aggregate 必须等前序事件 `sent` 之后才能进入下一轮 claim，"同一视频先删后投递 create"、"同一用户先 unlike 后投递 like" 这类反序从根源不会发生。`dead` 事件也会阻塞后续，强迫人工补偿，不静默跨过。
 - **专用索引 `idx_aggregate_status_id(aggregate_type, aggregate_id, status, id)`**（`016_outbox_aggregate_status_index.sql`）让 NOT EXISTS 只扫四种未完成状态，不会回扫同聚合已 sent 的历史事件。
@@ -3121,6 +3389,60 @@ t=62s    A 突然恢复了（网络通了、GC 停顿结束了）
 `lock_token` **不是锁，是"防伪印章"**：A 手里的章号 AAA，B 手里的 BBB，事件表里现在盖着 BBB 的章。A 想在事件上盖章，SQL WHERE 会说"这里已经不是你的章了"，A 就放弃。有了 `lock_token`，"实例 A 卡死复活 + 实例 B 已经接管"这种中间态里 A 绝不会覆写 B 的正确结果。
 
 **术语澄清**：outbox 里所谓的"独占"其实是**租约模型（lease）** 而不是**锁模型（lock）**。租约有明确的到期时间（`ClaimTimeoutSeconds`，默认 60s），到期后自动流转给下一个愿意接手的实例；锁则要求持有者显式释放，持有者崩溃后需要外部干预。租约是**为分布式系统里"节点可能随时挂"这个现实**而生的设计——你永远不能相信另一台机器一定还活着，只能相信它答应的租约到期时间。
+
+**claim 事务的隔离级别：为什么显式设为 `READ COMMITTED`**
+
+上文的 X 锁描述有一个隐藏前提——"`FOR UPDATE` 只加记录锁"。这个前提**在 MySQL 默认隔离级别 `REPEATABLE READ` 下并不成立**，因此 `claimDueOutboxEvents` 在 `gorm.Transaction(...)` 第二参数显式覆盖：
+
+```go
+err = d.svcCtx.GormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+    // 1) SELECT ... FOR UPDATE SKIP LOCKED
+    // 2) UPDATE status=processing, lock_token=xxx, locked_by=xxx, locked_at=now
+    return nil
+}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+```
+
+`sql.TxOptions{Isolation: sql.LevelReadCommitted}` 只作用于本次短事务，不改数据库全局配置、不影响连接池里其他事务；事务结束连接归还时驱动会自动重置隔离级别。
+
+**为什么必须显式改（MySQL 默认是 `REPEATABLE READ`）**：
+
+| 维度 | RR（MySQL 默认） | RC（本事务显式设置） |
+|---|---|---|
+| 锁模型 | `FOR UPDATE` 走 **next-key lock** = 记录锁 + 间隙锁 | **只加记录锁**，不加间隙锁（唯一索引/外键冲突场景除外） |
+| `SKIP LOCKED` 精度 | 间隙锁可能覆盖到 id 附近**并未真正命中**的行 → 其他 dispatcher 实例误跳过、白白等一轮 | 只锁真正 UPDATE 的行，其他实例能干净地跳过并领到剩下的 pending 行 |
+| 与业务侧高频 INSERT 的冲突 | 间隙锁 vs INSERT 的 insert intention lock 容易死锁 | 无间隙锁，业务插入与 dispatcher 认领彼此不干扰 |
+| SELECT 语义 | 事务级 read view，可重复读、防幻读 | 每条 SELECT 各自建 read view，读到最新已提交数据 |
+
+**为什么降到 RC 是安全的**：
+
+- 本事务只做**一次** SELECT + **一次** UPDATE，不存在事务内多次读，用不到 RR 的"可重复读"保证。
+- 不需要"防幻读"——**其他事务新插入的 pending 事件本来就应该被下一轮 claim 认领**，把它视为幻影反而是错误行为。
+- "两个 dispatcher 实例不认领到同一行"的互斥性由 `FOR UPDATE` 记录锁 + `SKIP LOCKED` 保证，**跟隔离级别无关**，RC 一样能保证。
+
+**由此形成的完整四层防线**（结合 9.1.3 上文的租约模型一起看）：
+
+```text
+┌───────────────────────────────────────────────────────────────┐
+│ 短事务 T（Isolation = READ COMMITTED）                         │
+│   只加记录锁、不加间隙锁：SKIP LOCKED 精确、避免死锁            │
+│                                                                │
+│  ① SELECT ... FOR UPDATE SKIP LOCKED    ← 并发抢占互斥         │
+│      + dueOutboxScope(NOT EXISTS 前序检查) ← 同 aggregate 保序 │
+│  ② UPDATE status=processing, lock_token=随机 hex,              │
+│              locked_by=instance, locked_at=now                 │
+│  ③ COMMIT（记录锁立即释放）                                    │
+├───────────────────────────────────────────────────────────────┤
+│  ④ Kafka Produce（事务外，可能耗时数百 ms）                    │
+├───────────────────────────────────────────────────────────────┤
+│  ⑤ UPDATE ... WHERE lock_token=? AND status=processing         │
+│      ← 乐观校验，token 不匹配则静默放弃，防止旧实例覆盖新接管者 │
+│                                                                │
+│  过期回收：dueOutboxScope 的 locked_at <= staleBefore 条件      │
+│      让崩溃/卡死实例认领的事件在下一轮被别人重新捞出            │
+└───────────────────────────────────────────────────────────────┘
+```
+
+一句话总结：**RC 让 `FOR UPDATE SKIP LOCKED` 的"跳过"语义更精确，同时降低与业务侧 INSERT 的死锁概率**；claim 短事务的正确性由记录锁 + `lock_token` + `locked_at` 超时机制共同保证，与是否可重复读无关。
 
 #### 9.1.4 两阶段独立 ctx 与失败路径的原子处理
 
@@ -3462,6 +3784,142 @@ flowchart TD
     E --> H[代表: feed:timeline:* / notification:unread:*]
 ```
 
+#### 12.1.1 分页/列表类缓存的击穿保护：本地 SingleFlight + Redis 分布式锁
+
+上面表格中的三种缓存策略各自适用于不同资源，但在 **"缓存 miss 时如何组织回源"** 这一步，全项目并存两种不同的防击穿方案：
+
+| 方案 | 适用场景 | 使用位置 |
+|---|---|---|
+| **仅本地 SingleFlight** | 批量单实体查询（miss 集合可稀释、DB 查询是主键 IN） | `account.BatchGetProfiles`、`video.BatchGetVideos`、`video.BatchGetVideoStats` |
+| **本地 SingleFlight + Redis 分布式锁 + 短轮询兜底** | 用户/资源维度的**分页列表 / Timeline / 匿名热榜成品缓存** | `interaction.ListMyLikedVideos`、`interaction.ListComments`、`social.ListFollowers / ListFollowings`、`feed.GetFollowingFeed`（Timeline 冷启动）、`gateway` 匿名热榜成品缓存 |
+
+也就是说——**interaction、social、feed 三个模块的列表类缓存均是"本地 SingleFlight + Redis 分布式锁"双层组合**，而 account、video 的单实体批量缓存只用了 SingleFlight。这一节把"为什么要分两套"、"锁怎么运作、超时后怎么办"讲清楚。
+
+##### ① 为什么分页列表必须额外加 Redis 分布式锁
+
+单纯用 `syncx.SingleFlight` 已经能把**单进程内**的并发合并成一次 DB 查询，但列表类缓存有三个特征让"进程内合并"不够用，必须再加一层**跨实例的**分布式锁：
+
+**特征 1：miss 一次就是一次全量重查询，DB 成本远高于主键 IN**
+
+以 `ListMyLikedVideos` 为例，回源函数是：
+
+```sql
+SELECT likes.* FROM likes
+  JOIN videos ON videos.id = likes.video_id
+             AND videos.status = 1 AND videos.deleted_at IS NULL
+ WHERE likes.user_id = ? AND likes.status = 1 AND likes.deleted_at IS NULL
+   AND (likes.updated_at < ? OR (likes.updated_at = ? AND likes.id < ?))
+ ORDER BY likes.updated_at DESC, likes.id DESC
+ LIMIT 21;
+```
+
+带 JOIN、带过滤、带排序、带游标，成本远高于 `WHERE id IN (...)`。ListFollowers / ListFollowings / ListComments / GetFollowingFeed 也是同一类"过滤+排序"重查询。
+
+**特征 2：SingleFlight key 天然难以合并**
+
+`BatchGetVideos` 的 SingleFlight key 是"排序后的 ID 组合"（`"3,7,12,88,..."`），只要两个并发请求 miss 集合相同就能合并；而分页列表的 key 里带着**游标时间戳**：
+
+```go
+// listmylikedvideoslogic.go
+func likedVideosListDBLoadKey(userID uint64, cursorCreatedAt int64, cursorLikeID uint64, pageSize int64) string {
+    return fmt.Sprintf("user:%d:cursor_created_at:%d:cursor_like_id:%d:size:%d", ...)
+}
+```
+
+两次点击点赞列表的时间戳几乎不会撞在同一毫秒，**同一进程内的合并率都很低**，更别提跨实例。
+
+**特征 3：版本 INCR / 短 TTL 会引起集中失效**
+
+- 用户 U 新点赞一个视频 → `INCR LikeUserVideosListVersionKey(U)` → U 的**所有**分页缓存瞬间作废；
+- `likedVideosListCacheTTL = 30s`、`commentListCacheTTL`、Timeline `TTL` 都不长——TTL 到期会造成集中 miss；
+- 生产环境每个 rpc 服务通常起 4~8 个副本，进程内 `SingleFlight` 只能把"每副本的多次并发"合并成 1 次 DB 查询，但**多副本之间不合并**——冷启动瞬间还是会产生 N 倍打库。
+
+对比 `BatchGetVideos`：一批 100 个 ID 里往往 90+ 个命中缓存，miss 掉的少数冷门 ID 走一次 `WHERE id IN (...)` 主键索引扫描，代价几乎可忽略，且不同请求的 miss 集合天然重叠，`SingleFlight` 就够挡了。
+
+综合这三个特征，**分页列表 / Timeline 的 miss 是"少数几个 key 集中失效 + 单次回源代价高 + 跨实例同时来抢"**——这是分布式锁最合适的场景。
+
+##### ② 两层防击穿的完整流程
+
+三大模块统一遵循下面的读路径（以 `ListMyLikedVideos` 为最完整版本，其余模块结构相同、参数不同）：
+
+```mermaid
+flowchart TD
+    A[RPC 进入] --> B[读版本号<br/>Get *ListVersionKey]
+    B -->|Redis 挂了| Z[cacheKey=&quot;&quot; 降级<br/>纯 MySQL + 本地 SingleFlight]
+    B -->|OK 或 Nil→0| C[拼 cacheKey<br/>带 userID/version/cursor/pageSize]
+    C --> D{GET cacheKey}
+    D -->|命中| R1[直接返回]
+    D -->|miss| E{SETNX buildLockKey<br/>token=randomHex EX=lockTTL}
+    E -->|抢到锁| F[进入回源分支<br/>defer 释放锁]
+    E -->|没抢到| G[短轮询等其他协程写完缓存<br/>3 次 × 50ms]
+    G -->|等到了| R2[读缓存返回]
+    G -->|等超时| F2[退化：自己也去查 DB 兜底]
+    F --> H[localLoadGroup.Do<br/>同进程相同参数合并成 1 次]
+    F2 --> H
+    H --> I[MySQL JOIN+ORDER+LIMIT]
+    I --> J[写回缓存 SET TTL=30s]
+    J --> R3[返回]
+    Z --> H2[localLoadGroup.Do]
+    H2 --> I2[MySQL] --> R4[返回 不回填]
+```
+
+关键点分层解释：
+
+1. **本地 `syncx.SingleFlight`（或等价 `localLoadGroup`）——进程内合并**
+   - `likedVideosListLoadGroup`（interaction）、`followListLoadGroup`（social，见 `socialhelper.go`）、`timelineBuildGroup / hotRankSnapshotBuildGroup`（feed）都是包级单例；
+   - 同一 rpc 进程内、相同参数的并发请求**只执行 1 次 DB 查询**，其余请求等 `chan` 关闭后共享结果；
+   - 作用：抵御"单实例内部瞬间涌入几百个协程"的场景，几乎零成本。
+
+2. **Redis `SETNX` 分布式锁——跨实例互斥**
+   - `lockKey` 用 `rediskey.LikeUserVideosPageCacheBuildLockKey(cacheKey)` / `CommentListBuildLockKey` / `FeedTimelineBuildLockKey` 等；
+   - `lockToken = randomHex(8/16)` 是**当前协程独有的随机串**，`SetNX(lockKey, token, EX=lockTTL)`；
+   - `lockTTL` 都设得很短：`likedVideosListCacheLockTTL = 2s`、评论列表 5s、Timeline 10s。作用是防止持锁协程崩溃后锁永远不释放；
+   - 释放时**必须走 Lua 校验 token**（`releaseRedisLock`，见 `interactionhelper.go:104`）——`GET lockKey == myToken then DEL`，避免"我持锁 → 我卡住 → TTL 到期锁被别人拿去 → 我最后再删把别人的锁误删了"这种经典 bug。
+
+3. **短轮询兜底——防"抢锁失败者永远拿不到数据"**
+   - 抢锁失败 = 有其他协程正在回源，那我等它写完就好；
+   - 每 50ms 重读一次 cacheKey，最多 3 次共 150ms（`likedVideosListCacheRetryDelay × likedVideosListCacheRetryAttempts`）；
+   - 命中就直接返回，比自己去打 DB 快得多。
+
+4. **超时兜底路径——防"回源者卡死拖垮所有请求"**
+
+   这是分布式锁最容易踩坑的地方。如果持锁协程因为 DB 慢查询卡在 MySQL 侧，其它协程短轮询 150ms 后**必须能自救**——否则一次慢查询会把所有等锁的请求全部拖成慢请求。三个模块的兜底完全一致：
+   - **短轮询 3 次仍然没命中 → 不 return，继续往下走**，自己也调用 `localLoadGroup.Do(...)` 去查 DB；
+   - 但因为进程内 `localLoadGroup` 会做二次合并，同参数的多个"兜底协程"仍然只会打 1 次 DB；
+   - 加上 `lockTTL` 是硬性上限（2~10s），持锁协程即便真的卡死，锁最多存活 `lockTTL` 时长就自动过期，下一轮请求可以正常抢锁；
+   - **最坏结果**：这段时间内每个副本各自打 1 次 DB，退化到"无锁但有 SingleFlight"的水位——**恰好等于 account/video 的默认水位**，不会更差。
+
+5. **Redis 挂掉的极端降级路径**
+   - 读版本号那一步就会失败 → `cacheKey = ""` → 后续所有"读缓存 / 抢锁 / 回填缓存"分支**全部短路**；
+   - 每个请求直接走 `localLoadGroup.Do` + MySQL 查询，不 SET 缓存不刷新版本；
+   - 保证 **"Redis 挂了别把 MySQL 也拖垮"**——单实例内相同参数仍然合并成 1 次 DB 查询。
+
+##### ③ 三个模块的落地位置对照
+
+| 模块 | 缓存 Key | 版本号 Key | 构建锁 Key | Lock TTL | 短轮询参数 | 本地 SingleFlight |
+|---|---|---|---|---|---|---|
+| `interaction.ListMyLikedVideos` | `LikeUserVideosPageCacheKey` | `LikeUserVideosListVersionKey` | `LikeUserVideosPageCacheBuildLockKey` | 2s | 3×50ms | `likedVideosListLoadGroup`（sync.Mutex 版） |
+| `interaction.ListComments` | `CommentListCacheKey` | `CommentListVersionKey` | `CommentListBuildLockKey` | 5s | 3×50ms | `syncx.SingleFlight` |
+| `social.ListFollowers` | `FollowerListPageKey` | `FollowerListVersionKey` | `FollowerListBuildLockKey` | 3s | 3×50ms | `followListLoadGroup` |
+| `social.ListFollowings` | `FollowingListPageKey` | `FollowingListVersionKey` | `FollowingListBuildLockKey` | 3s | 3×50ms | `followListLoadGroup`（分命名空间） |
+| `feed.GetFollowingFeed`（Timeline 冷启动） | `FeedTimelineKey` | — | `fsz:feed:timeline:build_lock:{viewer}` | 10s | 200ms 轮询 | `timelineBuildGroup` |
+| `gateway` 匿名热榜成品缓存 | 匿名 hot feed page cache | — | 匿名 hot feed build lock | 短 TTL | 短轮询 | `anonymousHotFeedPageBuildGroup` |
+
+##### ④ 为什么不改成"全项目统一都加分布式锁"
+
+反过来想：为什么不把 `BatchGetVideos` / `BatchGetProfiles` 也套上 Redis 锁？
+
+- **打库成本天然低**：主键 IN 查询是 B+ 树点查，几十条 ID 也只在毫秒级，跨实例并发 8 次也无感；
+- **Redis 锁本身有成本**：`SetNX + Lua 释放` 至少多两次 Redis RTT，读路径每次都要付出；
+- **SingleFlight key 已有天然合并率**：批量 ID 排序后拼 key，热点 ID 集合的重叠概率很高，SingleFlight 单层就压得住；
+- **热点资料早已被 Redis 缓存吸收**：真正会引起击穿的是"极少数冷门 ID"，本身 QPS 很低。
+
+所以规则可以精炼为：
+
+> **"单次回源是重查询 或 缓存失效呈集中式 或 miss key 天然难合并"**——三条中命中任何一条，就加 Redis 分布式锁；否则只用 SingleFlight。
+
+这条规则同时解释了：为什么 interaction 的**点赞写路径**（`LikeVideo` / `UnlikeVideo`）也用了 `SetNX` 短锁，但那把锁的作用是"**点击互斥**"（防同一用户 500ms 内狂点重复入库），与本节讨论的"**读侧缓存击穿**"锁是**两个完全不同的锁**，分别落在 `rediskey.LikeVideoLockKey` 和 `rediskey.LikeUserVideosPageCacheBuildLockKey`——不要混淆。
+
 ### 12.2 幂等的三层防护
 
 | 层 | 手段 |
@@ -3480,6 +3938,8 @@ flowchart TD
 | 并发大 V 升级 | `UPDATE ... WHERE is_big_v=0` 天然幂等 |
 | 并发 outbox dispatch | `SELECT ... FOR UPDATE SKIP LOCKED` + `lock_token` |
 | 并发 Timeline 冷启动 | `fsz:feed:timeline:build_lock:{viewer}` 分布式锁 |
+| 并发列表缓存回源（interaction / social） | `LikeUserVideosPageCacheBuildLockKey` / `CommentListBuildLockKey` / `FollowerListBuildLockKey` / `FollowingListBuildLockKey` 分布式锁 + 本地 SingleFlight，抢锁失败短轮询 3×50ms，超时后本地兜底查 DB（详见 §12.1.1） |
+| 并发匿名热榜成品缓存回源 | `anonymousHotFeedPageBuildGroup` 本地 SingleFlight + Redis 构建锁（详见 §12.1.1） |
 | 并发 profile 更新 | `INCR version` 原子 |
 | 并发未读数 bump | Lua 脚本 `INCR + DEL 旧 v key` 原子 |
 | 并发互动写入 | MySQL 事实行唯一键/行锁保证业务幂等；`1213/1205` 有限事务重试；Redis Lua 原子更新在线投影 |
@@ -3688,6 +4148,182 @@ T3'  R: Lua CAS: if GET version == v(n) then SET cacheKey ← ❌ v(n) ≠ v(n+1
 3. **INCR 本身是幂等的**：即使某次 pipeline 部分失败、多做一次 INCR 只是让版本号多跳一个数，不影响正确性；漏做一次 INCR 会导致短时脏缓存，但下次任何写入的 INCR 都会自然修复。
 
 **因此项目中使用“版本号 + 惰性重算”的模块（profile / video entity / notification unread / feed timeline / social lists）共享同一条原则：写侧推进版本，读侧只读取并在版本匹配时回填。各模块仍需结合自己的持久事实、TTL 和降级路径，不能只依赖 Redis 单点。**
+
+---
+
+### 12.8 各模块写侧 / 读侧缓存改动清单
+
+前面各章从"策略"、"版本号"、"幂等"等维度横向讲清了机制。本节把视角切回到**每个业务模块**，把"写入口做了哪些 Redis 副作用"、"读入口读了哪些 Redis Key"逐一列出来，方便代码维护时对照定位：任何一次线上问题都可以先按模块查这张表，判断是"写侧漏了 INCR"还是"读侧误信了脏缓存"。
+
+约定：
+- **写侧**：接口/事件在事务提交成功后对 Redis 做的**主动**变更；未列出的 Key 意味着该入口不会碰它。
+- **读侧**：接口在处理过程中主动读取（可能带回填/失效重建）的 Redis Key。
+- **消费侧（Kafka）**：如果对应模块有 job 消费者，会额外说明消费者对 Redis 的投影动作，这类动作不是同步链路，但同样属于"该模块的缓存改动"。
+- 所有 Key 都省略 `fsz:` 前缀以突出语义；完整常量见 `common/rediskey/*.go`。
+
+---
+
+#### 12.8.1 Account 账号模块
+
+代码位置：`apps/account/internal/logic/`
+
+| 入口 | 类型 | 缓存改动 |
+|---|---|---|
+| `RegisterLogic` | 写 | `GET VerificationCodeKey(email)` 校验邮箱验证码，通过后 `DEL` 掉；不写任何 profile / version key。 |
+| `SendVerificationLogic` | 写 | `SET VerificationCodeKey(email) = code` 附 5min TTL。 |
+| `LoginLogic` | 写 | `SET TokenKey(userID) = refresh_token` 附 TTL（服务端保存 refresh_token 以便强制下线/刷新校验）。 |
+| `RefreshTokenLogic` | 写 | 校验并 `SET TokenKey(userID)` 更新为新的 refresh_token。 |
+| `LogoutLogic` | 写 | `DEL TokenKey(userID)`。 |
+| `UpdateProfileLogic` | 写 | **事务提交后** `INCR AccountPublicProfileVersionKey(userID)`——让所有 `AccountPublicProfileKey(uid, v)` 分片瞬间对不上号，读侧自然失效重建。 |
+| `BatchGetProfilesLogic` | 读 | 分三步走：<br>① 用一次 Pipeline `GET AccountPublicProfileVersionKey(uid)` 拿版本；<br>② 用一次 Pipeline 同时 `GET AccountPublicProfileKey(uid, ver)` + 二次 `GET version`（"读-读-读"版本对齐，防止读期间版本被 bump）；<br>③ MISS 组走 SingleFlight 回 DB，回填时 `SET AccountPublicProfileKey(uid, expectedVersion)`，命中占位 TTL 也会写入 `AccountPublicProfileMissingTTL` 防击穿。<br>如果二次 version 校验发现版本变了，会 `DEL AccountPublicProfileKey(uid, oldVer)` 主动清除刚刚可能污染的分片。 |
+
+要点：Account 的 profile 缓存是**版本号 + 分片 Key**（形态 B），写侧的唯一动作就是 INCR 版本；不 DEL 具体 profile key，靠版本号变化让 v:{old} 那一份自然过 TTL。
+
+---
+
+#### 12.8.2 Video 视频模块
+
+代码位置：`apps/video/internal/logic/`
+
+| 入口 | 类型 | 缓存改动 |
+|---|---|---|
+| `PublishVideoLogic` / `DeleteVideoLogic` | 写 | 事务提交后调用 `videohelper.invalidateVideoCache(pipe, videoID)`：<br>① `INCR VideoEntityVersionKey(videoID)`；<br>② `DEL VideoEntityKey(videoID)`、`VideoDetailKey(videoID)`、`VideoStatsAuthKey(videoID)`——三把辅助缓存直接清空，等待下一次读侧惰性重建。 |
+| `BatchGetVideosLogic` | 读 | 类似 Account 的三步走：<br>① Pipeline `GET VideoEntityKey(videoID)` + `GET VideoEntityVersionKey(videoID)`；<br>② 二次校验版本号，若不一致则 `DEL VideoEntityKey(videoID)` 清脏；<br>③ MISS 组走 SingleFlight 回 DB，回填用 Lua 脚本 `KEYS = [VideoEntityVersionKey, VideoEntityKey]`——脚本内部先读版本再写 payload，保证"回填时的版本"和 cacheKey 中的版本严格对齐；<br>不存在的视频写 `VideoEntityMissingTTL` 短占位防击穿。 |
+
+要点：写侧动作比 Account 更狠——除了 INCR 版本，还额外 DEL 了 `VideoStatsAuthKey` 权威 Hash，因为视频发布/删除会让统计基线跟着变。互动模块下一次读会用 DB 冷备重新冷启动权威 Hash。
+
+---
+
+#### 12.8.3 Interaction 互动模块（重点：点赞 / 评论）
+
+代码位置：`apps/interaction/internal/logic/`
+
+写侧较多，按入口分列：
+
+##### （1）`LikeVideoLogic`（点赞）
+
+| 阶段 | 缓存改动 |
+|---|---|
+| 入口 | `SET NX LikeActionLockKey(videoID, userID)` 短 TTL 互斥锁，防用户连点。 |
+| 事务成功后 `applyRedisLikeState` | ① Lua 原子 `bumpVideoStatsAuth`：`HINCRBY VideoStatsAuthKey(videoID) likes_count +1, popularity +likeWeight`，冷启动时用 DB 冷备重建。<br>② Pipeline 一次性写入：`SAdd LikeVideoUsersKey(videoID) userID`、`SAdd LikeUserVideosKey(userID) videoID`、`SET LikeStateKey(videoID, userID)=1`、`ZIncrBy HotVideoRealtimeKey +likeWeight`、`INCR LikeUserVideosListVersionKey(userID)`。 |
+
+##### （2）`UnlikeVideoLogic`（取消点赞）
+
+对称：`SRem` 两个集合、`SET LikeStateKey=0`、`HINCRBY -1`、`ZIncrBy -likeWeight`、`INCR LikeUserVideosListVersionKey(userID)`。
+
+##### （3）`PublishCommentLogic`（发布评论）
+
+| 阶段 | 缓存改动 |
+|---|---|
+| 入口 | `INCR CommentRateLimitKey(userID, videoID)` 做每分钟限流；`GET CommentIdempotencyKey(userID, requestID)` 走请求级幂等。 |
+| 事务成功后 `applyRedisCommentCreatedState` | ① Lua 原子 `bumpVideoStatsAuth`：`comments_count +1, popularity +commentWeight`。<br>② Pipeline：`Eval bumpCommentListVersionScript` 对 `CommentListVersionKey(videoID)` 首次 SET 时间戳 / 已存在 INCR、`ZIncrBy HotVideoRealtimeKey +commentWeight`、`SET CommentIdempotencyKey(userID, requestID) = commentID` 24h TTL。 |
+
+##### （4）`DeleteCommentLogic`（删除评论）
+
+对称：`HINCRBY -1`、`INCR CommentListVersionKey(videoID)`、`ZIncrBy -commentWeight`、`DEL CommentIdempotencyKey`。
+
+##### （5）读入口
+
+| 入口 | 缓存动作 |
+|---|---|
+| `BatchGetVideoStatsLogic` | Pipeline `HGetAll VideoStatsAuthKey(videoID)` 拿权威计数；MISS 走 Lua `videoStatsAuthCold*` 从 DB 冷备重建并 `EXPIRE VideoStatsAuthTTL`。 |
+| `ListCommentsLogic` | ① `GET CommentListVersionKey(videoID)` 得到版本 v；<br>② 拼 `CommentFirstPageCacheKey(videoID, v)` 查缓存；<br>③ MISS 时 `SET NX CommentFirstPageCacheBuildLockKey(cacheKey)` 分布式锁 + SingleFlight，回源 DB；<br>④ 回填用 Lua `KEYS = [CommentListVersionKey, cacheKey]`，脚本内部校验版本一致才写入，防止回填期间 bump 造成脏缓存。 |
+| `ListMyLikedVideosLogic` | ① `GET LikeUserVideosListVersionKey(userID)` → v；<br>② `GET LikeUserVideosPageCacheKey(userID, v, cursor, size)`；<br>③ MISS 时 `SET NX LikeUserVideosPageCacheBuildLockKey(cacheKey)` 抢锁 + SingleFlight；<br>④ 回填时同样用版本对齐 Lua 脚本写入。 |
+| `IsLikedBatchLogic`（辅助） | Pipeline `GET LikeStateKey(videoID, userID)`；MISS 兜底查 MySQL 后 `SET LikeStateKey`。 |
+
+##### （6）Kafka 消费侧：`job/interaction_sync`
+
+从 `interaction_events` topic 消费，批量 Flush MySQL 后调用 `projectVideoStatsBatch`：用 Lua 脚本 `KEYS = [VideoStatsAuthKey]` 做**版本 CAS 投影**——只有当 DB 的 `stats_version > Redis stats_version` 时才覆盖 Redis 权威 Hash，否则跳过。**这一步永远不会覆盖读侧看到的 like/comment 集合、LikeState、CommentListVersion 等派生 Key**，那些 Key 只由写入口维护。
+
+要点：Interaction 是全项目缓存动作最重的模块，同时用了"权威 Hash+版本"、"分页 Key+版本"、"状态 Key"、"集合"、"ZSet 热榜"、"幂等 Key"六种缓存形态；写侧对每种形态都严格对称维护。
+
+---
+
+#### 12.8.4 Social 社交模块
+
+代码位置：`apps/social/internal/logic/`
+
+| 入口 | 类型 | 缓存改动 |
+|---|---|---|
+| `FollowLogic` / `UnfollowLogic` 事务成功后 `applyRedisFollowState` | 写 | Pipeline：<br>① `SET SocialFollowingStateKey(followerID, followingID) = 1/0` 附 TTL——`IsFollowing` 的正/负缓存；<br>② `INCR AccountPublicProfileVersionKey(followerID)` 和 `INCR AccountPublicProfileVersionKey(followingID)`——粉丝数/关注数变了，profile 缓存需要失效；<br>③ `INCR SocialFollowersListVersionKey(followingID)`——目标用户的"粉丝列表"缓存失效；<br>④ `INCR SocialFollowingsListVersionKey(followerID)`——当前用户的"关注列表"缓存失效。 |
+| `IsFollowingLogic` | 读 | `GET SocialFollowingStateKey`，MISS 查 MySQL 后 `SETNX` 回填（用 NX 避免覆盖已有正/负缓存）。 |
+| `BatchIsFollowingLogic` | 读 | Pipeline `GET SocialFollowingStateKey(viewer, target_i)`，MISS 组统一查 MySQL 后 Pipeline `SET`/`SETNX` 回填。 |
+| `ListFollowersLogic` | 读 | ① `GET SocialFollowersListVersionKey(userID)` → v；<br>② `GET SocialFollowersFirstPageCacheKey(userID, v)`；<br>③ MISS 时 `SET NX SocialFollowersFirstPageCacheBuildLockKey` + SingleFlight 回源；<br>④ Lua 脚本版本对齐后写入。 |
+| `ListFollowingsLogic` | 读 | 与上对称，Key 前缀换成 `SocialFollowings*`。 |
+
+要点：Social 模块的"跨模块联动"最典型——Follow/Unfollow 事件会同时 INCR **Account 模块的** `AccountPublicProfileVersionKey`，让粉丝数/关注数展示能自然自愈；这也是版本号方案跨模块协作的经典案例。
+
+---
+
+#### 12.8.5 Notification 通知模块
+
+代码位置：`apps/notification/internal/logic/` + `common/notificationcache/`
+
+| 入口 | 类型 | 缓存改动 |
+|---|---|---|
+| `MarkNotificationReadLogic` / `MarkAllNotificationsReadLogic` | 写 | 事务提交后调用 `notificationcache.BumpUnreadVersion(userID)`：`INCR UnreadCountVersionKey(userID)`，让 `UnreadCountKey(uid, v)` 立刻失效。 |
+| `GetUnreadCountLogic` | 读 | `notificationcache.LoadUnreadCount`：<br>① `GET UnreadCountVersionKey(uid)` → v；<br>② `GET UnreadCountKey(uid, v)`；<br>③ MISS 时调用 counter（回落 MySQL `COUNT(*)`）并 `SET UnreadCountKey(uid, v)` 短 TTL；<br>④ Redis 不可用时降级直查 MySQL，不阻塞业务。 |
+| 消费侧：`job/notification` | 消费 `notification_events` 后 INSERT `notifications` 表并 `BumpUnreadVersion(receiverID)`——写扩散源来自这里，不是 RPC 入口。 |
+
+要点：通知未读数走的是"惰性重算方案 B"——Redis 不存正确的 count，只存"某个版本下的最近一次快照"，任何一次影响未读数的事件都会 INCR 版本让快照失效。
+
+---
+
+#### 12.8.6 Feed 推拉分离模块
+
+代码位置：`apps/feed/internal/logic/`
+
+| 入口 | 类型 | 缓存改动 |
+|---|---|---|
+| `GetFollowingFeedLogic` | 读 | 用 `feedhelper.buildOrLoadCache`：`GET FeedTimelineReadyKey(uid)` 判就绪 → `GET FeedTimelineKey(uid)` ZSet 拿分页 → MISS 时 `SET NX FeedTimelineBuildLockKey(uid)` 抢锁、把 ZSet 从 `FeedAuthorOutboxKey(authorID)`（大 V 拉）合并 `FeedTimelineKey(uid)`（小 V 推）合并写到 `FeedTimelineTempKey(uid, token)` 临时 ZSet，最后 RENAME 到 `FeedTimelineKey(uid)` 原子替换，`EXPIRE` 三件套 `FeedTimelineKey / ReadyKey / VersionKey` 同一 TTL。 |
+| `GetHotFeedLogic` | 读 | 相似骨架，操作 `HotVideoMergeKey/ReadyKey/BuildLockKey/TempKey(asOf)`；数据源是 `HotVideoWindowKey(minute)` 一组滑窗 ZSet。 |
+| `GetRecommendFeedLogic` | 读 | 直接 `ZRevRange FeedGlobalTimelineKey()` 读全局推荐 ZSet；MISS 走类似 lock+rename 的重建流程。 |
+| 消费侧：`job/feed_timeline` | 消费 `video_events`（发布/删除）后做**推拉分离**：<br>① 小 V → 遍历粉丝 `ZAdd FeedTimelineKey(followerID) video`，`INCR FeedTimelineVersionKey(followerID)`；<br>② 大 V → `ZAdd FeedAuthorOutboxKey(authorID) video`，`INCR FeedAuthorOutboxVersionKey(authorID)`；<br>③ 视频删除时 `ZRem FeedTimelineKey(viewerID) videoID` / `ZRem FeedAuthorOutboxKey(authorID) videoID` 精确剔除。 |
+| 消费侧：`job/hotrank` | 定期 `ZUnionStore HotVideoMergeKey(asOf)` 把最近 N 分钟的 `HotVideoWindowKey(minute)` 合并成榜单快照。 |
+
+要点：Feed 是全项目**最重的读侧 + 最异步的写侧**。RPC 层几乎不主动写任何 timeline 缓存，写侧全都发生在 Kafka 消费者里；RPC 只做"抢锁 + 读构建"的懒重建。这也是为什么 `feedhelper.go` 有大量 `ReadyKey / VersionKey / BuildLockKey / TempKey` 四件套——每一份合并结果都要能原子替换、可探测就绪、可去重构建。
+
+---
+
+#### 12.8.7 HotRank 热榜模块（Job）
+
+代码位置：`apps/job/hotrank`
+
+不是 RPC 模块，只有**写侧**：
+- 消费 `interaction_events` 的每次点赞/评论 delta 后，`ZIncrBy HotVideoWindowKey(currentMinute) videoID +weight`——滑窗写入。
+- Merge 定时任务把最近若干分钟 `ZUnionStore` 到 `HotVideoMergeKey(asOf)` 并写 `HotVideoMergeReadyKey`。
+- 同时，RPC 侧的点赞/评论/取消都会实时 `ZIncrBy HotVideoRealtimeKey`——热榜有"实时增量榜"和"分钟聚合榜"两套，读侧根据场景选择。
+
+---
+
+#### 12.8.8 Gateway 分片上传相关
+
+代码位置：`apps/gateway/internal/logic/completevideouploadlogic.go`
+
+| 入口 | 缓存动作 |
+|---|---|
+| `CompleteVideoUploadLogic` | 读 `ChunkUploadMetaKey(uploadID)` 拿分片元信息、`SET NX ChunkUploadLockKey(uploadID)` 抢合并锁；成功后 `SET ChunkUploadHashKey(userID, fileHash) = url` 与 `SET ChunkUploadGlobalHashKey(fileHash) = url` 附 TTL，作为"下次秒传"的用户级/全局哈希索引。 |
+
+---
+
+#### 12.8.9 全景速查表
+
+| 模块 | 写侧改的 Key（简写） | 读侧读的 Key（简写） |
+|---|---|---|
+| Account | `TokenKey` / `VerificationCodeKey` / **INCR** `AccountPublicProfileVersionKey` | `AccountPublicProfileKey(uid, v)` + `AccountPublicProfileVersionKey` |
+| Video | **INCR** `VideoEntityVersionKey` + **DEL** `VideoEntityKey / VideoDetailKey / VideoStatsAuthKey` | `VideoEntityKey(v)` + `VideoEntityVersionKey` |
+| Interaction 点赞 | `HINCRBY VideoStatsAuthKey` + `LikeState / LikeVideoUsers / LikeUserVideos` + `ZIncrBy HotVideoRealtimeKey` + **INCR** `LikeUserVideosListVersionKey` | `LikeState / LikeVideoUsers / LikeUserVideos` + `LikeUserVideosPageCacheKey(v)` + `LikeUserVideosListVersionKey` + `VideoStatsAuthKey` |
+| Interaction 评论 | `HINCRBY VideoStatsAuthKey` + **INCR** `CommentListVersionKey` + `ZIncrBy HotVideoRealtimeKey` + `CommentIdempotencyKey` | `CommentFirstPageCacheKey(v)` + `CommentListVersionKey` + `VideoStatsAuthKey` + `CommentRateLimitKey` |
+| Social | `SocialFollowingStateKey` + **INCR** `AccountPublicProfileVersionKey`（双向） + **INCR** `SocialFollowersListVersionKey / SocialFollowingsListVersionKey` | `SocialFollowingStateKey` + `SocialFollowers/FollowingsFirstPageCacheKey(v)` + 对应 `ListVersionKey` |
+| Notification | **INCR** `UnreadCountVersionKey` | `UnreadCountKey(uid, v)` + `UnreadCountVersionKey` |
+| Feed（RPC） | 仅重建时写 `FeedTimelineKey / TempKey / ReadyKey` | `FeedTimelineKey / ReadyKey / VersionKey / BuildLockKey` + `FeedAuthorOutboxKey` |
+| Feed（Job） | `ZAdd FeedTimelineKey`（小 V 推） + `ZAdd FeedAuthorOutboxKey`（大 V 拉） + **INCR** `FeedTimelineVersionKey / FeedAuthorOutboxVersionKey` | — |
+| HotRank（Job） | `ZIncrBy HotVideoWindowKey` + `ZUnionStore HotVideoMergeKey` + `HotVideoMergeReadyKey` | `HotVideoWindowKey(minute)`（多分钟 union） |
+
+阅读建议：
+- 遇到"某个数据没更新"→ 定位写入口那一行，检查对应的 **INCR / SET / DEL** 有没有全部执行；
+- 遇到"某个数据脏了"→ 定位读入口，检查是不是漏了 version 二次校验、或读侧写回时 Lua 版本对齐脚本失效；
+- 遇到"读放大 / 击穿"→ 检查读入口是否用了 SingleFlight + BuildLockKey，以及回填是否有 TTL 抖动。
 
 ---
 
@@ -4056,6 +4692,7 @@ go vet ./apps/... ./common/... ./tests/...
 - Gateway 视频卡片的作者资料与互动统计改为并行批量聚合；匿名热榜增加 2 秒成品缓存、本地 SingleFlight 和 Redis 构建锁。
 - 完成 10000 用户、5000 视频最终回归：发布视频 50 并发为 572.9 QPS/P99 182ms，关注流三轮中位数 1160.8 QPS/P99 28ms，非空匿名热榜三轮中位数 8468.8 QPS/P99 15ms，点赞正式规模 318.0 循环/s/P99 325ms；所有场景成功率 100%。
 - 热榜三次冷快照单请求构建平均 11.77ms、最大 15.86ms；最终 Outbox、关键 Kafka Consumer Group lag、Redis 残留和三类 MySQL 对账差异均为 0。
+- 文档：在 §8.3.3 新增"五、`stats_version` 到底是什么？以及批处理时序抖动为何被接受"，澄清版本号只由 MySQL Flush 生产、Redis 中的版本字段只是投影副本、同步 `HINCRBY` 不改版本；用一段临界时序图说明"Flush 窗口内的新点赞会造成 1~3 秒的短暂负向抖动"并解释为何自愈、为何接受、前端如何屏蔽。追加 §5.5「用户点赞后拿到的返回值是什么？」和 §5.6「冷启动详解：为什么需要冷启动、以及冷启动是怎么做的」，说明 `HINCRBY` 返回值即"截止本次 `+1` 原子落地为止的实时累计总和"、并发用户被 Redis 单线程串行化不会拿到重复值、以及 Hash 缺失时如何用 MySQL 快照 + `stats_version` 建立基准（写侧 `bumpVideoStatsAuthScript` 与读侧 `readVideoStatsAuthScript` 两条冷启动路径）。
 
 ### 2026-08-12（互动统计中间架构，已被 2026-08-13 最终方案替代）
 

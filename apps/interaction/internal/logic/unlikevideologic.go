@@ -35,7 +35,7 @@ func NewUnlikeVideoLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Unlik
 var errNoActiveRecord = errors.New("no active record")
 
 func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interaction.UnlikeVideoResp, error) {
-	// 1. 校验 user_id、video_id 都不能为 0。
+	// 校验 user_id、video_id 都不能为 0。
 	userID := in.GetUserId()
 	if userID == 0 {
 		return nil, status.Error(codes.Unauthenticated, "用户未登录")
@@ -55,7 +55,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 		return nil, status.Error(codes.Internal, "查询视频失败")
 	}
 
-	// 2. 使用 rediskey.LikeActionLockKey(video_id,user_id) 加短 TTL 锁，和 LikeVideo 共用同一把锁。
+	// 使用 rediskey.LikeActionLockKey(video_id,user_id) 加短 TTL 锁，和 LikeVideo 共用同一把锁。
 	lockKey := rediskey.LikeActionLockKey(videoID, userID)
 	lockToken, err := randomHex(16)
 	if err != nil {
@@ -73,7 +73,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 			l.Errorf("release like action lock failed, key: %s, error: %v", lockKey, err)
 		}
 	}()
-	// 3. 先查 Redis LikeStateKey：
+	// 先查 Redis LikeStateKey：
 	liked, hit, err := loadLikeStateFromRedis(l.ctx, l.svcCtx.RedisCli, videoID, userID)
 	if err != nil {
 		l.Errorf("get like state from redis failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
@@ -94,7 +94,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 			l.Errorf("get like state from db failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
 			return nil, status.Error(codes.Internal, "查询点赞状态失败")
 		}
-		// 4.  MySQL 也没有有效点赞记录，把 Redis 状态补齐后幂等返回。
+		// MySQL 也没有有效点赞记录，把 Redis 状态补齐后幂等返回。
 		if !dbLiked {
 			if err := fillUnlikedState(l.ctx, l.svcCtx.RedisCli, videoID, userID); err != nil {
 				l.Errorf("fill redis unliked state failed, video_id: %d, user_id: %d, error: %v", videoID, userID, err)
@@ -167,7 +167,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 		}
 	}
 
-	// 5. MySQL 事务：软删除点赞关系，并写 interaction、领域 outbox 和通知 outbox。
+	// MySQL 事务：软删除点赞关系，并写 interaction、领域 outbox 和通知 outbox。
 	if err := runInteractionWriteTransaction(l.ctx, l.svcCtx.GormDB, func(tx *gorm.DB) error {
 		result := tx.Model(&model.Like{}).
 			Where(
@@ -235,7 +235,7 @@ func (l *UnlikeVideoLogic) UnlikeVideo(in *interaction.UnlikeVideoReq) (*interac
 		return nil, status.Error(codes.Internal, "取消点赞失败")
 	}
 
-	// 6. MySQL 已经成功后，再更新 Redis 权威计数和实时状态。若写入失败，用 fallback 预估值。
+	// MySQL 已经成功后，再更新 Redis 权威计数和实时状态。若写入失败，用 fallback 预估值。
 	likesCount, err := applyRedisUnlikeState(l.ctx, l.svcCtx.RedisCli, videoID, userID, video)
 	if err != nil {
 		l.Errorf("apply redis unlike state failed after mysql committed, video_id: %d, user_id: %d, fallback_likes_count: %d, error: %v", videoID, userID, fallbackLikesCount, err)

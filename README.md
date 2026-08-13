@@ -24,6 +24,7 @@
 - 🔁 **热点写事务可恢复**：互动和关注写事务只对 MySQL `1213/1205` 做有限指数退避重试；事件 ID 在事务外固定，重试不会制造重复事件。Social 在固定顺序锁住双账户后，用一条 CASE UPDATE 维护双方计数、一次批量 INSERT 写两条 Outbox，缩短锁持有时间。
 - 🚀 **Feed 推拉分离**：小 V 走 fanout 写扩散到粉丝 inbox，大 V（`is_big_v` 只升不降）只写自己的 outbox，读侧懒加载合并 inbox 与关注的大 V outbox。
 - 🧠 **可控降级**：Redis 作为高性能服务投影，Profile / Timeline / 未读数 / 评论首页均采用"版本号 + 惰性重算"；互动统计额外使用 MySQL `stats_version` 防旧快照覆盖，Redis 故障时可降级到 MySQL 持久快照。
+- 🛡️ **分页列表统一防击穿**：interaction（点赞列表 / 评论列表）、social（粉丝 / 关注列表）、feed（Timeline 冷启动）以及 gateway 匿名热榜的分页缓存，全部采用 **本地 SingleFlight + Redis 分布式锁（`SetNX` + 随机 token + Lua 校验释放）** 双层防护，锁 TTL 2~10s 硬上限、抢锁失败短轮询 3×50ms、超时后回退到本地 SingleFlight + MySQL 兜底，Redis 挂了自动降级为纯 DB 查询——单次 miss 是"JOIN + ORDER + LIMIT"的重查询，跨实例并发瞬间失效场景必须靠分布式锁互斥（详见 [`docs/PROJECT_OVERVIEW.md`](docs/PROJECT_OVERVIEW.md) §12.1.1）。
 - 🔥 **Gateway 聚合加速**：视频卡片的 Account 与 Interaction 批量 RPC 并发执行；匿名热榜使用 2 秒完整响应缓存，并以本地 SingleFlight + Redis 分布式锁合并回源。登录用户绕过成品缓存，保证 `is_liked` 实时准确。
 - 📦 **文件秒传 + 一致性巡检**：分片上传 + 全局 file_hash 秒传；发布前批量校验唯一物理文件，事务内通过条件原子更新维护 `ref_count`，asset_cleanup 负责延迟物理删除、引用复活和 Active 资产对账。
 - 🧹 **事件数据生命周期治理**：独立 `event_cleanup` Job 通过覆盖索引先选 ID、再按主键小批删除 sent Outbox 和过期消费幂等记录；带批间节流、单轮预算和单批超时，死信默认永久保留。

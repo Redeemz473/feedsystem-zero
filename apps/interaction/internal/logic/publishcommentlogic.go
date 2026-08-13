@@ -45,7 +45,7 @@ func NewPublishCommentLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Pu
 }
 
 func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) (*interaction.PublishCommentResp, error) {
-	// 1. 校验 user_id、video_id、username、content。
+	// 校验 user_id、video_id、username、content。
 	userID := in.GetUserId()
 	if userID == 0 {
 		return nil, status.Error(codes.Unauthenticated, "用户未登录")
@@ -77,7 +77,7 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 		return nil, status.Error(codes.InvalidArgument, "request_id过长")
 	}
 
-	// 2. 如果前端/网关传了 request_id，先走幂等查询。
+	// 如果前端/网关传了 request_id，先走幂等查询。
 	if resp, ok, err := l.loadIdempotentCommentResp(userID, requestID); err != nil {
 		l.Errorf("load idempotent comment failed, user_id: %d, request_id: %s, error: %v", userID, requestID, err)
 		return nil, status.Error(codes.Internal, "幂等校验失败")
@@ -85,7 +85,7 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 		return resp, nil
 	}
 
-	// 3. 校验视频是否存在且未删除。
+	// 校验视频是否存在且未删除。
 	var video model.Video
 	if err := l.svcCtx.GormDB.WithContext(l.ctx).
 		Where("id = ? AND status = ? AND deleted_at IS NULL", videoID, model.VideoStatusNormal).
@@ -97,9 +97,9 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 		return nil, status.Error(codes.Internal, "查询视频失败")
 	}
 
-	// 4. 对真正的新评论做短 TTL 限流。
-	//    锁 token 化：SetNX 用随机 token 而非固定 "1"，释放时通过 Lua CAS 只删自己写入的那把锁。
-	//    这样即便本次请求处理耗时超过 TTL、TTL 自动过期后被下一个请求 A 拿到，本次 defer 也不会误删 A 的锁。
+	// 对真正的新评论做短 TTL 限流。
+	// 锁 token 化：SetNX 用随机 token 而非固定 "1"，释放时通过 Lua CAS 只删自己写入的那把锁。
+	// 这样即便本次请求处理耗时超过 TTL、TTL 自动过期后被下一个请求 A 拿到，本次 defer 也不会误删 A 的锁。
 	rateLimitKey := rediskey.CommentRateLimitKey(userID, videoID)
 	rateLimitToken, err := randomHex(16)
 	if err != nil {
@@ -138,8 +138,9 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 		}
 	}
 
-	// 5. MySQL 事务：评论、互动事件、领域 outbox 与通知 outbox 必须一起提交。
+	// MySQL 事务：评论、互动事件、领域 outbox 与通知 outbox 必须一起提交。
 	now := time.Now()
+	// 事务外声明，因为结构体内的需要在事务结束后使用
 	comment := model.Comment{
 		VideoID:   videoID,
 		UserID:    userID,
@@ -149,7 +150,7 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 		Status:    model.CommentStatusNormal,
 	}
 	if err := runInteractionWriteTransaction(l.ctx, l.svcCtx.GormDB, func(tx *gorm.DB) error {
-		// 前一次失败尝试可能已经被 GORM 回填自增 ID；重试必须重新申请主键。
+		// comment结构体申明在事务外，前一次失败尝试可能已经被 GORM 回填自增 ID；重试必须重新申请主键。
 		comment.ID = 0
 		comment.CreatedAt = time.Time{}
 		comment.UpdatedAt = time.Time{}
@@ -244,7 +245,7 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 	}
 	keepRateLimit = true
 
-	// 6. Redis 更新：评论列表版本、评论权威计数、热度增量、request_id 幂等缓存。
+	// Redis 更新：评论列表版本、评论权威计数、热度增量、request_id 幂等缓存。
 	// 评论发布直接原子叠加 Redis 权威 Hash，返回值就是用户可见的权威评论数。
 	commentsCount := nonNegative(video.CommentsCount + 1)
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
@@ -272,6 +273,7 @@ func (l *PublishCommentLogic) PublishComment(in *interaction.PublishCommentReq) 
 	}, nil
 }
 
+// 重复请求的评论返回同一个
 func (l *PublishCommentLogic) loadIdempotentCommentResp(userID uint64, requestID string) (*interaction.PublishCommentResp, bool, error) {
 	commentID, ok, err := l.loadIdempotentCommentIDFromRedis(userID, requestID)
 	if err != nil {
@@ -318,6 +320,7 @@ func (l *PublishCommentLogic) loadIdempotentCommentResp(userID uint64, requestID
 	}, true, nil
 }
 
+// 获取发布评论请求的缓存ID，同一 requestID 重试应返回同一条评论表里的ID
 func (l *PublishCommentLogic) loadIdempotentCommentIDFromRedis(userID uint64, requestID string) (uint64, bool, error) {
 	value, err := l.svcCtx.RedisCli.Get(l.ctx, rediskey.CommentIdempotencyKey(userID, requestID)).Result()
 	if err != nil {

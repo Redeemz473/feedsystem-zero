@@ -71,7 +71,7 @@ func NewListMyLikedVideosLogic(ctx context.Context, svcCtx *svc.ServiceContext) 
 }
 
 func (l *ListMyLikedVideosLogic) ListMyLikedVideos(in *interaction.ListMyLikedVideosReq) (*interaction.ListMyLikedVideosResp, error) {
-	// 1. 校验 user_id 不能为 0；page_size 设置默认值和上限，例如默认 20、最大 50。
+	// 校验 user_id 不能为 0；page_size 设置默认值和上限，例如默认 20、最大 50。
 	userID := in.GetUserId()
 	if userID == 0 {
 		return nil, status.Error(codes.Unauthenticated, "用户未登录")
@@ -90,8 +90,8 @@ func (l *ListMyLikedVideosLogic) ListMyLikedVideos(in *interaction.ListMyLikedVi
 		pageSize = maxListMyLikedVideosPageSize
 	}
 
-	// 2. Redis 只缓存分页结果，不直接用 LikeUserVideosKey 做分页来源；普通 Set 没有时间顺序。
-	cacheKey := ""
+	// Redis 只缓存分页结果，不直接用 LikeUserVideosKey 做分页来源；普通 Set 没有时间顺序。
+	cacheKey := "" //如果在getLikedVideosListVersion中没能获取到版本号，证明Redis挂了/超时
 	if version, ok := l.getLikedVideosListVersion(userID); ok {
 		cacheKey = rediskey.LikeUserVideosPageCacheKey(userID, version, cursorCreatedAt, cursorLikeID, pageSize)
 		if resp, hit := l.loadLikedVideosListCache(cacheKey); hit {
@@ -102,7 +102,7 @@ func (l *ListMyLikedVideosLogic) ListMyLikedVideos(in *interaction.ListMyLikedVi
 	var lockKey, lockToken string
 	locked := false
 	if cacheKey != "" {
-		lockKey, lockToken, locked = l.tryLockLikedVideosListCache(cacheKey)
+		lockKey, lockToken, locked = l.tryLockLikedVideosListCache(cacheKey) //Redis可用则加分布式锁防缓存击穿
 		if !locked {
 			if resp, hit := l.waitAndReloadLikedVideosListCache(cacheKey); hit {
 				return resp, nil
@@ -162,7 +162,7 @@ func (l *ListMyLikedVideosLogic) loadLikedVideosFromDB(userID uint64, cursorCrea
 		)
 	}
 
-	// 4. 排序使用 updated_at DESC, id DESC，并多查一条判断 has_more。
+	// 排序使用 updated_at DESC, id DESC，并多查一条判断 has_more。
 	likes := make([]model.Like, 0, pageSize+1)
 	if err := query.
 		Order("likes.updated_at DESC").
@@ -335,6 +335,7 @@ func (l *ListMyLikedVideosLogic) tryLockLikedVideosListCache(cacheKey string) (s
 	return lockKey, lockToken, locked
 }
 
+// 短轮询3次，每次50ms，每次都会去读缓存，如果超时则自己去查DB
 func (l *ListMyLikedVideosLogic) waitAndReloadLikedVideosListCache(cacheKey string) (*interaction.ListMyLikedVideosResp, bool) {
 	for i := 0; i < likedVideosListCacheRetryAttempts; i++ {
 		timer := time.NewTimer(likedVideosListCacheRetryDelay)
