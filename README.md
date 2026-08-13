@@ -13,6 +13,8 @@
 
 ---
 
+> **一句话定位**：一个用 Go 单仓多服务（go-zero RPC）+ MySQL + Redis + Kafka + etcd 从零搭建的**短视频信息流后端**，用"强一致写路径（业务事务 + Outbox）+ 最终一致派生数据（Kafka 事件驱动）"的架构，解决了高并发下点赞/关注/Feed 等派生状态的一致性与热点写问题。配套 React 前端，可本地一键起全套并跑通压测。
+
 ## 一、项目亮点
 
 - 🧱 **单仓多服务**：`apps/{gateway, account, video, interaction, social, notification, feed}` + `apps/job/*`，同一个 Go module 内共享 `common/*` 与 `model/*`，避免多仓依赖同步的痛苦。
@@ -51,7 +53,7 @@ flowchart LR
     Jobs --> MySQL
 ```
 
-> 完整版架构图、ER 图、每个模块的时序图（共 17 张 Mermaid）见 [`docs/PROJECT_OVERVIEW.md`](./docs/PROJECT_OVERVIEW.md)。
+> 完整版架构图、ER 图、每个模块的时序图（共 24 张 Mermaid）见 [`docs/PROJECT_OVERVIEW.md`](./docs/PROJECT_OVERVIEW.md)。
 
 ---
 
@@ -272,9 +274,10 @@ go run ./tests/cmd/loadtest \
 ## 八、深入阅读
 
 - 📘 **一次读懂整个系统** → [`docs/PROJECT_OVERVIEW.md`](./docs/PROJECT_OVERVIEW.md)
-  - 总体架构 / ER 图 / 事件契约 / Outbox 模式 / 各模块时序图（共 17 张 Mermaid）
+  - 总体架构 / ER 图 / 事件契约 / Outbox 模式 / 各模块时序图（共 24 张 Mermaid）
   - Redis Key 命名空间 / 一致性 · 并发 · 幂等设计原则
   - Gateway HTTP API 汇总 / 常见问题排查
+  - **排查导航**：想查缓存 key 直奔 §11；想理解一致性 / 死锁 / 版本号设计看 §12；想知道最近改了什么看 §17 Changelog。
 - 🎨 **前端指南** → [`web/README.md`](./web/README.md)
 - 🗄️ **数据库迁移** → [`deploy/sql/`](./deploy/sql/)
 - ✉️ **事件契约** → [`common/eventx/`](./common/eventx/) 与 [`model/event.go`](./model/event.go)
@@ -284,9 +287,10 @@ go run ./tests/cmd/loadtest \
 ## 九、常用命令
 
 ```bash
+go mod tidy          # 拉取/对齐依赖；go.sum 已有但 go.mod 未 require 时 IDE 会报红波浪线，先 tidy 再重启语言服务器
 go build ./...       # 全量编译
 go vet ./...         # 静态检查
-go test ./...        # 单元测试
+go test ./...        # 单元测试（关键包建议加 -race 跑并发安全）
 
 # 改 proto 后重新生成 RPC
 cd apps/account
