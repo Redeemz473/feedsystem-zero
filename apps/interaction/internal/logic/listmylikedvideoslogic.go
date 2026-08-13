@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,7 +21,8 @@ import (
 )
 
 const (
-	defaultListMyLikedVideosPageSize  int64 = 20
+	likedVideosFirstPageWindowSize    int64 = 20
+	defaultListMyLikedVideosPageSize        = likedVideosFirstPageWindowSize
 	maxListMyLikedVideosPageSize      int64 = 50
 	likedVideosListCacheTTL                 = 30 * time.Second
 	likedVideosListCacheLockTTL             = 2 * time.Second
@@ -29,11 +31,26 @@ const (
 	maxLikedVideosCursorFutureSkew          = 5 * time.Minute
 )
 
+const saveLikedVideosFirstPageCacheScript = `
+if redis.call("GET", KEYS[3]) ~= ARGV[4] then
+	return -1
+end
+local current_version = redis.call("GET", KEYS[1])
+if not current_version then
+	redis.call("SET", KEYS[1], "0")
+	current_version = "0"
+end
+if current_version ~= ARGV[1] then
+	return 0
+end
+redis.call("SET", KEYS[2], ARGV[2], "PX", ARGV[3])
+return 1
+`
+
 type likedVideosListCache struct {
-	LikedVideos         []likedVideoItemCache `json:"liked_videos"`
-	NextCursorCreatedAt int64                 `json:"next_cursor_created_at"`
-	NextCursorLikeID    uint64                `json:"next_cursor_like_id"`
-	HasMore             bool                  `json:"has_more"`
+	Version            int64                 `json:"version"`
+	LikedVideos        []likedVideoItemCache `json:"liked_videos"`
+	HasMoreAfterWindow bool                  `json:"has_more_after_window"`
 }
 
 type likedVideoItemCache struct {
@@ -90,44 +107,91 @@ func (l *ListMyLikedVideosLogic) ListMyLikedVideos(in *interaction.ListMyLikedVi
 		pageSize = maxListMyLikedVideosPageSize
 	}
 
-	// Redis 只缓存分页结果，不直接用 LikeUserVideosKey 做分页来源；普通 Set 没有时间顺序。
-	cacheKey := "" //如果在getLikedVideosListVersion中没能获取到版本号，证明Redis挂了/超时
-	if version, ok := l.getLikedVideosListVersion(userID); ok {
-		cacheKey = rediskey.LikeUserVideosPageCacheKey(userID, version, cursorCreatedAt, cursorLikeID, pageSize)
-		if resp, hit := l.loadLikedVideosListCache(cacheKey); hit {
-			return resp, nil
-		}
-	}
-
-	var lockKey, lockToken string
-	locked := false
-	if cacheKey != "" {
-		lockKey, lockToken, locked = l.tryLockLikedVideosListCache(cacheKey) //Redis可用则加分布式锁防缓存击穿
-		if !locked {
-			if resp, hit := l.waitAndReloadLikedVideosListCache(cacheKey); hit {
+	// Redis 只缓存固定 20 条的首页窗口。小首页从窗口中截取；大页和历史页直接查 MySQL。
+	cacheable := isLikedVideosFirstPageCacheable(cursorCreatedAt, cursorLikeID, pageSize)
+	cacheKey := ""
+	version := int64(0)
+	if cacheable {
+		if currentVersion, ok := l.getLikedVideosListVersion(userID); ok {
+			version = currentVersion
+			cacheKey = rediskey.LikeUserVideosFirstPageCacheKey(userID, version)
+			if resp, hit := l.loadLikedVideosFirstPageCache(cacheKey, version, pageSize); hit {
 				return resp, nil
 			}
 		}
 	}
-	if locked {
+
+	var lockKey, lockToken string
+	useFixedWindow := false
+	cacheWriteAllowed := false
+	if cacheKey != "" {
+		var lockErr error
+		var locked bool
+		lockKey, lockToken, locked, lockErr = l.tryLockLikedVideosListCache(cacheKey)
+		switch {
+		case lockErr != nil:
+			// Redis 不可用时直接按请求大小查 MySQL，不再等待或回写缓存。
+			cacheKey = ""
+		case locked:
+			useFixedWindow = true
+			cacheWriteAllowed = true
+		default:
+			if resp, hit := l.waitAndReloadLikedVideosFirstPageCache(cacheKey, version, pageSize); hit {
+				return resp, nil
+			}
+			// 等待超时后允许回源，但此时尚无缓存写入权。
+			useFixedWindow = true
+		}
+	}
+	if cacheWriteAllowed {
 		defer l.releaseLikedVideosListCacheLock(lockKey, lockToken)
 	}
 
-	dbLoadKey := likedVideosListDBLoadKey(userID, cursorCreatedAt, cursorLikeID, pageSize)
+	dbPageSize := pageSize
+	if useFixedWindow {
+		dbPageSize = likedVideosFirstPageWindowSize
+	}
+	dbLoadKey := likedVideosListDBLoadKey(userID, cursorCreatedAt, cursorLikeID, dbPageSize)
+	if useFixedWindow {
+		dbLoadKey = "cache:" + cacheKey
+	}
 	likes, hasMore, err := likedVideosListLoadGroup.Do(l.ctx, dbLoadKey, func() ([]model.Like, bool, error) {
-		return l.loadLikedVideosFromDB(userID, cursorCreatedAt, cursorLikeID, pageSize)
+		return l.loadLikedVideosFromDB(userID, cursorCreatedAt, cursorLikeID, dbPageSize)
 	})
 	if err != nil {
 		l.Errorf("list user liked videos failed, user_id: %d, error: %v", userID, err)
 		return nil, status.Error(codes.Internal, "获取点赞视频失败")
 	}
 
-	resp := buildListMyLikedVideosResp(likes, hasMore)
-	if cacheKey != "" {
-		l.saveLikedVideosListCache(cacheKey, resp)
+	// 首次未抢到锁的请求在回源完成后再尝试一次。原构建者已经完成时优先复用其缓存；
+	// 原构建者失败或锁已过期时，只有二次抢锁成功者可以接管缓存写入。
+	if useFixedWindow && cacheKey != "" && !cacheWriteAllowed {
+		if resp, hit := l.loadLikedVideosFirstPageCache(cacheKey, version, pageSize); hit {
+			return resp, nil
+		}
+		secondLockKey, secondLockToken, locked, lockErr := l.tryLockLikedVideosListCache(cacheKey)
+		if lockErr == nil && locked {
+			lockKey = secondLockKey
+			lockToken = secondLockToken
+			cacheWriteAllowed = true
+			defer l.releaseLikedVideosListCacheLock(lockKey, lockToken)
+		}
 	}
 
+	if cacheWriteAllowed {
+		l.saveLikedVideosFirstPageCache(userID, cacheKey, version, lockKey, lockToken, likes, hasMore)
+	}
+
+	responseLikes, responseHasMore := selectLikedVideosPage(likes, pageSize, hasMore)
+	resp := buildListMyLikedVideosResp(responseLikes, responseHasMore)
 	return resp, nil
+}
+
+func isLikedVideosFirstPageCacheable(cursorCreatedAt int64, cursorLikeID uint64, pageSize int64) bool {
+	return cursorCreatedAt == 0 &&
+		cursorLikeID == 0 &&
+		pageSize > 0 &&
+		pageSize <= likedVideosFirstPageWindowSize
 }
 
 func validateLikedVideosListCursor(cursorCreatedAt int64, cursorLikeID uint64) error {
@@ -206,6 +270,26 @@ func buildListMyLikedVideosResp(likes []model.Like, hasMore bool) *interaction.L
 	}
 }
 
+func selectLikedVideosPage(likes []model.Like, pageSize int64, hasMoreAfterWindow bool) ([]model.Like, bool) {
+	returnCount, hasMore := likedVideosPageBounds(len(likes), pageSize, hasMoreAfterWindow)
+	return likes[:returnCount], hasMore
+}
+
+func likedVideosPageBounds(itemCount int, pageSize int64, hasMoreAfterWindow bool) (int, bool) {
+	if itemCount <= 0 || pageSize <= 0 {
+		return 0, false
+	}
+	returnCount := itemCount
+	if int64(returnCount) > pageSize {
+		returnCount = int(pageSize)
+	}
+	hasMore := returnCount < itemCount
+	if returnCount == itemCount {
+		hasMore = hasMoreAfterWindow
+	}
+	return returnCount, hasMore
+}
+
 func (l *ListMyLikedVideosLogic) getLikedVideosListVersion(userID uint64) (int64, bool) {
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
 	defer cancel()
@@ -221,7 +305,10 @@ func (l *ListMyLikedVideosLogic) getLikedVideosListVersion(userID uint64) (int64
 	return 0, false
 }
 
-func (l *ListMyLikedVideosLogic) loadLikedVideosListCache(cacheKey string) (*interaction.ListMyLikedVideosResp, bool) {
+func (l *ListMyLikedVideosLogic) loadLikedVideosFirstPageCache(cacheKey string, expectedVersion int64, pageSize int64) (*interaction.ListMyLikedVideosResp, bool) {
+	if pageSize <= 0 || pageSize > likedVideosFirstPageWindowSize {
+		return nil, false
+	}
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
 	defer cancel()
 
@@ -238,36 +325,63 @@ func (l *ListMyLikedVideosLogic) loadLikedVideosListCache(cacheKey string) (*int
 		l.Errorf("unmarshal liked videos list cache failed, key: %s, error: %v", cacheKey, err)
 		return nil, false
 	}
-
-	items := make([]*interaction.LikedVideoItem, 0, len(cached.LikedVideos))
+	if cached.Version != expectedVersion {
+		return nil, false
+	}
+	if len(cached.LikedVideos) > int(likedVideosFirstPageWindowSize) {
+		l.Errorf("unexpected liked videos first page cache size, key: %s, size: %d", cacheKey, len(cached.LikedVideos))
+		return nil, false
+	}
+	if cached.HasMoreAfterWindow && len(cached.LikedVideos) != int(likedVideosFirstPageWindowSize) {
+		l.Errorf("invalid liked videos first page cache window, key: %s, size: %d", cacheKey, len(cached.LikedVideos))
+		return nil, false
+	}
 	for _, item := range cached.LikedVideos {
+		if item.LikeID == 0 || item.VideoID == 0 || item.LikedAt <= 0 {
+			l.Errorf("invalid liked videos first page cache item, key: %s", cacheKey)
+			return nil, false
+		}
+	}
+
+	returnCount, hasMore := likedVideosPageBounds(len(cached.LikedVideos), pageSize, cached.HasMoreAfterWindow)
+	items := make([]*interaction.LikedVideoItem, 0, returnCount)
+	for _, item := range cached.LikedVideos[:returnCount] {
 		items = append(items, &interaction.LikedVideoItem{
 			LikeId:  item.LikeID,
 			VideoId: item.VideoID,
 			LikedAt: item.LikedAt,
 		})
 	}
+	var nextCursorCreatedAt int64
+	var nextCursorLikeID uint64
+	if hasMore && len(items) > 0 {
+		last := items[len(items)-1]
+		nextCursorCreatedAt = last.GetLikedAt()
+		nextCursorLikeID = last.GetLikeId()
+	}
 
 	return &interaction.ListMyLikedVideosResp{
 		LikedVideos:         items,
-		NextCursorCreatedAt: cached.NextCursorCreatedAt,
-		NextCursorLikeId:    cached.NextCursorLikeID,
-		HasMore:             cached.HasMore,
+		NextCursorCreatedAt: nextCursorCreatedAt,
+		NextCursorLikeId:    nextCursorLikeID,
+		HasMore:             hasMore,
 	}, true
 }
 
-func (l *ListMyLikedVideosLogic) saveLikedVideosListCache(cacheKey string, resp *interaction.ListMyLikedVideosResp) {
-	cached := likedVideosListCache{
-		LikedVideos:         make([]likedVideoItemCache, 0, len(resp.GetLikedVideos())),
-		NextCursorCreatedAt: resp.GetNextCursorCreatedAt(),
-		NextCursorLikeID:    resp.GetNextCursorLikeId(),
-		HasMore:             resp.GetHasMore(),
+func (l *ListMyLikedVideosLogic) saveLikedVideosFirstPageCache(userID uint64, cacheKey string, version int64, lockKey string, lockToken string, likes []model.Like, hasMoreAfterWindow bool) {
+	if len(likes) > int(likedVideosFirstPageWindowSize) {
+		likes = likes[:likedVideosFirstPageWindowSize]
 	}
-	for _, item := range resp.GetLikedVideos() {
+	cached := likedVideosListCache{
+		Version:            version,
+		LikedVideos:        make([]likedVideoItemCache, 0, len(likes)),
+		HasMoreAfterWindow: hasMoreAfterWindow,
+	}
+	for _, item := range likes {
 		cached.LikedVideos = append(cached.LikedVideos, likedVideoItemCache{
-			LikeID:  item.GetLikeId(),
-			VideoID: item.GetVideoId(),
-			LikedAt: item.GetLikedAt(),
+			LikeID:  item.ID,
+			VideoID: item.VideoID,
+			LikedAt: item.UpdatedAt.UnixMilli(),
 		})
 	}
 
@@ -279,8 +393,23 @@ func (l *ListMyLikedVideosLogic) saveLikedVideosListCache(cacheKey string, resp 
 
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
 	defer cancel()
-	if err := l.svcCtx.RedisCli.Set(redisCtx, cacheKey, data, likedVideosListCacheTTL).Err(); err != nil {
+	written, err := l.svcCtx.RedisCli.Eval(
+		redisCtx,
+		saveLikedVideosFirstPageCacheScript,
+		[]string{rediskey.LikeUserVideosListVersionKey(userID), cacheKey, lockKey},
+		strconv.FormatInt(version, 10),
+		data,
+		likedVideosListCacheTTL.Milliseconds(),
+		lockToken,
+	).Int64()
+	if err != nil {
 		l.Errorf("set liked videos list cache failed, key: %s, error: %v", cacheKey, err)
+		return
+	}
+	if written == 0 {
+		l.Infof("skip stale liked videos first page cache, version: %d", version)
+	} else if written < 0 {
+		l.Infof("skip liked videos first page cache without lock ownership, key: %s", cacheKey)
 	}
 }
 
@@ -317,26 +446,26 @@ func (g *localLikedVideosListLoadGroup) Do(ctx context.Context, key string, fn f
 	return call.likes, call.hasMore, call.err
 }
 
-func (l *ListMyLikedVideosLogic) tryLockLikedVideosListCache(cacheKey string) (string, string, bool) {
+func (l *ListMyLikedVideosLogic) tryLockLikedVideosListCache(cacheKey string) (string, string, bool, error) {
 	lockToken, err := randomHex(8)
 	if err != nil {
 		l.Errorf("generate liked videos list cache lock token failed, key: %s, error: %v", cacheKey, err)
-		return "", "", false
+		return "", "", false, err
 	}
 
-	lockKey := rediskey.LikeUserVideosPageCacheBuildLockKey(cacheKey)
+	lockKey := rediskey.LikeUserVideosFirstPageCacheBuildLockKey(cacheKey)
 	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
 	defer cancel()
 	locked, err := l.svcCtx.RedisCli.SetNX(redisCtx, lockKey, lockToken, likedVideosListCacheLockTTL).Result()
 	if err != nil {
 		l.Errorf("lock liked videos list cache build failed, key: %s, error: %v", cacheKey, err)
-		return "", "", false
+		return "", "", false, err
 	}
-	return lockKey, lockToken, locked
+	return lockKey, lockToken, locked, nil
 }
 
 // 短轮询3次，每次50ms，每次都会去读缓存，如果超时则自己去查DB
-func (l *ListMyLikedVideosLogic) waitAndReloadLikedVideosListCache(cacheKey string) (*interaction.ListMyLikedVideosResp, bool) {
+func (l *ListMyLikedVideosLogic) waitAndReloadLikedVideosFirstPageCache(cacheKey string, version int64, pageSize int64) (*interaction.ListMyLikedVideosResp, bool) {
 	for i := 0; i < likedVideosListCacheRetryAttempts; i++ {
 		timer := time.NewTimer(likedVideosListCacheRetryDelay)
 		select {
@@ -344,7 +473,7 @@ func (l *ListMyLikedVideosLogic) waitAndReloadLikedVideosListCache(cacheKey stri
 			timer.Stop()
 			return nil, false
 		case <-timer.C:
-			if resp, hit := l.loadLikedVideosListCache(cacheKey); hit {
+			if resp, hit := l.loadLikedVideosFirstPageCache(cacheKey, version, pageSize); hit {
 				return resp, true
 			}
 		}
@@ -357,7 +486,7 @@ func (l *ListMyLikedVideosLogic) releaseLikedVideosListCacheLock(lockKey string,
 		return
 	}
 
-	redisCtx, cancel := context.WithTimeout(l.ctx, commentRedisOpTimeout)
+	redisCtx, cancel := context.WithTimeout(context.WithoutCancel(l.ctx), commentRedisOpTimeout)
 	defer cancel()
 	if err := releaseRedisLock(redisCtx, l.svcCtx.RedisCli, lockKey, lockToken); err != nil {
 		l.Errorf("release liked videos list cache lock failed, key: %s, error: %v", lockKey, err)

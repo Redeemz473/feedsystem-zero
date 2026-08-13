@@ -97,22 +97,21 @@ func LikeUserVideosListVersionKey(userID uint64) string {
 	return fmt.Sprintf("%s:like:user:%d:videos:list:version", prefix, userID)
 }
 
-// LikeUserVideosPageCacheKey 用户点赞视频分页结果缓存。
+// LikeUserVideosFirstPageCacheKey 用户点赞视频固定首页窗口缓存。
 // 数据结构: STRING (JSON)
-// key: fsz:like:user:{userID}:videos:page:{version}:{cursorCreatedAt}:{cursorLikeID}:{pageSize}
-// value: 该分页页数据 JSON
-// 用途: cursorCreatedAt 实际表示上一页最后一条 liked_at，沿用 proto 字段名 cursor_created_at；
-// 版本变化后旧 key 自然失效。
-func LikeUserVideosPageCacheKey(userID uint64, version int64, cursorCreatedAt int64, cursorLikeID uint64, pageSize int64) string {
-	return fmt.Sprintf("%s:like:user:%d:videos:page:%d:%d:%d:%d", prefix, userID, version, cursorCreatedAt, cursorLikeID, pageSize)
+// key: fsz:like:user:{userID}:videos:first:{version}
+// value: 最多 20 条点赞关系及窗口外是否还有数据。
+// 用途: 同一版本下所有 page_size<=20 的首页请求共用一份缓存；历史页和大页直接查询 MySQL。
+func LikeUserVideosFirstPageCacheKey(userID uint64, version int64) string {
+	return fmt.Sprintf("%s:like:user:%d:videos:first:%d", prefix, userID, version)
 }
 
-// LikeUserVideosPageCacheBuildLockKey 用户点赞视频分页缓存构建锁。
+// LikeUserVideosFirstPageCacheBuildLockKey 用户点赞视频首页缓存构建锁。
 // 数据结构: STRING
-// key: fsz:like:user:videos:page:lock:{cacheKey}  value: 持锁实例标识
-// 用途: 防止分页缓存 miss 时多副本并发回源 MySQL。
-func LikeUserVideosPageCacheBuildLockKey(cacheKey string) string {
-	return fmt.Sprintf("%s:like:user:videos:page:lock:%s", prefix, cacheKey)
+// key: fsz:like:user:videos:first:lock:{cacheKey}  value: 持锁实例标识
+// 用途: 防止首页缓存 miss 时多副本并发回源 MySQL。
+func LikeUserVideosFirstPageCacheBuildLockKey(cacheKey string) string {
+	return fmt.Sprintf("%s:like:user:videos:first:lock:%s", prefix, cacheKey)
 }
 
 // LikeStateKey 点赞状态覆盖缓存。
