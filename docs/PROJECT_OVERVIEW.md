@@ -2586,15 +2586,15 @@ end
 flowchart TD
     A[点赞/取消点赞请求] --> B[Redis 短锁与状态预判]
     B -->|重复状态| C[幂等返回]
-    B -->|真实变化| D[MySQL 事务<br/>关系事实 + interaction_event + outbox]
-    D --> E[Redis Lua bumpVideoStatsAuthScript<br/>冷启动 + HINCRBY 实时投影]
+    B -->|真实变化| D[MySQL 事务 关系事实 + interaction_event + outbox]
+    D --> E[Redis Lua bumpVideoStatsAuthScript 冷启动 + HINCRBY 实时投影]
     E --> F[返回实时投影值]
-    D --> OB[Outbox Job 扫描并投递]
+    F --> OB[Outbox Job 扫描并投递]
     OB --> K[Kafka 多 partition]
-    K --> G[interaction_sync<br/>topic+partition 组内保序、组间并发]
+    K --> G[interaction_sync topic+partition 组内保序、组间并发]
     G --> H[每 500 条一个批量事务]
-    H --> I[processed_events 幂等<br/>按 video 聚合净增量<br/>按 video_id 升序更新<br/>递增 stats_version]
-    I --> J[Consumer Pipeline<br/>按版本 CAS 投影 Redis]
+    H --> I[processed_events 幂等 按 video 聚合净增量 按 video_id 升序更新 递增 stats_version]
+    I --> J[Consumer Pipeline 按版本 CAS 投影 Redis]
 ```
 
 | 层次 | 机制 | 解决的问题 |
@@ -2621,20 +2621,20 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    U[用户点赞 RPC] -->|事务| DB1[(MySQL<br/>likes / interaction_events / outbox_events)]
-    DB1 -.outbox.-> OD[outbox dispatcher<br/>扫表分发]
-    DB1 -->|事务提交后 Lua| R1[(Redis<br/>版本化服务投影立即可见)]
-    OD --> K[Kafka<br/>interaction.like.events<br/>6 partition]
-    K --> C[interaction_sync Consumer<br/>topic+partition 组内保序、组间并发]
-    C -->|累积 500 条<br/>或 100ms 超时| RPC[FlushLikeEvents RPC]
-    RPC --> AGG[内存 map 按 videoID 聚合<br/>deltasByVideo]
+    U[用户点赞 RPC] -->|事务| DB1[(MySQL likes / interaction_events / outbox_events)]
+    DB1 --> OD[outbox dispatcher 扫表分发]
+    DB1 -->|事务提交后 Lua| R1[(Redis 版本化服务投影立即可见)]
+    OD --> K[Kafka interaction.like.events 6 partition]
+    K --> C[interaction_sync Consumer topic+partition 组内保序、组间并发]
+    C -->|累积 500 条 或 100ms 超时| RPC[FlushLikeEvents RPC]
+    RPC --> AGG[内存 map 按 videoID 聚合 deltasByVideo]
     AGG --> TX[一个 MySQL 事务]
-    TX -->|按 event_id 顺序逐条 INSERT processed_events<br/>都在同一事务| DB2[(MySQL)]
-    TX -->|M 条 UPDATE videos<br/>按 videoID 升序| DB2
+    TX -->|按 event_id 顺序逐条 INSERT processed_events 都在同一事务| DB2[(MySQL)]
+    TX -->|M 条 UPDATE videos 按 videoID 升序| DB2
     TX -->|一次 COMMIT| DB2
-    DB2 --> SNAP[批量读取最新聚合快照<br/>含 stats_version]
-    SNAP --> PROJ[Redis Pipeline<br/>Lua CAS 投影]
-    PROJ -->|失败| RETRY[Flush 返回错误<br/>Kafka 保留 offset 后重放]
+    DB2 --> SNAP[批量读取最新聚合快照 含 stats_version]
+    SNAP --> PROJ[Redis Pipeline Lua CAS 投影]
+    PROJ -->|失败| RETRY[Flush 返回错误 Kafka 保留 offset 后重放]
 ```
 
 ##### 二、关键参数与代码位置
@@ -2795,28 +2795,32 @@ sequenceDiagram
     participant NJ as notification-job
     participant V as 视频作者 V
 
-    U->>RPC: PublishComment(video_id, content, request_id)
-    RPC->>R: Get CommentIdempotencyKey(user, request_id)
+    U->>RPC: PublishComment video_id content request_id
+    RPC->>R: GET CommentIdempotencyKey user request_id
     alt 命中幂等
         R-->>RPC: 已存在 commentID
         RPC-->>U: 返回历史结果
     else 首次请求
         RPC->>R: 令牌桶限流 CommentRateLimitKey
         RPC->>DB: BEGIN
-        RPC->>DB: INSERT comments (status=1)
-        RPC->>DB: INSERT outbox_events (业务事件 comment.create)
-        alt video.AuthorID != user_id
-            RPC->>DB: INSERT outbox_events (通知事件 create,<br/>business_key=comment:V:U:C)
+        RPC->>DB: INSERT comments status=1
+        RPC->>DB: INSERT outbox_events 业务事件 comment.create
+        alt video.AuthorID 不等于 user_id
+            RPC->>DB: INSERT outbox_events 通知事件 create
+            RPC->>DB: 通知事件 business_key = comment V U C
         end
         RPC->>DB: COMMIT
-        RPC->>R: Pipeline:<br/>HINCRBY VideoStatsAuthKey comments_count +1<br/>INCR CommentListVersionKey<br/>ZIncrBy HotVideoRealtimeKey +5<br/>SET CommentIdempotencyKey commentID EX 24h
-        RPC-->>U: 返回 commentID + 权威计数
+        RPC->>R: HINCRBY VideoStatsAuthKey comments_count +1
+        RPC->>R: INCR CommentListVersionKey
+        RPC->>R: ZIncrBy HotVideoRealtimeKey +5
+        RPC->>R: SET CommentIdempotencyKey commentID EX 24h
+        RPC-->>U: 返回 commentID 与权威计数
         Note over DB,K: outbox-dispatcher 异步分发两条事件
-        DB->>K: interaction.comment.events (业务)
-        DB->>K: notification.events (通知 create)
+        DB->>K: interaction.comment.events 业务
+        DB->>K: notification.events 通知 create
         K->>NJ: 通知事件
-        NJ->>DB: INSERT notifications<br/>(business_key=comment:V:U:C, status=1 未读)
-        NJ->>R: BumpUnreadVersion(V)
+        NJ->>DB: INSERT notifications business_key = comment V U C status=1 未读
+        NJ->>R: BumpUnreadVersion V
         V->>RPC: 下次拉未读数时 COUNT +1
     end
 ```
@@ -2835,7 +2839,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Op as 删除者<br/>(评论作者 或 视频作者)
+    participant Op as 删除者 评论作者或视频作者
     participant RPC as interaction-rpc
     participant DB as MySQL
     participant R as Redis
@@ -2843,28 +2847,32 @@ sequenceDiagram
     participant NJ as notification-job
     participant V as 视频作者 V
 
-    Op->>RPC: DeleteComment(comment_id)
-    RPC->>DB: SELECT comment, video FOR check
-    RPC->>RPC: 权限校验:<br/>comment.UserID == Op 或 video.AuthorID == Op
-    alt comment 已删/已下架
-        RPC-->>Op: 幂等返回"评论已删除"
+    Op->>RPC: DeleteComment comment_id
+    RPC->>DB: SELECT comment 与 video 用于校验
+    RPC->>RPC: 权限校验 comment.UserID == Op 或 video.AuthorID == Op
+    alt comment 已删或已下架
+        RPC-->>Op: 幂等返回 评论已删除
     else 正常
-        RPC->>RPC: 构造 notificationOutbox<br/>(仅当 video.AuthorID != comment.UserID)<br/>actor 使用原评论作者 comment.UserID
+        RPC->>RPC: 构造 notificationOutbox 仅当 video.AuthorID 不等于 comment.UserID
+        RPC->>RPC: actor 使用原评论作者 comment.UserID
         RPC->>DB: BEGIN
-        RPC->>DB: UPDATE comments SET status=已删, deleted_at=now
-        RPC->>DB: INSERT outbox_events (业务事件 comment.delete)
+        RPC->>DB: UPDATE comments SET status=已删 deleted_at=now
+        RPC->>DB: INSERT outbox_events 业务事件 comment.delete
         alt 有通知需要撤回
-            RPC->>DB: INSERT outbox_events<br/>(通知事件 delete,<br/>business_key=comment:V:U:C)
+            RPC->>DB: INSERT outbox_events 通知事件 delete
+            RPC->>DB: 通知事件 business_key = comment V U C
         end
         RPC->>DB: COMMIT
-        RPC->>R: Pipeline:<br/>HINCRBY VideoStatsAuthKey comments_count -1<br/>INCR CommentListVersionKey<br/>ZIncrBy HotVideoRealtimeKey -5
+        RPC->>R: HINCRBY VideoStatsAuthKey comments_count -1
+        RPC->>R: INCR CommentListVersionKey
+        RPC->>R: ZIncrBy HotVideoRealtimeKey -5
         RPC-->>Op: 返回权威计数
         Note over DB,K: outbox-dispatcher 异步分发
-        DB->>K: notification.events (通知 delete)
+        DB->>K: notification.events 通知 delete
         K->>NJ: 通知事件
-        NJ->>DB: SELECT notifications FOR UPDATE<br/>WHERE business_key=comment:V:U:C
-        NJ->>DB: UPDATE status=3 (已撤回)
-        NJ->>R: BumpUnreadVersion(V)
+        NJ->>DB: SELECT notifications FOR UPDATE WHERE business_key = comment V U C
+        NJ->>DB: UPDATE status=3 已撤回
+        NJ->>R: BumpUnreadVersion V
         V->>RPC: 下次拉未读数时 COUNT 排除 status=3
     end
 ```
