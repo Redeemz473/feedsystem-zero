@@ -44,7 +44,7 @@ func NewBatchGetVideoStatsLogic(ctx context.Context, svcCtx *svc.ServiceContext)
 // BatchGetVideoStats 优先读取 Redis 版本化统计投影；miss 时批量读取 MySQL 持久快照，
 // 再用一条 Pipeline 原子冷启动全部 key。Redis 故障时直接降级返回 MySQL 快照。
 func (l *BatchGetVideoStatsLogic) BatchGetVideoStats(in *interaction.BatchGetVideoStatsReq) (*interaction.BatchGetVideoStatsResp, error) {
-	// 1. 校验 video_ids，并去重保序；限制单次批量数量，避免大请求压垮 Redis/MySQL。
+	// 校验 video_ids，并去重保序；限制单次批量数量，避免大请求压垮 Redis/MySQL。
 	viewerID := in.GetViewerId()
 	videoIDs, err := normalizeBatchVideoIDs(in.GetVideoIds())
 	if err != nil {
@@ -54,7 +54,7 @@ func (l *BatchGetVideoStatsLogic) BatchGetVideoStats(in *interaction.BatchGetVid
 		return &interaction.BatchGetVideoStatsResp{Stats: []*interaction.VideoInteractionStats{}}, nil
 	}
 
-	// 2. 批量查询当前用户是否点赞。未登录 viewer_id=0 时，helper 会全部返回 false。
+	// 批量查询当前用户是否点赞。未登录 viewer_id=0 时，helper 会全部返回 false。
 	likedMap, err := batchLoadLikeStates(
 		l.ctx,
 		l.svcCtx.RedisCli,
@@ -66,7 +66,7 @@ func (l *BatchGetVideoStatsLogic) BatchGetVideoStats(in *interaction.BatchGetVid
 		return nil, status.Error(codes.Internal, "查询点赞状态失败")
 	}
 
-	// 3. 从 Redis 权威 Hash 批量读；未命中的 video 后续用 DB 冷备值冷启动。
+	// 从 Redis 权威 Hash 批量读；未命中的 video 后续用 DB 冷备值冷启动。
 	statsMap := make(map[uint64]videoBaseStats, len(videoIDs))
 	for _, videoID := range videoIDs {
 		statsMap[videoID] = videoBaseStats{}
@@ -74,8 +74,8 @@ func (l *BatchGetVideoStatsLogic) BatchGetVideoStats(in *interaction.BatchGetVid
 
 	missVideoIDs := l.loadAuthStats(videoIDs, statsMap)
 
-	// 4. Redis miss 的视频用 MySQL 冷备值做冷启动：读取 videos 冷备字段，
-	//    通过 readVideoStatsAuthScript 的 EXISTS==0 分支原子建立 auth key（避免 double init）。
+	// Redis miss 的视频用 MySQL 冷备值做冷启动：读取 videos 冷备字段，
+	// 通过 readVideoStatsAuthScript 的 EXISTS==0 分支原子建立 auth key（避免 double init）。
 	if len(missVideoIDs) > 0 {
 		if err := l.coldStartAuthStats(missVideoIDs, statsMap); err != nil {
 			l.Errorf("cold start auth stats failed, video_ids:%v err:%v", missVideoIDs, err)
@@ -83,7 +83,7 @@ func (l *BatchGetVideoStatsLogic) BatchGetVideoStats(in *interaction.BatchGetVid
 		}
 	}
 
-	// 5. 按请求顺序组装返回，方便 gateway 直接按 video_id 映射回视频列表。
+	// 按请求顺序组装返回，方便 gateway 直接按 video_id 映射回视频列表。
 	respStats := make([]*interaction.VideoInteractionStats, 0, len(videoIDs))
 	for _, videoID := range videoIDs {
 		stats := statsMap[videoID]

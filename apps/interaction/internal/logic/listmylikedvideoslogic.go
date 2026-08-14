@@ -124,6 +124,7 @@ func (l *ListMyLikedVideosLogic) ListMyLikedVideos(in *interaction.ListMyLikedVi
 	var lockKey, lockToken string
 	useFixedWindow := false
 	cacheWriteAllowed := false
+	// cacheKey不为空证明请求可以缓存，Redis没有挂
 	if cacheKey != "" {
 		var lockErr error
 		var locked bool
@@ -166,9 +167,11 @@ func (l *ListMyLikedVideosLogic) ListMyLikedVideos(in *interaction.ListMyLikedVi
 	// 首次未抢到锁的请求在回源完成后再尝试一次。原构建者已经完成时优先复用其缓存；
 	// 原构建者失败或锁已过期时，只有二次抢锁成功者可以接管缓存写入。
 	if useFixedWindow && cacheKey != "" && !cacheWriteAllowed {
+		// 先看构建者是不是已经把缓存写好了
 		if resp, hit := l.loadLikedVideosFirstPageCache(cacheKey, version, pageSize); hit {
 			return resp, nil
 		}
+		// 再抢一次锁
 		secondLockKey, secondLockToken, locked, lockErr := l.tryLockLikedVideosListCache(cacheKey)
 		if lockErr == nil && locked {
 			lockKey = secondLockKey
@@ -446,6 +449,7 @@ func (g *localLikedVideosListLoadGroup) Do(ctx context.Context, key string, fn f
 	return call.likes, call.hasMore, call.err
 }
 
+// 拿Redis分布式锁
 func (l *ListMyLikedVideosLogic) tryLockLikedVideosListCache(cacheKey string) (string, string, bool, error) {
 	lockToken, err := randomHex(8)
 	if err != nil {

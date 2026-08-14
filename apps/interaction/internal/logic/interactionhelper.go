@@ -577,6 +577,7 @@ func applyRedisLikeState(ctx context.Context, redisCli *redis.Client, videoID ui
 }
 
 // applyRedisUnlikeState 写取消点赞后的 Redis 实时状态，同时用 Lua 原子扣减权威 Hash。
+// 添加视频点赞用户集合、用户点赞视频集合、更新点赞状态覆盖键、实时热榜积分、用户点赞列表版本号。
 func applyRedisUnlikeState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64, video model.Video) (int64, error) {
 	authStats, err := bumpVideoStatsAuth(ctx, redisCli, videoID, videoBaseStatsFromDB(video), videoStatDelta{
 		LikeDelta:       -1,
@@ -609,7 +610,7 @@ func realtimeLikesCount(ctx context.Context, redisCli *redis.Client, video model
 }
 
 // applyRedisCommentCreatedState 写评论发布后的 Redis 实时状态，同时用 Lua 原子叠加权威 Hash。
-// 添加视频评论用户集合、用户评论视频集合、更新评论状态覆盖键、实时热榜积分、用户评论列表版本号。
+// 更新评论状态覆盖键、实时热榜积分、用户评论列表版本号。
 // 返回操作后 Redis 权威评论数（用户可见值）。
 func applyRedisCommentCreatedState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64, commentID uint64, requestID string, video model.Video) (int64, error) {
 	authStats, err := bumpVideoStatsAuth(ctx, redisCli, videoID, videoBaseStatsFromDB(video), videoStatDelta{
@@ -634,6 +635,7 @@ func applyRedisCommentCreatedState(ctx context.Context, redisCli *redis.Client, 
 }
 
 // applyRedisCommentDeletedState 写评论删除后的 Redis 实时状态，同时用 Lua 原子扣减权威 Hash。
+// 更新评论状态覆盖键、实时热榜积分、用户评论列表版本号。
 func applyRedisCommentDeletedState(ctx context.Context, redisCli *redis.Client, videoID uint64, userID uint64, requestID string, video model.Video) (int64, error) {
 	authStats, err := bumpVideoStatsAuth(ctx, redisCli, videoID, videoBaseStatsFromDB(video), videoStatDelta{
 		CommentDelta:    -1,

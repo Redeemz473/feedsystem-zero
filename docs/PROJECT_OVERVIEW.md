@@ -2177,38 +2177,43 @@ sequenceDiagram
     participant G as Gateway
     participant I as Interaction RPC
     participant DB as MySQL
-    participant R as Redis<br/>(VideoStatsAuthKey Hash)
+    participant R as Redis VideoStatsAuthKey
     participant OB as Outbox Job
     participant K as Kafka
     participant IS as interaction_sync Job
 
-    U->>G: POST /interaction/video/{video_id}/like
-    G->>I: LikeVideo(user_id=JWT.uid, video_id)
-    I->>R: SETNX fsz:like:lock:{u}:{v}  (3s，防重复点击)
+    U->>G: "POST /interaction/video/{id}/like"
+    G->>I: LikeVideo(user_id from JWT, video_id)
+    I->>R: "SETNX fsz:like:lock:{u}:{v} PX 3s 防重复点击"
     I->>DB: BEGIN
-    I->>DB: INSERT likes ON DUPLICATE KEY UPDATE status=1
-    I->>DB: INSERT outbox_events(like.created)
+    I->>DB: "INSERT likes ON DUPLICATE KEY UPDATE status=1"
+    I->>DB: "INSERT outbox_events (like.created)"
     I->>DB: COMMIT
 
-    Note over I,R: Lua bumpVideoStatsAuthScript（原子）
-    I->>R: if !EXISTS auth_key then HSET DB 快照 + stats_version<br/>HINCRBY likes_count/popularity/comments_count<br/>EXPIRE 7d
-    I->>R: SET LikeStateKey=1 / SAdd LikeVideoUsersKey / ZIncrBy HotVideoRealtimeKey / INCR LikeUserVideosListVersionKey
-    I-->>G: { liked:true, likes_count = Lua 返回的实时投影值 }
+    Note over I,R: Lua bumpVideoStatsAuthScript 原子执行
+    I->>R: 冷启动 HSET MySQL 快照与 stats_version
+    I->>R: HINCRBY likes_count / popularity / comments_count
+    I->>R: EXPIRE 7d 续期
+    I->>R: "SET LikeStateKey=1 / SAdd LikeVideoUsersKey"
+    I->>R: ZIncrBy HotVideoRealtimeKey
+    I->>R: INCR LikeUserVideosListVersionKey
+    I-->>G: liked=true, likes_count 使用 Lua 返回值
     G-->>U: 200 OK
 
     Note over OB,K: 异步持久化与投影修复链路
     OB->>K: like.created
-    K->>IS: LikeEvent（按 topic+partition 分组）
+    K->>IS: LikeEvent 按 topic+partition 分组
 
-    Note over IS,DB: 默认 500 条组成一个 Flush RPC / MySQL 事务
+    Note over IS,DB: 默认 500 条组成一个 Flush RPC 事务
     IS->>DB: BEGIN
-    IS->>DB: 按 event_id 排序 INSERT processed_events（幂等）
+    IS->>DB: "按 event_id 排序 INSERT processed_events 幂等"
     IS->>DB: 首次事件按 video_id 聚合净增量
-    IS->>DB: 按 video_id 升序 UPDATE videos<br/>stats_version = stats_version + 1
+    IS->>DB: 按 video_id 升序 UPDATE videos
+    IS->>DB: stats_version = stats_version + 1
     IS->>DB: COMMIT
-    IS->>DB: 批量读取最新聚合快照 + stats_version
+    IS->>DB: 批量读取最新聚合快照与 stats_version
     IS->>R: Pipeline Lua CAS 投影四字段 Hash
-    Note over IS,R: Redis 失败则 Kafka 重放；<br/>processed_events 跳过 DB 增量但仍重投影。
+    Note over IS,R: Redis 失败则 Kafka 重放 processed_events 跳过增量但仍重投影
 ```
 
 ##### 五、`stats_version` 到底是什么？以及批处理时序抖动为何被接受
@@ -2479,6 +2484,100 @@ return redis.call("HMGET", KEYS[1],
 2. **基准建立与后续操作打包成一个 Lua**（用 `EXISTS` + `HSET` + `HINCRBY` 或 `HSET` + `HMGET`），杜绝并发穿插造成的"基准值丢增量"。
 3. **`processed_events` 幂等 + Consumer 版本 CAS**，保证冷启动后 Kafka 里可能重复到达的旧事件不会重复累计 MySQL，也不会用滞后快照回滚 Redis。
 
+###### 5.7 三条链路对同一个 Hash 的动作矩阵，以及 `>=` 而不是 `>` 的理由
+
+前面 5.1~5.6 是按"时间/场景"讲的。这里换一个视角，把**同一个 `VideoStatsAuthKey` Hash**上并存的三条链路对四个字段的动作**并排列出来**，作为落地时最直接的对照表。
+
+###### 5.7.1 三条链路 × 四字段的动作矩阵
+
+`fsz:video:stats:auth:{videoID}` 这个 Hash 同时被三条链路操作：
+
+| 链路 | 触发方 | 用的 Lua | `likes_count / comments_count / popularity` | `stats_version` |
+|---|---|---|---|---|
+| **写侧** | `LikeVideo` / `UnlikeVideo` / `PublishComment` / `DeleteComment`（MySQL 事务提交后）| `bumpVideoStatsAuthScript` | `HINCRBY ±delta` 原子叠加 | **不动**（仅在 Hash 冷启动或旧三字段兼容分支时用 DB 值填一次基准）|
+| **读侧** | `BatchGetVideoStats`（Hash miss 或字段残缺时）| `readVideoStatsAuthScript` | 冷启动 / 追赶落后版本时整体覆盖为 DB 快照；命中时**只读不写** | 只在"Redis 版本 < DB 版本"或"版本缺失"时把它拉齐到 DB 版本 |
+| **投影侧** | `interaction_sync` Job（Flush 事务提交后）| `projectVideoStatsScript` | 与 `stats_version` 一起**整体覆盖**为 MySQL 落盘后的最新快照 | **每次 Flush 由 MySQL 事务 +1**，投影时用 `>=` 单调覆盖到 Redis |
+
+三句话概括三条链路的分工：
+
+- **写侧管快**：只做 `HINCRBY`，让用户立刻看到点赞数变化，不碰版本号；
+- **投影侧管准**：把 MySQL 落盘后的完整快照（含 `stats_version+1`）用 `>=` 单调地覆盖 Redis，是长期漂移的唯一修正源；
+- **读侧管兜底**：命中直接返回；miss 时用 DB 快照冷启动或追赶到最新版本，从不主动 `HINCRBY`、也不主动 `+1` 版本号。
+
+**只有投影侧（Consumer）会 +1 版本号**——写侧和读侧永远不会主动递增它。这是理解 §5.1 "版本号只有一份、MySQL 是唯一生产者"最直观的落点。
+
+###### 5.7.2 `projectVideoStatsScript` 为什么是 `>=` 而不是 `>`
+
+`projectVideoStatsScript` 的核心判断是：
+
+```lua
+if not current_version_number or tonumber(ARGV[1]) >= current_version_number then
+    -- 覆盖
+end
+```
+
+用 `>=` 而不是 `>` 是刻意为之，两者的差异只在"同版本重复投影"这一种情况下：
+
+| 运算符 | 同版本重放（`ARGV[1] == current`）| 低版本重放（`ARGV[1] < current`）| 高版本正常前进 |
+|---|---|---|---|
+| `>` | **拒绝**——同一 batch 若 Redis 那一步失败重试就永远修不好 | 拒绝 ✓ | 覆盖 ✓ |
+| `>=`（当前实现）| **允许幂等重写**——Kafka 重放同一 batch 时可以补写 Redis | 拒绝 ✓ | 覆盖 ✓ |
+
+关键场景：
+
+- **Flush 事务已提交 → 投影 Redis 那一步失败**（Redis 抖动 / Pipeline 报错），Consumer 直接返回错误让 Kafka 重投；
+- Kafka 重投后，`processed_events` 唯一键会让 MySQL Flush 事务里的 `UPDATE videos` **跳过已入库的事件**——`stats_version` **不再 +1**（MySQL 已经是 `v=6`）；
+- Consumer 再次读到 `stats_version=6` 的快照并 EVAL 投影脚本；
+- 若判断用 `>`，`6 > 6` 为假 → **永远补写不上 Redis**，Redis 卡在 `v=5` 直到 TTL 过期；
+- 用 `>=`，`6 >= 6` 为真 → 幂等地把同一份 `v=6` 快照再刷一次到 Redis，写失败被修复。
+
+这与 §5.4 "版本号保证 Redis 快照单调按版本推进"并不冲突：`>=` 允许"同版本再写一次相同数据"，仍然满足**Redis 版本号只增不减**的约束，也不会造成数据回滚。
+
+###### 5.7.3 读侧 `readVideoStatsAuthScript` 追赶分支的真正触发场景
+
+`readVideoStatsAuthScript` 里的追赶分支（`current_version_number < tonumber(ARGV[4])`）在什么时候被真正触发？很多人会以为"Job 每次投影完，读侧就会用这个分支追赶"——**这个理解是错的**。
+
+正常路径下：Job 投影成功 → Redis 已经是最新版本 → 读侧走 `loadAuthStats` 直接 `HGetAll` **命中**返回，`readVideoStatsAuthScript` **根本不会被 EVAL**。
+
+它真正生效的场景只有一条：**Step 3 因为 Hash 缺失或字段残缺而判定为 miss**，导致 `coldStartAuthStats` 被触发，才会进入这段 Lua，此时可能遇到：
+
+| 分支 | 触发原因 |
+|---|---|
+| key 不存在 | 视频首次被访问，或 Hash TTL 过期，或 Redis LRU 淘汰 |
+| 字段缺 `stats_version` | 滚动升级前的旧三字段 Hash（此分支只补 `stats_version`，**不覆盖计数**）|
+| `stats_version < DB.version` | **Job 已 UPDATE MySQL 但投影 Redis 那一步失败**（Redis 抖动导致 `projectVideoStatsScript` 返回错误）→ 恰好这时 Hash 又因 TTL/LRU 被逐出 → 读侧 miss → 用 DB 的新快照冷启动 |
+
+第三种场景就是"Job 投影失败 + Hash 被淘汰"的复合兜底，非常罕见但不是不可能。**读侧不会因为"命中一个滞后的 Hash"而主动更新它**——只有走到冷启动路径时才有机会追赶。这解释了 §5.4 里"从长期看最终一致"的具体保障机制来自哪里：**投影侧的 `>=` 幂等重写 + 读侧的 miss 兜底冷启动**，两条路径叠加才能覆盖所有边界。
+
+###### 5.7.4 心智模型总结
+
+把三条链路和 Hash 的关系压缩成一张脑图：
+
+```
+                ┌─────────────────────────────────────────┐
+                │  fsz:video:stats:auth:{videoID}  TTL=7d │
+                │  ┌──────────────┐  ┌────────────────┐   │
+                │  │ likes_count  │  │ stats_version  │   │
+                │  │ comments_count │  │  (仲裁字段)   │   │
+                │  │ popularity   │  │                │   │
+                │  └──────┬───────┘  └────────┬───────┘   │
+                └─────────┼──────────────────┼───────────┘
+                          │                  │
+     ┌────────────────────┤                  ├─────────────────┐
+     │                    │                  │                 │
+   HINCRBY              整体覆盖            +1（仅一处）      追赶到最新
+     │                    │                  │                 │
+┌────┴─────┐        ┌────┴─────┐       ┌───┴──────┐      ┌────┴─────┐
+│ 写侧      │        │ 投影侧    │       │ 投影侧    │      │ 读侧     │
+│ bump...  │        │ project. │       │ project. │      │ read...  │
+│ (LikeVi.)│        │ (Job)    │       │ (Job)    │      │ (miss 时)│
+└──────────┘        └──────────┘       └──────────┘      └──────────┘
+
+  管快                管准                管仲裁              管兜底
+```
+
+**如果你只能记住一件事**：`stats_version` 是"MySQL 持久快照的世代号"，写侧完全不动它，投影侧每 Flush +1 并 `>=` 单调覆盖 Redis，读侧只在 miss 时用它判断"是否要追赶到最新版本"。三条链路共享一个 Hash，靠这个版本号做仲裁——**写快、Job 准、读兜底**。
+
 #### 8.3.4 点赞抗压分析：削峰、批量聚合与可持续吞吐
 
 朴素方案在每次点赞请求中直接更新 `videos.likes_count`，热门视频会形成单行锁热点。当前实现把用户关系事实与派生计数拆开：在线事务只完成 `likes / interaction_events / outbox_events` 等事实写入，Redis 立即维护用户可见增量；Kafka 消费端再批量更新 `videos` 聚合字段。
@@ -2490,7 +2589,8 @@ flowchart TD
     B -->|真实变化| D[MySQL 事务<br/>关系事实 + interaction_event + outbox]
     D --> E[Redis Lua bumpVideoStatsAuthScript<br/>冷启动 + HINCRBY 实时投影]
     E --> F[返回实时投影值]
-    D -.Outbox.-> K[Kafka 多 partition]
+    D --> OB[Outbox Job 扫描并投递]
+    OB --> K[Kafka 多 partition]
     K --> G[interaction_sync<br/>topic+partition 组内保序、组间并发]
     G --> H[每 500 条一个批量事务]
     H --> I[processed_events 幂等<br/>按 video 聚合净增量<br/>按 video_id 升序更新<br/>递增 stats_version]
@@ -2673,6 +2773,168 @@ realtimeLikesCount(videoID)
 - ✅ 事务内先 `INSERT processed_events` 做幂等，冲突则跳过对应 delta，防止重复消费
 - ✅ 读路径优先走带 `stats_version` 的 Redis 服务投影，miss/损坏时批量回源 MySQL 持久快照
 - ✅ 这是常见的事件驱动 write-behind + batch aggregation，实际容量以压测、Kafka lag 和数据库锁等待共同判断
+
+---
+
+#### 8.3.6 评论完整流程：发布、删除与"撤通知"语义
+
+评论侧和点赞共用同一套 outbox + 版本化 Redis + Consumer 投影骨架，但比点赞多出一条**独立的通知链路**：一条评论会同时触发两条 Kafka 事件——一条业务事件（用于聚合计数、热榜），另一条通知事件（进入被评论者的收件箱）。因此评论的"撤销"不是简单地把评论表软删，还必须把**当初已经写进对方收件箱那条通知**同步作废，这就是本小节要讲清楚的"撤通知"。
+
+##### 一、PublishComment 完整流程
+
+入口 [publishcommentlogic.go](../apps/interaction/internal/logic/publishcommentlogic.go)。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 评论者 U
+    participant RPC as interaction-rpc
+    participant R as Redis
+    participant DB as MySQL
+    participant K as Kafka
+    participant NJ as notification-job
+    participant V as 视频作者 V
+
+    U->>RPC: PublishComment(video_id, content, request_id)
+    RPC->>R: Get CommentIdempotencyKey(user, request_id)
+    alt 命中幂等
+        R-->>RPC: 已存在 commentID
+        RPC-->>U: 返回历史结果
+    else 首次请求
+        RPC->>R: 令牌桶限流 CommentRateLimitKey
+        RPC->>DB: BEGIN
+        RPC->>DB: INSERT comments (status=1)
+        RPC->>DB: INSERT outbox_events (业务事件 comment.create)
+        alt video.AuthorID != user_id
+            RPC->>DB: INSERT outbox_events (通知事件 create,<br/>business_key=comment:V:U:C)
+        end
+        RPC->>DB: COMMIT
+        RPC->>R: Pipeline:<br/>HINCRBY VideoStatsAuthKey comments_count +1<br/>INCR CommentListVersionKey<br/>ZIncrBy HotVideoRealtimeKey +5<br/>SET CommentIdempotencyKey commentID EX 24h
+        RPC-->>U: 返回 commentID + 权威计数
+        Note over DB,K: outbox-dispatcher 异步分发两条事件
+        DB->>K: interaction.comment.events (业务)
+        DB->>K: notification.events (通知 create)
+        K->>NJ: 通知事件
+        NJ->>DB: INSERT notifications<br/>(business_key=comment:V:U:C, status=1 未读)
+        NJ->>R: BumpUnreadVersion(V)
+        V->>RPC: 下次拉未读数时 COUNT +1
+    end
+```
+
+**关键点**：
+
+1. **事务内一次落三张表**：`comments` + 业务 outbox + 通知 outbox（自评自视频除外），保证"评论存在"和"通知会送达"要么全成、要么全无；
+2. **通知事件的 business_key 在事务落库时就已经算好**：拼法为 `comment:{视频作者ID}:{评论作者ID}:{评论ID}`，见 [common/eventx/notification.go](../common/eventx/notification.go) 的 `NotificationBusinessKey`；这个 key 既是 `notifications.uk_notification_business` 的唯一约束，也是撤回时的匹配依据；
+3. **自评自视频不发通知**：`ValidateNotificationEvent` 里硬编码 `ReceiverID == ActorID → error`，因此 `video.AuthorID == user_id` 的分支根本不构造通知 outbox；
+4. **Redis 写在事务外**：评论列表版本号 `INCR`、权威计数 `HINCRBY`、热度 `ZIncrBy`、幂等键 `SET` 全部在 Pipeline 里一次完成，MySQL 提交成功才执行——这里 Redis 挂了也不影响持久性，Consumer 投影和 TTL 兜底会最终收敛。
+
+##### 二、DeleteComment 完整流程
+
+入口 [deletecommentlogic.go](../apps/interaction/internal/logic/deletecommentlogic.go)。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as 删除者<br/>(评论作者 或 视频作者)
+    participant RPC as interaction-rpc
+    participant DB as MySQL
+    participant R as Redis
+    participant K as Kafka
+    participant NJ as notification-job
+    participant V as 视频作者 V
+
+    Op->>RPC: DeleteComment(comment_id)
+    RPC->>DB: SELECT comment, video FOR check
+    RPC->>RPC: 权限校验:<br/>comment.UserID == Op 或 video.AuthorID == Op
+    alt comment 已删/已下架
+        RPC-->>Op: 幂等返回"评论已删除"
+    else 正常
+        RPC->>RPC: 构造 notificationOutbox<br/>(仅当 video.AuthorID != comment.UserID)<br/>actor 使用原评论作者 comment.UserID
+        RPC->>DB: BEGIN
+        RPC->>DB: UPDATE comments SET status=已删, deleted_at=now
+        RPC->>DB: INSERT outbox_events (业务事件 comment.delete)
+        alt 有通知需要撤回
+            RPC->>DB: INSERT outbox_events<br/>(通知事件 delete,<br/>business_key=comment:V:U:C)
+        end
+        RPC->>DB: COMMIT
+        RPC->>R: Pipeline:<br/>HINCRBY VideoStatsAuthKey comments_count -1<br/>INCR CommentListVersionKey<br/>ZIncrBy HotVideoRealtimeKey -5
+        RPC-->>Op: 返回权威计数
+        Note over DB,K: outbox-dispatcher 异步分发
+        DB->>K: notification.events (通知 delete)
+        K->>NJ: 通知事件
+        NJ->>DB: SELECT notifications FOR UPDATE<br/>WHERE business_key=comment:V:U:C
+        NJ->>DB: UPDATE status=3 (已撤回)
+        NJ->>R: BumpUnreadVersion(V)
+        V->>RPC: 下次拉未读数时 COUNT 排除 status=3
+    end
+```
+
+**权限模型**：只有两类人能删——**评论作者本人**、**视频作者（管理员语义）**。判定见 `deletecommentlogic.go` L51。
+
+##### 三、"撤通知"到底在撤什么
+
+这是评论删除和点赞取消最容易被误解的地方。**撤通知不是"阻止推送发出"，而是"把已经落到收件人邮箱里的那条通知记录标记为已撤回，并让未读数回落"**。
+
+一个类比：
+
+> **发评论 = 发一封邮件**："U 评论了你的视频"；
+> **删评论 = 发一封撤回请求邮件**："请把我上一封邮件从收件人的收件箱撤回"；
+> **notification-job = 收件人的邮件服务器**：负责把撤回请求应用到已经落地的邮件上——推送出去的弹窗收不回来，但至少能让"未读列表"里那条消失、badge 数字回落。
+
+具体到时机：
+
+| 时机 | V 的收件箱列表 | V 的未读数 badge | V 是否弹过 push |
+|---|---|---|---|
+| V 一直没开 App | 打开后**看不到**这条通知（列表过滤 `status=1`） | 不会 +1 | 若 APNs/FCM 已送达，锁屏可能闪过 |
+| V 恰好在评论存在的窗口内刷新过收件箱 | 曾看到"U 评论了你" | 短暂 +1，之后回落 | 可能收到过 |
+| 删除完成后 V 才打开 | 那条通知不再展示 | 无变化 | —— |
+
+**保证的是最终一致性**：评论没了 → 收件箱里那条也没了、未读数扣回来。至于弹窗是否已经打扰过用户，业务层管不了那么远。
+
+##### 四、为什么 Delete 事件的 actor 必须使用"原评论作者"
+
+见 `deletecommentlogic.go` L70-71 的注释：
+
+```go
+// 删除动作的 actor 必须使用原评论作者，而不是当前执行删除的人。
+// 视频作者代删他人评论时，才能准确撤回原评论通知的 business_key。
+```
+
+原因串起来看：
+
+1. 发评论时通知 business_key = `comment:{V}:{U}:{C}`，其中 `U` 是评论作者；
+2. Consumer 撤回时靠 `WHERE business_key = ?` 精确匹配 [consumer.go](../apps/job/notification/internal/logic/consumer.go) L377；
+3. 如果 `V` 代删 `U` 的评论时 actor 传成当前 `userID`（即 `V` 自己），delete 事件的 business_key 会变成 `comment:{V}:{V}:{C}`，**与当年落库的 `comment:{V}:{U}:{C}` 对不上**，Consumer 查不到记录，撤回失败，`V` 收件箱里那条通知永远撤不掉、未读数也降不回来。
+
+因此 `actorID` 在通知语义里代表**业务身份**（这条通知是"谁"引起的），而不是**动作发起者**（谁按了删除按钮）——Create 和 Delete 必须指向同一条业务通知，`(receiver, actor, target)` 三元组必须字节级一致。
+
+##### 五、为什么不能"删的时候干脆不发通知"
+
+看上去省事：如果发布评论 → notification-job 消费 Create 前，评论就被删了，能不能干脆不发 Delete，让 Create 也不落库？
+
+答案：**不能**，理由：
+
+1. **写侧不知道读侧状态**：interaction-rpc 提交事务时，notification-job 可能已经消费完 Create 并落库，也可能还在 Kafka 里排队；写侧无从判断，只能"我发出撤回意图，你负责收敛"；
+2. **Kafka 无法回收在途消息**：Create 一旦进入 Kafka，就算 job 层还没消费，删除操作也没有任何手段把它抽出来；
+3. **顺序容忍**：同 `business_key` 走同一 partition 有序，但 job 处理有延迟、可能重试；必须让 Consumer 自己拿 business_key + status 做收敛，任意顺序都能正确落地（Create 先到→INSERT status=1；Delete 后到→UPDATE status=3；哪怕 Delete 先到 Create 后到，也有 6 种状态转移表兜底，见 8.5 通知模块 [[memory:9l16e7mx]]）；
+4. **跨服务无共享事务**：interaction 的 MySQL 事务和 notification-job 的 MySQL 事务是两个独立事务，只能靠"发件箱 + 幂等消费者"这套模式做到"评论存在 ↔ 通知存在"的最终一致。
+
+##### 六、Redis 缓存变更点（写侧速览）
+
+| 场景 | Redis 动作 | Key |
+|---|---|---|
+| PublishComment | `HINCRBY comments_count +1` | `VideoStatsAuthKey(videoID)` |
+| PublishComment | `INCR` 评论列表版本号 | `CommentListVersionKey(videoID)` |
+| PublishComment | `ZIncrBy +5` 实时热度 | `HotVideoRealtimeKey` |
+| PublishComment | `SET commentID EX 24h` 幂等 | `CommentIdempotencyKey(userID, requestID)` |
+| DeleteComment | `HINCRBY comments_count -1`（GREATEST 防负） | `VideoStatsAuthKey(videoID)` |
+| DeleteComment | `INCR` 评论列表版本号（作废首页缓存） | `CommentListVersionKey(videoID)` |
+| DeleteComment | `ZIncrBy -5` 实时热度 | `HotVideoRealtimeKey` |
+| 两者共有 | 事务提交后 Consumer 侧 `BumpUnreadVersion(V)` | `fsz:notification:unread:version:{V}` |
+
+##### 七、一句话总结
+
+评论发布/删除采用**双 outbox**（业务 + 通知）在同一 MySQL 事务里落库，写侧原子、读侧最终一致。所谓"撤通知"不是拦截推送，而是通过 delete 事件让 notification-job 把 `notifications` 表里对应 `business_key` 的那行状态改为已撤回、并 bump 未读数版本号——**评论没了，收件箱里那条也会跟着消失，未读数最终会回到正确值**。而实现这一切的关键，是 delete 事件的 `(receiver, actor, target)` 三元组必须与 create 时完全一致，所以 actor 永远回填**原评论作者**，与"谁触发这次删除"无关。
 
 ---
 
@@ -3920,6 +4182,177 @@ flowchart TD
 
 这条规则同时解释了：为什么 interaction 的**点赞写路径**（`LikeVideo` / `UnlikeVideo`）也用了 `SetNX` 短锁，但那把锁的作用是"**点击互斥**"（防同一用户 500ms 内狂点重复入库），与本节讨论的"**读侧缓存击穿**"锁是**两个完全不同的锁**，分别落在 `rediskey.LikeVideoLockKey` 和 `rediskey.LikeUserVideosFirstPageCacheBuildLockKey`——不要混淆。
 
+#### 12.1.2 ListMyLikedVideos：端到端击穿保护实录
+
+`interaction.ListMyLikedVideos` 是本项目"分页列表 + 版本号 + 分布式锁 + 短轮询 + SingleFlight"五件套用得最完整的一处，本小节按代码走一遍它是如何抵御缓存击穿的。所有代码引用来自 [listmylikedvideoslogic.go](d:\feedsystem-zero-main-git\apps\interaction\internal\logic\listmylikedvideoslogic.go)。
+
+##### ① 缓存对象与三个关键常量
+
+```go
+const (
+    likedVideosFirstPageWindowSize    int64 = 20      // 缓存里永远只存首页 20 条固定窗口
+    likedVideosListCacheTTL                 = 30 * time.Second
+    likedVideosListCacheLockTTL             = 2 * time.Second
+    likedVideosListCacheRetryDelay          = 50 * time.Millisecond
+    likedVideosListCacheRetryAttempts       = 3     // 短轮询 3 × 50ms = 150ms
+)
+```
+
+一份缓存 = 一位用户 + 一个版本号，值是 JSON：
+
+```go
+type likedVideosListCache struct {
+    Version            int64                 // 与 LikeUserVideosListVersionKey 对齐
+    LikedVideos        []likedVideoItemCache // 最多 20 条
+    HasMoreAfterWindow bool                  // 20 条之外是否还有历史
+}
+```
+
+**关键设计：Redis 里存的是"固定 20 条首页窗口"，而不是按用户请求的 pageSize 存。** 用户若只要 5 条，从这 20 条里截前 5 条返回；用户若要 20 条则整份返回；用户 pageSize > 20 或带游标则**根本不走缓存**（`isLikedVideosFirstPageCacheable` 判定为 false，直接查 DB）。这样做的收益是：一份缓存能同时服务"首页任意小 pageSize"的所有请求，命中率显著高于"按 pageSize 分桶存"。
+
+##### ② 缓存 miss 后的四种身份
+
+缓存 miss 后请求会走这段代码：
+
+```go
+lockKey, lockToken, locked, lockErr = l.tryLockLikedVideosListCache(cacheKey)
+switch {
+case lockErr != nil:               // 身份 A：Redis 挂了
+    cacheKey = ""
+case locked:                       // 身份 B：我抢到锁，我是构建者
+    useFixedWindow = true
+    cacheWriteAllowed = true
+default:                           // 身份 C/D：没抢到锁，别人在构建
+    if resp, hit := l.waitAndReloadLikedVideosFirstPageCache(...); hit {
+        return resp, nil           // 身份 C：等到了 → 直接返回
+    }
+    useFixedWindow = true          // 身份 D：等超时 → 允许查 DB 但不允许写缓存
+}
+```
+
+两个状态位 `useFixedWindow` / `cacheWriteAllowed` 是**决定当前请求角色**的核心开关：
+
+| 身份 | 触发条件 | `useFixedWindow` | `cacheWriteAllowed` | DB 查询大小 | 会写缓存 |
+|---|---|:-:|:-:|---|:-:|
+| A：Redis 挂 | `SETNX` 报错 | false | false | 用户 pageSize | ✗ |
+| B：构建者 | `SETNX` 成功 | true | true | **20 条固定窗口** | ✓ |
+| C：等待成功 | `SETNX` 失败 + 短轮询命中 | — | — | 不查 DB | ✗ |
+| D：等待超时 | `SETNX` 失败 + 短轮询 150ms 都没等到 | true | false | **20 条固定窗口** | ✗（可能二次抢锁后转 ✓） |
+
+四条分支合起来覆盖了所有异常路径：
+- **A 保 MySQL**：Redis 一旦异常直接降级为"纯 MySQL + 本地 SingleFlight"，绝不因为拿不到锁就阻塞用户；
+- **B 保命中率**：只让唯一一个构建者写缓存，避免多人并发 SET 相互覆盖；
+- **C 保 QPS**：跨实例的等待者复用构建者的成果，把 N 次 DB 查询合并成 1 次；
+- **D 保尾延迟**：构建者若卡在慢查询上，等待者最多阻塞 150ms 就自救查 DB，绝不无限等。
+
+##### ③ `useFixedWindow` 的深意：为什么构建者要多查用户不需要的数据
+
+用户可能只请求了 5 条，但如果构建者也只查 5 条，那**缓存里就只有 5 条**——下一个请求 pageSize=20 就会再次 miss。因此**构建者一定要把这份缓存"建满 20 条"**，才能让后续任意 ≤20 条的请求都命中：
+
+```go
+dbPageSize := pageSize
+if useFixedWindow {
+    dbPageSize = likedVideosFirstPageWindowSize   // 强制 20
+}
+```
+
+对身份 D 也生效——D 虽然不会写缓存，但仍然按 20 条查，一方面因为后面要"事后二次抢锁"接管写入（见 ④），另一方面方便本地 SingleFlight 与 B/其他 D 请求合并（同一个 `dbLoadKey`）。
+
+##### ④ 二次抢锁：构建者失联的接管机制
+
+身份 D（等待超时者）查完 DB 之后，还有一段"接管逻辑"：
+
+```go
+if useFixedWindow && cacheKey != "" && !cacheWriteAllowed {
+    // 先看看构建者是不是刚好在这一刻写完了
+    if resp, hit := l.loadLikedVideosFirstPageCache(...); hit {
+        return resp, nil
+    }
+    // 构建者还是没写好，说明它可能挂了或锁过期了，我来接管
+    secondLockKey, secondLockToken, locked, lockErr := l.tryLockLikedVideosListCache(cacheKey)
+    if lockErr == nil && locked {
+        cacheWriteAllowed = true
+        defer l.releaseLikedVideosListCacheLock(secondLockKey, secondLockToken)
+    }
+}
+```
+
+这段代码解决的问题：
+- 原构建者进程崩溃 → 锁 2s 后自动过期 → 一直没人写缓存 → 后续所有请求都 miss，退化成"每人查一次 DB"；
+- 有了二次抢锁，超时者查完 DB 后**再抢一次锁**，谁抢到谁负责补写缓存，把系统重新拉回到"只有一份缓存"的稳态。
+
+##### ⑤ Lua 双重校验：写回缓存时同时锁定"锁 token"和"版本号"
+
+即使拿到了 `cacheWriteAllowed = true`，写缓存这一步仍然可能踩坑：
+- 从"抢到锁"到"查完 DB 准备 SET"这段时间里，可能已经有 `INCR LikeUserVideosListVersionKey` 打过来（有新的点赞 / 取消点赞发生）——我手上的数据**已经是旧版本**，不能写；
+- 我的锁也可能因为 DB 慢查询已经超过 2s TTL 被自动释放、被别人抢走——**我不再是构建者**，不能写。
+
+所以 `saveLikedVideosFirstPageCache` 的 SET 动作走的是 Lua 脚本：
+
+```lua
+-- KEYS[1]=版本号 key, KEYS[2]=缓存 key, KEYS[3]=锁 key
+-- ARGV[1]=我记住的 version, ARGV[2]=JSON 数据, ARGV[3]=TTL, ARGV[4]=我的 lockToken
+if redis.call("GET", KEYS[3]) ~= ARGV[4] then
+    return -1        -- 我已经不持有锁，放弃写入
+end
+local current_version = redis.call("GET", KEYS[1])
+if not current_version then
+    redis.call("SET", KEYS[1], "0"); current_version = "0"
+end
+if current_version ~= ARGV[1] then
+    return 0         -- 版本已经变化，我的数据过期了，放弃写入
+end
+redis.call("SET", KEYS[2], ARGV[2], "PX", ARGV[3])
+return 1
+```
+
+三种返回值对应三种结果：`1` = 正常写入；`0` = 版本过期跳过；`-1` = 锁已易主跳过。这一步是**保证缓存里从不出现"旧数据覆盖新数据"**的最后一道闸门。
+
+##### ⑥ 完整流程图
+
+```mermaid
+flowchart TD
+    A[ListMyLikedVideos 进入] --> A1{参数校验<br/>cursor / pageSize}
+    A1 --> B{isLikedVideosFirstPageCacheable<br/>cursor=0 且 pageSize≤20}
+    B -->|否| Z0[dbPageSize = pageSize<br/>SingleFlight → DB<br/>直接返回 不涉及缓存]
+    B -->|是| C[GET LikeUserVideosListVersionKey → version]
+    C -->|Redis 报错| Z1[cacheKey=&quot;&quot; 降级<br/>SingleFlight+DB 按 pageSize]
+    C -->|ok / Nil→0| D[cacheKey = LikeUserVideosFirstPageCacheKey uid,ver]
+    D --> E{GET cacheKey}
+    E -->|命中且版本匹配| R1[从 20 条窗口截前 pageSize 条返回]
+    E -->|miss| F{SETNX buildLockKey EX=2s}
+    F -->|Redis 报错| Z1
+    F -->|抢到锁 B| G1[useFixedWindow=true<br/>cacheWriteAllowed=true<br/>defer 释放锁]
+    F -->|没抢到| H[短轮询 3×50ms<br/>期间读 cacheKey]
+    H -->|命中 C| R2[直接返回]
+    H -->|超时 D| G2[useFixedWindow=true<br/>cacheWriteAllowed=false]
+    G1 --> I[localLoadGroup.Do<br/>相同参数进程内合并]
+    G2 --> I
+    I --> J[MySQL JOIN+ORDER+LIMIT 21<br/>返回 ≤20 条 + hasMore]
+    J --> K{cacheWriteAllowed?}
+    K -->|B: 是| L[Lua 校验 token+version<br/>SET cacheKey PX=30s]
+    K -->|D: 否| M[再读一次缓存构建者可能刚写完]
+    M -->|命中| R3[返回]
+    M -->|仍 miss| N[二次 SETNX 抢锁]
+    N -->|抢到| L
+    N -->|没抢到| R4[按 pageSize 截取返回 不写缓存]
+    L --> R5[按 pageSize 截取返回]
+```
+
+##### ⑦ 这套方案挡住了哪些具体故障
+
+| 故障场景 | 保护机制 |
+|---|---|
+| 首页缓存 TTL 到期，某热门用户被上百个粉丝同时刷"我点赞的视频" | Redis 分布式锁只放 1 个构建者过；其余等 150ms 复用结果 |
+| 构建者所在 rpc 进程崩溃 | 锁 2s TTL 自动过期 + 等待超时者二次抢锁接管 |
+| 构建者 DB 慢查询卡 5s | 等待者 150ms 后自救查 DB（每副本最多 1 次），退化到"无锁但有 SingleFlight"的水位 |
+| 构建者在查 DB 期间发生新点赞导致 `INCR` 版本号 | Lua 脚本检查 `current_version != ARGV[1]` → 拒绝写入，保护缓存不倒退 |
+| A 拿锁 → A 卡住 2s → 锁自动释放 → B 拿锁 → A 醒来 | Lua `GET==token then DEL` 释放 + 写入前 `GET==token` 校验，A 不会误删 / 误写 B 的锁与缓存 |
+| Redis 整个宕机 | 版本号读失败即 `cacheKey=""`，全链路走 MySQL + 本地 SingleFlight，MySQL 单副本 QPS 有上限但不至于击穿 |
+| 用户高频翻页导致缓存 key 爆炸 | 只有 `cursor=0 && pageSize≤20` 的首页请求走缓存；历史页直接查 DB 且带 `updated_at DESC, id DESC` 索引 |
+
+这套模板同样被 `ListComments`（评论列表）和 `ListFollowers / ListFollowings`（社交列表）复用，只是常量和 key 前缀不同，整体结构一致——如需扩展新的分页列表缓存，直接照搬本节的 7 个要素即可。
+
 ### 12.2 幂等的三层防护
 
 | 层 | 手段 |
@@ -4324,6 +4757,159 @@ T3'  R: Lua CAS: if GET version == v(n) then SET cacheKey ← ❌ v(n) ≠ v(n+1
 - 遇到"某个数据没更新"→ 定位写入口那一行，检查对应的 **INCR / SET / DEL** 有没有全部执行；
 - 遇到"某个数据脏了"→ 定位读入口，检查是不是漏了 version 二次校验、或读侧写回时 Lua 版本对齐脚本失效；
 - 遇到"读放大 / 击穿"→ 检查读入口是否用了 SingleFlight + BuildLockKey，以及回填是否有 TTL 抖动。
+
+---
+
+### 12.9 连接池与运行时资源治理
+
+一致性和幂等只能保证"写对"，连接池才决定"能撑住多少 QPS 又不把下游打爆"。项目里真正落在代码里的"池"分四层：**MySQL / Redis / Kafka / gRPC**。这一节把每一层的默认值、写在哪、以及为什么选这个数说清楚——排查"接口偶发 200ms 尖刺""DB `too many connections`""Redis pool exhausted"时先来这里查。
+
+#### 12.9.1 全局连接池一览
+
+```
+每个 RPC / Job 进程启动后持有的资源：
+┌────────────────────────────────────────────────────────────────────────┐
+│ MySQL  (common/gormx.NewDB)                                            │
+│   ├─ MaxOpenConns    = 10        ← FSZ_MYSQL_MAX_OPEN_CONNS            │
+│   ├─ MaxIdleConns    = 5         ← FSZ_MYSQL_MAX_IDLE_CONNS            │
+│   ├─ ConnMaxLifetime = 1h        ← FSZ_MYSQL_CONN_MAX_LIFETIME_SECONDS │
+│   └─ ConnMaxIdleTime = 10m       ← FSZ_MYSQL_CONN_MAX_IDLE_SECONDS     │
+├────────────────────────────────────────────────────────────────────────┤
+│ Redis  (每个 svc/servicecontext 单独 redis.NewClient)                  │
+│   ├─ interaction : PoolSize=100  MinIdleConns=10  R/W=500ms  Pool=1s   │
+│   └─ 其他模块    : go-redis v9 默认（PoolSize=10×GOMAXPROCS，其余默认）│
+├────────────────────────────────────────────────────────────────────────┤
+│ Kafka  (common/kafkax)                                                 │
+│   ├─ Producer : BatchSize=100  BatchBytes=1MiB  FlushMs=20~100  Ack=1  │
+│   └─ Consumer : MinBytes=1  MaxBytes=10MiB  MaxWaitMs=1000  Worker=4   │
+├────────────────────────────────────────────────────────────────────────┤
+│ gRPC   (zrpc.MustNewClient)                                            │
+│   └─ 单 ClientConn + HTTP/2 多路复用 + go-zero p2c 负载均衡（无自定义）│
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 12.9.2 MySQL 池：为什么"故意"设成 10
+
+**唯一配置点**：[common/gormx/gormx.go](../common/gormx/gormx.go)。所有 RPC/Job 都通过 `gormx.NewDB(dsn)` 建库，不允许在 svc 里手工 `SetMaxOpenConns`。
+
+```go
+const (
+    defaultMaxIdleConns    = 5
+    defaultMaxOpenConns    = 10
+    defaultConnMaxLifetime = time.Hour
+    defaultConnMaxIdleTime = 10 * time.Minute
+)
+
+maxIdleConns := positiveIntFromEnv("FSZ_MYSQL_MAX_IDLE_CONNS", defaultMaxIdleConns)
+maxOpenConns := positiveIntFromEnv("FSZ_MYSQL_MAX_OPEN_CONNS", defaultMaxOpenConns)
+if maxIdleConns > maxOpenConns {
+    maxIdleConns = maxOpenConns  // 兜底夹紧，避免 GORM/database/sql 报错
+}
+```
+
+**为什么默认 `MaxOpen=10`？**
+
+1. **算数上先算够**。本项目一次完整部署会同时跑 **6 个 RPC 进程 + 8 个 Job 进程 = 14 个进程**：
+
+   | 进程组 | 数量 | 每进程 `MaxOpen` | 合计 |
+   |---|---|---|---|
+   | RPC（account/video/interaction/social/feed/notification）| 6 | 10 | 60 |
+   | Job（outbox/interaction_sync/social_sync/feed_timeline/hotrank/notification/asset_cleanup/event_cleanup）| 8 | 10 | 80 |
+   | Gateway | 1 | 10 | 10 |
+   | **总计** | | | **150** |
+
+   MySQL 8 默认 `max_connections=151`，再加上 DBA/监控/binlog dumper 的连接，用 `MaxOpen=100` 那种"看起来豪爽"的默认值会**在服务全量启动瞬间就把 MySQL 打满**，任何一个业务写入都会得到 `ERROR 1040 (HY000): Too many connections`。
+
+2. **业务侧根本用不到 100**。每个 RPC 请求打 DB 的模式基本是"事务里 1~3 条 SQL"，且事务提交在毫秒级；Job 的批处理都用了 `FlushBatchSize=500` 的单条批量语句。**单进程 QPS 上千也很难同时占用超过 10 条连接**——瓶颈会先出现在 Redis pool 或 Kafka worker，而不是 MySQL 池。
+
+3. **每进程可按需覆盖**。压测里发现某个进程（典型是 `job/outbox` 16 worker、`job/interaction_sync` 4 worker × 500 batch）确实排队，就单独设环境变量 `FSZ_MYSQL_MAX_OPEN_CONNS=30~50`，而**不改默认值**——避免把开发环境或 CI 上跑一遍脚本就把 MySQL 打爆。
+
+**为什么再配 `Lifetime=1h` + `IdleTime=10m`？**
+
+- MySQL 主动 kill 空闲连接的默认阈值是 `wait_timeout=8h`；如果 Go 侧完全不管，可能持有已被 MySQL 单方面关闭的 stale 连接，下次 `Exec` 就会拿到 `invalid connection` 错误（database/sql 会重试一次，但仍会打日志抖动）。
+- 用 `ConnMaxLifetime=1h` 保证连接一小时内必轮换一次；`ConnMaxIdleTime=10m` 保证低峰期主动缩池，把空闲配额还给其他进程。
+
+**例外**：[tests/internal/seed/seed.go](../tests/internal/seed/seed.go) 里种子脚本单独设了 `MaxOpen=20, MaxIdle=10`。它是短生命周期的一次性批量写工具，不走 gormx，也不参与 MySQL 全局配额分配。
+
+#### 12.9.3 Redis 池：为什么只有 interaction 显式放大
+
+**默认策略**：其他所有模块都是最朴素的三行——
+
+```go
+rdb := redis.NewClient(&redis.Options{
+    Addr:     c.BizRedis.Addr,
+    Password: c.BizRedis.Password,
+    DB:       c.BizRedis.DB,
+})
+```
+
+用 go-redis v9 的默认：`PoolSize = 10 × GOMAXPROCS(0)`（4C 机器 = 40）、`MinIdleConns=0`、`DialTimeout=5s`、`ReadTimeout=WriteTimeout=3s`、`PoolTimeout=ReadTimeout+1s`。这对读放大不大的模块（account/video/social/notification/feed/gateway）够用——单请求打 1~3 次 Redis，40 条池够扛 4C 机器上千 QPS。
+
+**唯一被显式调大的：interaction**（见 [apps/interaction/internal/svc/servicecontext.go](../apps/interaction/internal/svc/servicecontext.go)）：
+
+```go
+rdb := redis.NewClient(&redis.Options{
+    Addr:         c.BizRedis.Addr,
+    Password:     c.BizRedis.Password,
+    DB:           c.BizRedis.DB,
+    DialTimeout:  2 * time.Second,       // 建连快超时，防止启动阶段 Redis 慢导致进程卡住
+    ReadTimeout:  500 * time.Millisecond,// 单次读写都必须 ≤500ms，超时就走 DB 回源
+    WriteTimeout: 500 * time.Millisecond,
+    PoolTimeout:  1 * time.Second,       // 等池 >1s 直接返回错误，让上层降级而不是拖垮请求
+    PoolSize:     100,                   // 4C 默认 40 → 显式抬到 100
+    MinIdleConns: 10,                    // 保留 10 条热连接，避免冷启动第一个请求握手
+})
+```
+
+**为什么单独放大到 100？**因为**互动模块是全项目 Redis 打得最密的**。一次点赞/评论请求在 [interactionhelper.go](../apps/interaction/internal/logic/interactionhelper.go) 里要串起：
+
+1. `EVAL` 分布式锁 `SET NX PX` + LockToken；
+2. `EVAL` Lua CAS：读版本 → `HINCRBY` VideoStatsAuthKey → 写回；
+3. `SADD` LikeState / `ZAdd` LikeUserVideos / LikeVideoUsers；
+4. `ZIncrBy` HotVideoRealtimeKey（热榜实时权重）；
+5. `INCR` LikeUserVideosListVersionKey（列表版本号 bump）；
+6. `DEL` LikeUserVideosFirstPageCacheKey（首页 20 条窗口失效）；
+7. `EVAL` 释放锁（校验 LockToken）。
+
+**单请求 5~8 次 Redis round-trip**——用默认 40 池，5000 QPS 峰值会立刻打满，PoolTimeout 触发→请求 500。抬到 100 就有约 2.5× 的余量顶住毛刺。
+
+**为什么再压短 R/W 超时到 500ms？**
+
+- Redis 慢查询是雪崩的第一信号。如果保留 3s 默认，一个 `KEYS *` 或 slot rebalance 会让 100 条连接全部卡在等 reply，pool 反而更快耗尽。
+- 500ms 命中 SLA 后走**兜底路径**（§12.5）：SingleFlight 打 DB + 回写缓存，业务侧宁可慢一次，也不允许连锁阻塞。
+
+**为什么显式配 `MinIdleConns=10`？**避免半夜低峰期池收缩到 0，早高峰第一波流量全部要走 TCP 3 次握手 + AUTH，冷启动就把 P99 顶到几百 ms。
+
+#### 12.9.4 Kafka：不是"连接池"而是"批处理与并发"
+
+Kafka 底层用 `segmentio/kafka-go`，每 topic-partition 一条 TCP，走 broker 侧多路复用，本身**不需要"连接池"概念**。真正决定吞吐的是三个参数（都在 [common/kafkax](../common/kafkax) + 各模块 yaml）：
+
+- **Producer** 侧（`interaction`, `job/outbox`）：`BatchSize=100`（100 条或达阈值就发） + `BatchBytes=1MiB` + `FlushMs=20~100`（outbox 用 20ms 追求低延迟，interaction 用 100ms 追求批量效率）。
+  - `RequiredAcks=1`：只等 leader 落盘 ack，不等 ISR 全同步——搭配 Outbox 模式保证不丢，牺牲这一点的持久性换 5~10× 吞吐。
+  - `RetryMax=3`：重试超过 3 次仍失败，事件由 Outbox 表的 `retry_count` 继续兜住，交给 event_cleanup 转 dead_letter_events。
+- **Consumer** 侧（所有 sync-job）：`MinBytes=1` + `MaxBytes=10MiB` + `MaxWaitMs=1000` 决定"一次 Fetch 最多攒多久 / 攒多少"；上层再叠 `Sync.WorkerCount=4` 做业务并发。
+  - `WorkerCount=4` 是"分区数 × 消费者数 = 分区数"策略下的经验值——单分区消费带宽约 30MB/s，4 worker 足够跟得上写侧峰值，且不会让同一 partition key 的事件乱序（有 §9.2 的 `normalizeSyncWorkerCount` 兜底夹紧到不超过实际 group 数）。
+
+#### 12.9.5 gRPC：为什么没有"池"
+
+所有 zrpc 客户端（`gateway`, `social`, `job/interaction_sync`）都是最简的 `zrpc.MustNewClient(cfg)`，**全部使用 go-zero + gRPC 默认值**：
+
+- 每个 target etcd key 对应 **1 个 `grpc.ClientConn`**——HTTP/2 天然支持一条连接上并发多个 stream（默认 `MaxConcurrentStreams=100`），根本不需要传统意义的"连接池"。
+- 多后端实例由 go-zero 的 **p2c**（power-of-two-choices）负载均衡在 sub-conn 间分发，动态感知延迟做加权。
+- **超时统一在调用侧用 `context.WithTimeout` 控制**：`interaction_sync.SyncConf.RpcTimeoutMs=10000`、`Timeline.RedisOpTimeoutMs=1000` 等，都是 per-call 的显式超时；不再叠 dial-level 的额外池设置，避免多层超时冲突。
+
+#### 12.9.6 常见排查路径
+
+| 现象 | 先看这里 |
+|---|---|
+| `Error 1040: Too many connections` | 数一下当前 K8s 上跑了几个 pod × `FSZ_MYSQL_MAX_OPEN_CONNS`，对齐 MySQL 的 `max_connections` |
+| DB 请求排队 / 事务等锁超时 | 单进程压测：`FSZ_MYSQL_MAX_OPEN_CONNS=30` 起步，看 P99 是否下降；配合 slow log 排除是慢 SQL |
+| Redis `pool exhausted` | 只可能出在 interaction；先看 Redis 慢查询是不是真的慢，再考虑把 PoolSize 拉到 200 |
+| Redis P99 > 500ms 报警 | ReadTimeout 是 500ms，说明 Redis 真的卡了，走 §12.5 兜底路径，DB 端能扛住即可，不用改超时 |
+| Kafka 消费滞后 | 先看 job 的 `WorkerCount` 是否等于 topic 分区数；不够就先扩分区再扩 worker |
+| gRPC 偶发 200ms 尖刺 | 大概率是 p2c 探活时踩到了刚起的实例；`context.WithTimeout` 保底后重试即可 |
+
+**核心原则**：**默认值都朝小配、按进程可覆盖**。宁可在某个高压进程单独调大 3~5×，也不要给所有进程发一份"看着舒服"的大默认——那才是真正的雪崩起点。
 
 ---
 
