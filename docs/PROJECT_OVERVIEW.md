@@ -66,22 +66,22 @@
 
 ```mermaid
 flowchart LR
-    Client["Web / App<br/>(前端)"] -->|HTTPS + JWT| Gateway["Gateway<br/>(go-zero api)"]
+    Client["Web / App (前端)"] -->|HTTPS + JWT| Gateway["Gateway (go-zero api)"]
 
-    Gateway -->|gRPC| Account["Account RPC<br/>账号 / Profile"]
-    Gateway -->|gRPC| Video["Video RPC<br/>视频元数据 / 文件资产"]
-    Gateway -->|gRPC| Interaction["Interaction RPC<br/>点赞 / 评论"]
-    Gateway -->|gRPC| Social["Social RPC<br/>关注 / 粉丝"]
-    Gateway -->|gRPC| Notification["Notification RPC<br/>通知列表 / 未读数"]
-    Gateway -->|gRPC| Feed["Feed RPC<br/>关注流 / 热榜 / 推荐"]
+    Gateway -->|gRPC| Account["Account RPC 账号 / Profile"]
+    Gateway -->|gRPC| Video["Video RPC 视频元数据 / 文件资产"]
+    Gateway -->|gRPC| Interaction["Interaction RPC 点赞 / 评论"]
+    Gateway -->|gRPC| Social["Social RPC 关注 / 粉丝"]
+    Gateway -->|gRPC| Notification["Notification RPC 通知列表 / 未读数"]
+    Gateway -->|gRPC| Feed["Feed RPC 关注流 / 热榜 / 推荐"]
 
-    Account --> MySQL[("MySQL<br/>accounts / videos / follows<br/>likes / comments / notifications<br/>file_assets / outbox / processed / dead_letter")]
+    Account --> MySQL[("MySQL accounts / videos / follows likes / comments / notifications file_assets / outbox / processed / dead_letter")]
     Video --> MySQL
     Interaction --> MySQL
     Social --> MySQL
     Notification --> MySQL
 
-    Account --> Redis[("Redis<br/>Profile 版本号缓存<br/>视频统计版本化服务投影<br/>Timeline ZSet / 热榜快照<br/>未读数 version / 秒传全局哈希")]
+    Account --> Redis[("Redis Profile 版本号缓存 视频统计版本化服务投影 Timeline ZSet / 热榜快照 未读数 version / 秒传全局哈希")]
     Video --> Redis
     Interaction --> Redis
     Social --> Redis
@@ -89,20 +89,20 @@ flowchart LR
     Feed --> Redis
     Feed --> MySQL
 
-    Gateway --> Disk[("本地磁盘<br/>uploads/{yyyy/mm/dd}/<br/>file_hash.ext")]
+    Gateway --> Disk[("本地磁盘 uploads/{yyyy/mm/dd}/ file_hash.ext")]
     Video --> Disk
 
-    MySQL -.outbox_events.-> Outbox["Outbox Job<br/>扫描 & 投递"]
-    Outbox -->|Publish| Kafka[("Kafka<br/>6 topics")]
+    MySQL --> Outbox["Outbox Job 扫描 & 投递"]
+    Outbox -->|Publish| Kafka[("Kafka 6 topics")]
 
-    Kafka --> InteractionSync["interaction_sync Job<br/>按 partition 并发<br/>批量幂等更新 DB 快照<br/>stats_version CAS 投影 Redis"]
-    Kafka --> SocialSync["social_sync Job<br/>关注缓存 & 版本号"]
-    Kafka --> FeedTimeline["feed_timeline Job<br/>推拉分离扇出 + global ready 自愈"]
-    Kafka --> HotRank["hotrank Job<br/>热度增量聚合"]
-    Kafka --> NotifJob["notification Job<br/>写通知 & bump 未读数"]
+    Kafka --> InteractionSync["interaction_sync Job 按 partition 并发 批量幂等更新 DB 快照 stats_version CAS 投影 Redis"]
+    Kafka --> SocialSync["social_sync Job 关注缓存 & 版本号"]
+    Kafka --> FeedTimeline["feed_timeline Job 推拉分离扇出 + global ready 自愈"]
+    Kafka --> HotRank["hotrank Job 热度增量聚合"]
+    Kafka --> NotifJob["notification Job 写通知 & bump 未读数"]
 
-    MySQL -.轮询扫库.-> AssetCleanup["asset_cleanup Job<br/>延迟物理清理 file_assets"]
-    MySQL -.轮询扫库.-> EventCleanup["event_cleanup Job<br/>分批清理 sent outbox / 过期幂等记录"]
+    MySQL --> AssetCleanup["asset_cleanup Job 延迟物理清理 file_assets"]
+    MySQL --> EventCleanup["event_cleanup Job 分批清理 sent outbox / 过期幂等记录"]
     AssetCleanup -->|os.Remove| Disk
     AssetCleanup -->|DEL fsz:chunkupload:hash:global| Redis
     AssetCleanup --> MySQL
@@ -363,31 +363,31 @@ notification.create / notification.delete → NotificationEvent
 ```mermaid
 sequenceDiagram
     autonumber
-    participant RPC as 业务 RPC<br/>(如 Social.Follow)
+    participant RPC as 业务 RPC (如 Social.Follow)
     participant DB as MySQL
     participant OB as Outbox Job
     participant K as Kafka
-    participant CS as Consumer<br/>(如 feed_timeline)
+    participant CS as Consumer (如 feed_timeline)
 
     RPC->>DB: BEGIN TRANSACTION
-    RPC->>DB: INSERT/UPDATE 业务表<br/>(follows / accounts.follower_count / is_big_v)
-    RPC->>DB: INSERT outbox_events<br/>(status=1 pending)
+    RPC->>DB: INSERT/UPDATE 业务表 (follows / accounts.follower_count / is_big_v)
+    RPC->>DB: INSERT outbox_events (status=1 pending)
     RPC->>DB: COMMIT
-    RPC-->>RPC: 事务后同步失效 Redis 缓存<br/>（尽力而为，失败不阻塞）
+    RPC-->>RPC: 事务后同步失效 Redis 缓存 （尽力而为，失败不阻塞）
 
     loop 每 200ms 轮询
-        OB->>DB: SELECT ... WHERE status=1<br/>AND next_retry_at<=now<br/>FOR UPDATE SKIP LOCKED
-        OB->>DB: UPDATE lock_token=uuid<br/>(乐观锁抢占)
+        OB->>DB: SELECT ... WHERE status=1 AND next_retry_at<=now FOR UPDATE SKIP LOCKED
+        OB->>DB: UPDATE lock_token=uuid (乐观锁抢占)
         OB->>K: Publish 到对应 topic
         alt 成功
             OB->>DB: UPDATE status=2 sent_at=now
         else 失败
-            OB->>DB: UPDATE retry_count+1<br/>next_retry_at=now+backoff
+            OB->>DB: UPDATE retry_count+1 next_retry_at=now+backoff
         end
     end
 
     K->>CS: 消费消息
-    CS->>DB: SELECT processed_events<br/>WHERE event_id + consumer_name
+    CS->>DB: SELECT processed_events WHERE event_id + consumer_name
     alt 未处理
         CS->>DB: BEGIN → 业务写入 + INSERT processed_events → COMMIT
     else 已处理
@@ -453,16 +453,16 @@ flowchart LR
     A["GetProfile / BatchGetProfiles"] --> B["Pipeline#1: GET version key"]
     B --> C{"version 存在?"}
     C -->|存在 n| D1["expectedVersion = n"]
-    C -->|redis.Nil| D2["expectedVersion = 0<br/>（内存兜底，不写回 Redis）"]
-    D1 --> E["Pipeline#2:<br/>GET profile:v:expectedVersion<br/>+ 再 GET version key"]
+    C -->|redis.Nil| D2["expectedVersion = 0 （内存兜底，不写回 Redis）"]
+    D1 --> E["Pipeline#2: GET profile:v:expectedVersion + 再 GET version key"]
     D2 --> E
     E --> F{"两次 version 相等?"}
-    F -->|不等| M1["视为 miss<br/>（并发写发生了）"]
+    F -->|不等| M1["视为 miss （并发写发生了）"]
     F -->|相等 & 数据 hit| R1["返回缓存"]
     F -->|相等 & 数据 miss| M2["视为 miss"]
     M1 --> G["回源 MySQL"]
     M2 --> G
-    G --> H["cachePublicProfileMisses:<br/>回填前再 GET version 校验<br/>currentVersion == expectedVersion 才 SET"]
+    G --> H["cachePublicProfileMisses: 回填前再 GET version 校验 currentVersion == expectedVersion 才 SET"]
     H --> R2["返回 MySQL 数据"]
 ```
 
@@ -528,7 +528,7 @@ sequenceDiagram
     R->>Redis: Pipeline#1: GET version:100
     Redis-->>R: 5 (expectedVersion=5)
     W->>Redis: INCR version:100 → 6
-    R->>Redis: Pipeline#2:<br/>GET profile:100:v:5<br/>+ GET version:100
+    R->>Redis: Pipeline#2: GET profile:100:v:5 + GET version:100
     Redis-->>R: 旧 JSON A, 6
     R->>R: 校验: expected=5, current=6 → 不一致
     R->>R: 放弃 → 加入 missUserIDs 回源
@@ -762,16 +762,16 @@ func publicProfileDBLoadKey(userIDs []uint64) string {
 
 ```mermaid
 flowchart TD
-    Start["客户端选中视频文件"] --> Hash["本地读文件 → 计算 SHA256(fileHash)<br/>获取 fileSize / filename"]
-    Hash --> Init["POST /upload/init<br/>只发 { fileHash, fileSize, filename, chunkSize }<br/>—— 一次几十字节的元信息请求"]
-    Init --> Q1{"服务端查 Redis + MySQL<br/>是否已有同 hash 且 Active/PendingDelete?"}
-    Q1 -- "命中<br/>(EnableInstantUpload=true)" --> Instant["✅ 真·秒传<br/>返回 { Needupload:false, Needchunk:false, Playurl }<br/>客户端 0 字节文件内容传输"]
-    Q1 -- "未命中" --> Q2{"fileSize ><br/>ChunkThresholdBytes?"}
-    Q2 -- "小文件" --> Small["返回 { Needupload:true, Needchunk:false }<br/>→ 客户端 POST /upload/video (multipart)<br/>整体一次性上传"]
-    Q2 -- "大文件" --> Big["返回 { Needupload:true, Needchunk:true,<br/>Uploadid, Uploadedchunks[], Chunksize }<br/>→ 客户端循环 /upload/chunk (可并发/断点续传)<br/>→ 最终 POST /upload/complete"]
-    Small --> Post["upsertFileAsset 去重登记<br/>+ 写 Redis 秒传双 key (为未来秒传埋种子)"]
+    Start["客户端选中视频文件"] --> Hash["本地读文件 → 计算 SHA256(fileHash) 获取 fileSize / filename"]
+    Hash --> Init["POST /upload/init 只发 { fileHash, fileSize, filename, chunkSize } —— 一次几十字节的元信息请求"]
+    Init --> Q1{"服务端查 Redis + MySQL 是否已有同 hash 且 Active/PendingDelete?"}
+    Q1 -- "命中 (EnableInstantUpload=true)" --> Instant["✅ 真·秒传 返回 { Needupload:false, Needchunk:false, Playurl } 客户端 0 字节文件内容传输"]
+    Q1 -- "未命中" --> Q2{"fileSize > ChunkThresholdBytes?"}
+    Q2 -- "小文件" --> Small["返回 { Needupload:true, Needchunk:false } → 客户端 POST /upload/video (multipart) 整体一次性上传"]
+    Q2 -- "大文件" --> Big["返回 { Needupload:true, Needchunk:true, Uploadid, Uploadedchunks[], Chunksize } → 客户端循环 /upload/chunk (可并发/断点续传) → 最终 POST /upload/complete"]
+    Small --> Post["upsertFileAsset 去重登记 + 写 Redis 秒传双 key (为未来秒传埋种子)"]
     Big --> Post
-    Instant --> Publish["拿到 play_url → POST /video/publish<br/>(video-rpc 事务里 ref_count+=1、INSERT videos、写 outbox)"]
+    Instant --> Publish["拿到 play_url → POST /video/publish (video-rpc 事务里 ref_count+=1、INSERT videos、写 outbox)"]
     Post --> Publish
 ```
 
@@ -1062,18 +1062,18 @@ TTL 都是 `chunkSessionTTL`（默认 24 小时），且**每次 init/chunk 操�
 
 ```mermaid
 flowchart TD
-    Init["POST /upload/init<br/>{ fileHash, fileSize, chunkSize, filename }"] --> Q0{"秒传命中?<br/>(前面已判定)"}
+    Init["POST /upload/init { fileHash, fileSize, chunkSize, filename }"] --> Q0{"秒传命中? (前面已判定)"}
     Q0 -- "未命中" --> Session["GET fsz:chunkupload:session:{userID}:{fileHash}"]
     Session --> Q1{"找到旧 uploadID?"}
-    Q1 -- "无" --> New["生成新 uploadID<br/>mkdir chunkTempDir<br/>HSET meta / EXPIRE 三把 key<br/>返回 Uploadedchunks=[]"]
+    Q1 -- "无" --> New["生成新 uploadID mkdir chunkTempDir HSET meta / EXPIRE 三把 key 返回 Uploadedchunks=[]"]
     Q1 -- "有" --> Meta["HGETALL fsz:chunkupload:meta:{uploadID}"]
-    Meta --> Q2{"强一致校验:<br/>fileHash / userID / fileSize /<br/>finalExt / chunkSize 全部匹配?"}
+    Meta --> Q2{"强一致校验: fileHash / userID / fileSize / finalExt / chunkSize 全部匹配?"}
     Q2 -- "任一不匹配" --> New
-    Q2 -- "全部匹配" --> Reuse["SMEMBERS fsz:chunkupload:set:{uploadID}<br/>→ 已上传分片编号列表"]
+    Q2 -- "全部匹配" --> Reuse["SMEMBERS fsz:chunkupload:set:{uploadID} → 已上传分片编号列表"]
     Reuse --> Refresh["Pipeline 刷新三把 key 的 TTL"]
     Refresh --> Return["返回 { Uploadid, Uploadedchunks:[已传编号], Chunksize }"]
     New --> Return
-    Return --> Client["客户端遍历 1..totalChunks<br/>只对不在 Uploadedchunks 里的编号<br/>调 /upload/chunk"]
+    Return --> Client["客户端遍历 1..totalChunks 只对不在 Uploadedchunks 里的编号 调 /upload/chunk"]
 ```
 
 **为什么必须做"强一致校验"？** 想象一下反例：用户先用 500MB 视频 A 开了一个会话传了 3 片，然后又选了另一个 200MB 视频 B（碰巧 SHA256 已经变了但客户端 bug 传错 hash），如果不校验 `file_size / chunk_size / total_chunks`，就会把 B 的分片写到 A 的临时目录里、`SADD` 到同一个 set 里，最终合并出来的是**混合文件**、hash 校验通不过，前面传的 3 片全废。
@@ -1119,8 +1119,8 @@ sequenceDiagram
     autonumber
     participant U as 前端
     participant G as Gateway (api)
-    participant Disk as 本地磁盘<br/>uploads/yyyy/mm/dd
-    participant DB as MySQL<br/>(file_assets)
+    participant Disk as 本地磁盘 uploads/yyyy/mm/dd
+    participant DB as MySQL (file_assets)
     participant R as Redis
     participant V as Video RPC
     participant AC as asset_cleanup Job
@@ -1132,12 +1132,12 @@ sequenceDiagram
     alt DB 命中 且 os.Stat(storage_path) 通过（秒传命中）
         DB-->>G: asset row
         G->>Disk: os.Stat 校验磁盘文件存在且为普通文件
-        G->>R: SET fsz:chunkupload:hash:global / hash:{userID}<br/>= asset.url, EX 7d（刷新缓存）
+        G->>R: SET fsz:chunkupload:hash:global / hash:{userID} = asset.url, EX 7d（刷新缓存）
         G-->>U: { instant:true, url = asset.url }
     else 未命中 → 走真实上传
         U->>G: 分片上传 or 整传
         G->>Disk: 落盘临时文件
-        G->>G: 服务端二次 SHA256 校验<br/>+ 读取前 12 字节魔数校验
+        G->>G: 服务端二次 SHA256 校验 + 读取前 12 字节魔数校验
         G->>DB: BEGIN → upsertFileAsset(fileHash, url, storagePath)
 
         alt 无冲突（首次登记）
@@ -1145,14 +1145,14 @@ sequenceDiagram
         else 冲突 → 查旧记录
             DB-->>G: existing
             alt existing.status = Cleaning
-                Note over G,AC: 秒传正确性关键：<br/>不能改回 Active，必须轮询等待
+                Note over G,AC: 秒传正确性关键： 不能改回 Active，必须轮询等待
                 G->>DB: 每 50ms 轮询（≤5s）直到 Cleaning → Deleted / Active
             end
             alt existing.status = PendingDelete
-                G->>DB: UPDATE PendingDelete → Active,<br/>ref_count 保持, deleted_at = NULL
+                G->>DB: UPDATE PendingDelete → Active, ref_count 保持, deleted_at = NULL
             end
             alt existing.status = Active
-                G->>Disk: 删除本次重复的临时文件<br/>（保留 canonical storage_path）
+                G->>Disk: 删除本次重复的临时文件 （保留 canonical storage_path）
             end
         end
 
@@ -1165,19 +1165,19 @@ sequenceDiagram
     U->>G: /video/publish { title, play_url, cover_url, tags, request_id }
     G->>V: PublishVideo
     V->>DB: SELECT file_assets WHERE url IN (...) AND status=Active
-    V->>Disk: 批量预检唯一 storage_path<br/>存在且为普通文件
+    V->>Disk: 批量预检唯一 storage_path 存在且为普通文件
     V->>DB: BEGIN
-    V->>DB: 条件原子 UPDATE file_assets<br/>ref_count += logical_delta
+    V->>DB: 条件原子 UPDATE file_assets ref_count += logical_delta
     V->>DB: INSERT videos + INSERT video_tags
     V->>DB: INSERT outbox_events(feed.video.events, published)
     V->>DB: COMMIT
     V-->>G: VideoInfo
 
     Note over AC,Disk: 视频软删除后
-    Note over DB: ref_count 减到 0 → status=PendingDelete<br/>deleted_at=now
-    AC->>DB: SELECT WHERE (PendingDelete AND deleted_at ≤ now-Grace)<br/>OR (Cleaning AND updated_at ≤ now-ClaimTimeout)
-    AC->>DB: BEGIN → FOR UPDATE → 二次校验 videos 引用<br/>UPDATE → Cleaning
-    AC->>Disk: os.Remove(storagePath)<br/>（路径注入防御 + 只删普通文件）
+    Note over DB: ref_count 减到 0 → status=PendingDelete deleted_at=now
+    AC->>DB: SELECT WHERE (PendingDelete AND deleted_at ≤ now-Grace) OR (Cleaning AND updated_at ≤ now-ClaimTimeout)
+    AC->>DB: BEGIN → FOR UPDATE → 二次校验 videos 引用 UPDATE → Cleaning
+    AC->>Disk: os.Remove(storagePath) （路径注入防御 + 只删普通文件）
     AC->>DB: UPDATE Cleaning → Deleted
     AC->>R: DEL fsz:chunkupload:hash:global:{fileHash}
 ```
@@ -1550,21 +1550,21 @@ DB 中"记录存在与否"和"status 字段值"是**两件完全不同的事**�
 ```mermaid
 stateDiagram-v2
     direction LR
-    [*] --> Active : ① upsertFileAsset 段落 2<br/>INSERT DO NOTHING 成功<br/>（新 hash 首次登记）
+    [*] --> Active : ① upsertFileAsset 段落 2 INSERT DO NOTHING 成功 （新 hash 首次登记）
 
-    Active --> Active : ref_count += 1<br/>（新视频引用同一资产）
-    Active --> PendingDelete : ② video-rpc SoftDeleteVideo<br/>ref_count 减到 0<br/>deleted_at = now
-    Active --> Deleted : ③ asset_cleanup 巡检异常<br/>reconcileActiveAsset：<br/>磁盘丢失 AND 真实引用=0<br/>（跳过 PendingDelete）
+    Active --> Active : ref_count += 1 （新视频引用同一资产）
+    Active --> PendingDelete : ② video-rpc SoftDeleteVideo ref_count 减到 0 deleted_at = now
+    Active --> Deleted : ③ asset_cleanup 巡检异常 reconcileActiveAsset： 磁盘丢失 AND 真实引用=0 （跳过 PendingDelete）
 
-    PendingDelete --> Active : ⑥ asset_cleanup claimAsset<br/>事务内二次校验真实引用>0<br/>（Grace 期被复用，自纠错）
-    PendingDelete --> Cleaning : ⑤ asset_cleanup 抢占<br/>过 GraceSeconds=300s + 二次校验 ref=0
+    PendingDelete --> Active : ⑥ asset_cleanup claimAsset 事务内二次校验真实引用>0 （Grace 期被复用，自纠错）
+    PendingDelete --> Cleaning : ⑤ asset_cleanup 抢占 过 GraceSeconds=300s + 二次校验 ref=0
 
-    Cleaning --> PendingDelete : ⑧ removeAssetFile 失败<br/>（回退重试，下轮再抢）
-    Cleaning --> Deleted : ⑦ removeAssetFile 成功<br/>UPDATE + DEL Redis 全局缓存
-    Cleaning --> Cleaning : 抢占者崩溃 → 过 ClaimTimeout<br/>被其他实例重抢
+    Cleaning --> PendingDelete : ⑧ removeAssetFile 失败 （回退重试，下轮再抢）
+    Cleaning --> Deleted : ⑦ removeAssetFile 成功 UPDATE + DEL Redis 全局缓存
+    Cleaning --> Cleaning : 抢占者崩溃 → 过 ClaimTimeout 被其他实例重抢
 
-    Deleted --> Active : ④/⑨ upsertFileAsset 段落 4<br/>用户上传同 hash<br/>CAS 复活（os.Stat 校验通过后）
-    Deleted --> [*] : ⑩ 兜底 GC<br/>长时间无复活 → 硬 DELETE 整行
+    Deleted --> Active : ④/⑨ upsertFileAsset 段落 4 用户上传同 hash CAS 复活（os.Stat 校验通过后）
+    Deleted --> [*] : ⑩ 兜底 GC 长时间无复活 → 硬 DELETE 整行
 
     note right of Cleaning
       Gateway upsertFileAsset 遇到 Cleaning
@@ -1644,15 +1644,15 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TD
-    A["BatchGetVideos"] --> B["normalizeBatchVideoEntityIDs<br/>限批 100 / 过滤 0 / 去重保序"]
-    B --> C["loadVideoEntitiesFromCache<br/>一次 Pipeline: GET entity + GET version"]
-    C --> D{"cached.Version == 当前 version<br/>且 status == VideoStatusNormal?"}
+    A["BatchGetVideos"] --> B["normalizeBatchVideoEntityIDs 限批 100 / 过滤 0 / 去重保序"]
+    B --> C["loadVideoEntitiesFromCache 一次 Pipeline: GET entity + GET version"]
+    C --> D{"cached.Version == 当前 version 且 status == VideoStatusNormal?"}
     D -- "是" --> E1["cached.toVideoInfo() → 命中"]
     D -- "Missing:true" --> E2["跳过（负缓存生效）"]
     D -- "否" --> M["加入 missVideoIDs"]
-    M --> F["loadVideoEntitiesFromDB<br/>SingleFlight(排序后拼 key 合并并发)<br/>WHERE id IN ? AND status=Normal AND deleted_at IS NULL"]
-    F --> G["cacheVideoEntityMisses<br/>Lua CAS: current==ARGV[1] 才 SET"]
-    G --> H["按输入顺序组装响应<br/>Missing/Deleted 直接跳过"]
+    M --> F["loadVideoEntitiesFromDB SingleFlight(排序后拼 key 合并并发) WHERE id IN ? AND status=Normal AND deleted_at IS NULL"]
+    F --> G["cacheVideoEntityMisses Lua CAS: current==ARGV[1] 才 SET"]
+    G --> H["按输入顺序组装响应 Missing/Deleted 直接跳过"]
 ```
 
 **"先读实体再读版本"命令顺序的关键性**：
@@ -1906,17 +1906,17 @@ func invalidateVideoEntityCache(ctx context.Context, redisCli *redis.Client, vid
 sequenceDiagram
     autonumber
     participant C as 客户端 / RPC 调用方
-    participant V as Video RPC Logic<br/>(PublishVideoLogic / DeleteVideoLogic)
+    participant V as Video RPC Logic (PublishVideoLogic / DeleteVideoLogic)
     participant DB as MySQL
     participant R as Redis
     participant R2 as 后续读侧 goroutine
 
     C->>V: PublishVideo / DeleteVideo
     V->>DB: BEGIN → 状态变更（INSERT / UPDATE videos + tags + outbox）→ COMMIT
-    Note over V,DB: 事务成功提交才继续<br/>失败则直接返回错误、不触发缓存作废
-    V->>R: invalidateVideoEntityCache:<br/>TxPipeline{ INCR version, DEL entity/detail/stats }
-    Note over R: version: 5 → 6<br/>entity/detail/stats 三把 key 被清空
-    Note over V,R: 【失败静默】所有调用点都是<br/>if err != nil { l.Errorf(...) }<br/>只记日志、不重试、不阻塞客户端响应
+    Note over V,DB: 事务成功提交才继续 失败则直接返回错误、不触发缓存作废
+    V->>R: invalidateVideoEntityCache: TxPipeline{ INCR version, DEL entity/detail/stats }
+    Note over R: version: 5 → 6 entity/detail/stats 三把 key 被清空
+    Note over V,R: 【失败静默】所有调用点都是 if err != nil { l.Errorf(...) } 只记日志、不重试、不阻塞客户端响应
     V-->>C: 返回成功
     Note over R2: 稍后...
     R2->>R: Pipeline: GET entity(=nil), GET version(=6)
@@ -2981,19 +2981,19 @@ sequenceDiagram
     U->>G: POST /social/follow { target_user_id }
     G->>S: Follow(follower_id=JWT.uid, following_id)
     S->>DB: BEGIN
-    Note over S,DB: 事件 ID 与 payload 已在事务外生成；<br/>双账户按 ID 升序 SELECT FOR UPDATE
-    S->>DB: SELECT accounts WHERE id IN (fid,tid)<br/>ORDER BY id FOR UPDATE
+    Note over S,DB: 事件 ID 与 payload 已在事务外生成； 双账户按 ID 升序 SELECT FOR UPDATE
+    S->>DB: SELECT accounts WHERE id IN (fid,tid) ORDER BY id FOR UPDATE
     S->>DB: INSERT follows ON DUPLICATE KEY UPDATE status=1
-    S->>DB: 一条 CASE UPDATE 同时维护双方计数<br/>并按锁内快照完成大 V 只升不降晋升
-    S->>DB: 一次多值 INSERT 写入<br/>业务 Outbox + 通知 Outbox
+    S->>DB: 一条 CASE UPDATE 同时维护双方计数 并按锁内快照完成大 V 只升不降晋升
+    S->>DB: 一次多值 INSERT 写入 业务 Outbox + 通知 Outbox
     S->>DB: COMMIT
-    S->>R: SET fsz:social:following:{f}:{t}=1<br/>DEL 列表首页缓存<br/>INCR AccountPublicProfileVersionKey(两侧)
+    S->>R: SET fsz:social:following:{f}:{t}=1 DEL 列表首页缓存 INCR AccountPublicProfileVersionKey(两侧)
     S-->>G: { followed:true }
 
     OB->>K: 双事件
     K->>JS: FollowEvent → 再次刷缓存 & bump version（幂等兜底）
-    K->>JF: FollowEvent → 拉取被关注者最近 200 视频<br/>→ 写 follower 的 Timeline
-    K->>JN: NotificationEvent → INSERT notifications<br/>→ BumpUnreadVersion
+    K->>JF: FollowEvent → 拉取被关注者最近 200 视频 → 写 follower 的 Timeline
+    K->>JN: NotificationEvent → INSERT notifications → BumpUnreadVersion
 ```
 
 **大 V 判定详解**：见 [8.6 Feed 推拉分离](#86-feed-推拉分离模块)。
@@ -3126,7 +3126,7 @@ Job 消费 `notification.events` 时，需要精确判断"这次事件是否真�
 ```mermaid
 sequenceDiagram
     autonumber
-    participant S as Social/Interaction<br/>业务 RPC
+    participant S as Social/Interaction 业务 RPC
     participant DB as MySQL
     participant OB as Outbox
     participant K as Kafka
@@ -3236,12 +3236,12 @@ flowchart TD
     C -->|有| D[得到小 V 视频集合 A]
     C -->|冷启动/miss| E[获取 build_lock:viewer]
     E --> F{抢到锁?}
-    F -->|抢到| G[SELECT follows 关注列表<br/>MySQL 拉最近 200 视频<br/>ZADD 回填 inbox]
+    F -->|抢到| G[SELECT follows 关注列表 MySQL 拉最近 200 视频 ZADD 回填 inbox]
     F -->|没抢到| H[等待 200ms 重读]
     G --> D
     H --> D
 
-    D --> I[SELECT accounts WHERE is_big_v=1<br/>AND id IN 关注列表]
+    D --> I[SELECT accounts WHERE is_big_v=1 AND id IN 关注列表]
     I --> J[对每个大 V ZREVRANGEBYLEX author_outbox]
     J --> K[得到大 V 视频集合 B]
     K --> L[合并 A∪B → 按 published_at DESC 归并]
@@ -3321,18 +3321,18 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    I[Interaction RPC<br/>Outbox] --> K[Kafka<br/>like/comment events]
-    K --> H[hotrank Job<br/>独立 Consumer Group]
-    H --> L[Redis Lua<br/>事件幂等 + ZINCRBY]
+    I[Interaction RPC Outbox] --> K[Kafka like/comment events]
+    K --> H[hotrank Job 独立 Consumer Group]
+    H --> L[Redis Lua 事件幂等 + ZINCRBY]
     L --> W[UTC 单分钟窗口 ZSET]
 
     F[Feed.GetHotFeed] --> C{snapshot ready?}
     C -->|是| S[读取固定 merge 快照]
     C -->|否| SF[本地 SingleFlight]
     SF --> DL[Redis 分布式构建锁]
-    DL --> ZU[ZUNIONSTORE<br/>最近 60 分钟 + 衰减权重]
+    DL --> ZU[ZUNIONSTORE 最近 60 分钟 + 衰减权重]
     ZU --> TMP[临时 ZSET 只保留 Top K]
-    TMP --> P[Lua 校验锁并原子发布<br/>merge + ready]
+    TMP --> P[Lua 校验锁并原子发布 merge + ready]
     P --> S
 ```
 
@@ -3364,7 +3364,7 @@ Feed / 通知列表 / 评论列表等场景，Gateway logic 层负责：
 
 ```mermaid
 flowchart LR
-    IDs[Feed 返回 video_ids] --> V[BatchGetVideos<br/>基础视频]
+    IDs[Feed 返回 video_ids] --> V[BatchGetVideos 基础视频]
     V --> A[Account BatchGetProfiles]
     V --> I[Interaction BatchGetVideoStats]
     A --> M[合并作者最新资料]
@@ -3830,7 +3830,7 @@ flowchart TD
     H -->|否| J[业务写入]
     J --> K[INSERT processed_events]
     K --> L{COMMIT 成功?}
-    L -->|是| M[事务后副作用:<br/>Redis / 二次 Produce]
+    L -->|是| M[事务后副作用: Redis / 二次 Produce]
     L -->|失败| N[retry_count++ → 死信旁路]
 ```
 
@@ -4045,9 +4045,9 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     A[资源类型] --> B{变更频率?}
-    B -->|低频<br/>profile/video 元数据| C[版本号 + 长 TTL<br/>写路径 INCR 版本号<br/>读时用当前版本组合 key]
-    B -->|高频统计<br/>点赞/评论/热度| D[版本化服务投影<br/>在线 Lua 乐观更新<br/>Consumer CAS 修复]
-    B -->|派生数据<br/>Timeline / 未读数 / 热榜| E[事件驱动<br/>Kafka 扇出维护<br/>按模块降级或重建]
+    B -->|低频 profile/video 元数据| C[版本号 + 长 TTL 写路径 INCR 版本号 读时用当前版本组合 key]
+    B -->|高频统计 点赞/评论/热度| D[版本化服务投影 在线 Lua 乐观更新 Consumer CAS 修复]
+    B -->|派生数据 Timeline / 未读数 / 热榜| E[事件驱动 Kafka 扇出维护 按模块降级或重建]
 
     C --> F[代表: AccountPublicProfileKey]
     D --> G[代表: VideoStatsAuthKey]
@@ -4114,17 +4114,17 @@ func likedVideosListDBLoadKey(userID uint64, cursorCreatedAt int64, cursorLikeID
 
 ```mermaid
 flowchart TD
-    A[RPC 进入] --> B[读版本号<br/>Get *ListVersionKey]
-    B -->|Redis 挂了| Z[cacheKey=&quot;&quot; 降级<br/>纯 MySQL + 本地 SingleFlight]
-    B -->|OK 或 Nil→0| C[拼 cacheKey<br/>带 userID/version/cursor/pageSize]
+    A[RPC 进入] --> B[读版本号 Get *ListVersionKey]
+    B -->|Redis 挂了| Z[cacheKey=&quot;&quot; 降级 纯 MySQL + 本地 SingleFlight]
+    B -->|OK 或 Nil→0| C[拼 cacheKey 带 userID/version/cursor/pageSize]
     C --> D{GET cacheKey}
     D -->|命中| R1[直接返回]
-    D -->|miss| E{SETNX buildLockKey<br/>token=randomHex EX=lockTTL}
-    E -->|抢到锁| F[进入回源分支<br/>defer 释放锁]
-    E -->|没抢到| G[短轮询等其他协程写完缓存<br/>3 次 × 50ms]
+    D -->|miss| E{SETNX buildLockKey token=randomHex EX=lockTTL}
+    E -->|抢到锁| F[进入回源分支 defer 释放锁]
+    E -->|没抢到| G[短轮询等其他协程写完缓存 3 次 × 50ms]
     G -->|等到了| R2[读缓存返回]
     G -->|等超时| F2[退化：自己也去查 DB 兜底]
-    F --> H[localLoadGroup.Do<br/>同进程相同参数合并成 1 次]
+    F --> H[localLoadGroup.Do 同进程相同参数合并成 1 次]
     F2 --> H
     H --> I[MySQL JOIN+ORDER+LIMIT]
     I --> J[写回缓存 SET TTL=30s]
@@ -4320,25 +4320,25 @@ return 1
 
 ```mermaid
 flowchart TD
-    A[ListMyLikedVideos 进入] --> A1{参数校验<br/>cursor / pageSize}
-    A1 --> B{isLikedVideosFirstPageCacheable<br/>cursor=0 且 pageSize≤20}
-    B -->|否| Z0[dbPageSize = pageSize<br/>SingleFlight → DB<br/>直接返回 不涉及缓存]
+    A[ListMyLikedVideos 进入] --> A1{参数校验 cursor / pageSize}
+    A1 --> B{isLikedVideosFirstPageCacheable cursor=0 且 pageSize≤20}
+    B -->|否| Z0[dbPageSize = pageSize SingleFlight → DB 直接返回 不涉及缓存]
     B -->|是| C[GET LikeUserVideosListVersionKey → version]
-    C -->|Redis 报错| Z1[cacheKey=&quot;&quot; 降级<br/>SingleFlight+DB 按 pageSize]
+    C -->|Redis 报错| Z1[cacheKey=&quot;&quot; 降级 SingleFlight+DB 按 pageSize]
     C -->|ok / Nil→0| D[cacheKey = LikeUserVideosFirstPageCacheKey uid,ver]
     D --> E{GET cacheKey}
     E -->|命中且版本匹配| R1[从 20 条窗口截前 pageSize 条返回]
     E -->|miss| F{SETNX buildLockKey EX=2s}
     F -->|Redis 报错| Z1
-    F -->|抢到锁 B| G1[useFixedWindow=true<br/>cacheWriteAllowed=true<br/>defer 释放锁]
-    F -->|没抢到| H[短轮询 3×50ms<br/>期间读 cacheKey]
+    F -->|抢到锁 B| G1[useFixedWindow=true cacheWriteAllowed=true defer 释放锁]
+    F -->|没抢到| H[短轮询 3×50ms 期间读 cacheKey]
     H -->|命中 C| R2[直接返回]
-    H -->|超时 D| G2[useFixedWindow=true<br/>cacheWriteAllowed=false]
-    G1 --> I[localLoadGroup.Do<br/>相同参数进程内合并]
+    H -->|超时 D| G2[useFixedWindow=true cacheWriteAllowed=false]
+    G1 --> I[localLoadGroup.Do 相同参数进程内合并]
     G2 --> I
-    I --> J[MySQL JOIN+ORDER+LIMIT 21<br/>返回 ≤20 条 + hasMore]
+    I --> J[MySQL JOIN+ORDER+LIMIT 21 返回 ≤20 条 + hasMore]
     J --> K{cacheWriteAllowed?}
-    K -->|B: 是| L[Lua 校验 token+version<br/>SET cacheKey PX=30s]
+    K -->|B: 是| L[Lua 校验 token+version SET cacheKey PX=30s]
     K -->|D: 否| M[再读一次缓存构建者可能刚写完]
     M -->|命中| R3[返回]
     M -->|仍 miss| N[二次 SETNX 抢锁]
@@ -4414,12 +4414,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[MySQL 事务 COMMIT<br/>权威事实（likes/comments 行 + outbox）已落地] --> B{事务后 Redis 操作}
+    A[MySQL 事务 COMMIT 权威事实（likes/comments 行 + outbox）已落地] --> B{事务后 Redis 操作}
     B -->|成功| C[用户立刻看到 Redis 服务投影 +1]
-    B -->|失败, 只 log 不阻塞| D[核心业务已成功<br/>返回 fallbackLikesCount 给客户端]
-    D --> E1[路径①: Kafka Consumer 秒级<br/>更新 videos 持久快照 + stats_version]
-    E1 --> E2[路径②: Consumer Lua CAS<br/>主动投影 Redis]
-    E2 -->|失败| E3[Kafka 不提交 offset<br/>幂等重放再次投影]
+    B -->|失败, 只 log 不阻塞| D[核心业务已成功 返回 fallbackLikesCount 给客户端]
+    D --> E1[路径①: Kafka Consumer 秒级 更新 videos 持久快照 + stats_version]
+    E1 --> E2[路径②: Consumer Lua CAS 主动投影 Redis]
+    E2 -->|失败| E3[Kafka 不提交 offset 幂等重放再次投影]
     E2 -->|成功| F[最终收敛到持久快照]
 ```
 
