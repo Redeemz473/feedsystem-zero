@@ -3871,7 +3871,7 @@ flowchart TD
    - 作用：抵御"单实例内部瞬间涌入几百个协程"的场景，几乎零成本。
 
 2. **Redis `SETNX` 分布式锁——跨实例互斥**
-   - `lockKey` 用 `rediskey.LikeUserVideosPageCacheBuildLockKey(cacheKey)` / `CommentListBuildLockKey` / `FeedTimelineBuildLockKey` 等；
+   - `lockKey` 用 `rediskey.LikeUserVideosFirstPageCacheBuildLockKey(cacheKey)` / `CommentFirstPageCacheBuildLockKey` / `FeedTimelineBuildLockKey` 等；
    - `lockToken = randomHex(8/16)` 是**当前协程独有的随机串**，`SetNX(lockKey, token, EX=lockTTL)`；
    - `lockTTL` 都设得很短：`likedVideosListCacheLockTTL = 2s`、评论列表 5s、Timeline 10s。作用是防止持锁协程崩溃后锁永远不释放；
    - 释放时**必须走 Lua 校验 token**（`releaseRedisLock`，见 `interactionhelper.go:104`）——`GET lockKey == myToken then DEL`，避免"我持锁 → 我卡住 → TTL 到期锁被别人拿去 → 我最后再删把别人的锁误删了"这种经典 bug。
@@ -3898,8 +3898,8 @@ flowchart TD
 
 | 模块 | 缓存 Key | 版本号 Key | 构建锁 Key | Lock TTL | 短轮询参数 | 本地 SingleFlight |
 |---|---|---|---|---|---|---|
-| `interaction.ListMyLikedVideos` | `LikeUserVideosPageCacheKey` | `LikeUserVideosListVersionKey` | `LikeUserVideosPageCacheBuildLockKey` | 2s | 3×50ms | `likedVideosListLoadGroup`（sync.Mutex 版） |
-| `interaction.ListComments` | `CommentListCacheKey` | `CommentListVersionKey` | `CommentListBuildLockKey` | 5s | 3×50ms | `syncx.SingleFlight` |
+| `interaction.ListMyLikedVideos` | `LikeUserVideosFirstPageCacheKey`（固定 20 条首页窗口，小页从窗口截取） | `LikeUserVideosListVersionKey` | `LikeUserVideosFirstPageCacheBuildLockKey` | 2s | 3×50ms | `likedVideosListLoadGroup`（sync.Mutex 版） |
+| `interaction.ListComments` | `CommentFirstPageCacheKey`（固定 20 条首页窗口，小页从窗口截取） | `CommentListVersionKey` | `CommentFirstPageCacheBuildLockKey` | 5s | 3×50ms | `syncx.SingleFlight` |
 | `social.ListFollowers` | `FollowerListPageKey` | `FollowerListVersionKey` | `FollowerListBuildLockKey` | 3s | 3×50ms | `followListLoadGroup` |
 | `social.ListFollowings` | `FollowingListPageKey` | `FollowingListVersionKey` | `FollowingListBuildLockKey` | 3s | 3×50ms | `followListLoadGroup`（分命名空间） |
 | `feed.GetFollowingFeed`（Timeline 冷启动） | `FeedTimelineKey` | — | `fsz:feed:timeline:build_lock:{viewer}` | 10s | 200ms 轮询 | `timelineBuildGroup` |
@@ -3918,7 +3918,7 @@ flowchart TD
 
 > **"单次回源是重查询 或 缓存失效呈集中式 或 miss key 天然难合并"**——三条中命中任何一条，就加 Redis 分布式锁；否则只用 SingleFlight。
 
-这条规则同时解释了：为什么 interaction 的**点赞写路径**（`LikeVideo` / `UnlikeVideo`）也用了 `SetNX` 短锁，但那把锁的作用是"**点击互斥**"（防同一用户 500ms 内狂点重复入库），与本节讨论的"**读侧缓存击穿**"锁是**两个完全不同的锁**，分别落在 `rediskey.LikeVideoLockKey` 和 `rediskey.LikeUserVideosPageCacheBuildLockKey`——不要混淆。
+这条规则同时解释了：为什么 interaction 的**点赞写路径**（`LikeVideo` / `UnlikeVideo`）也用了 `SetNX` 短锁，但那把锁的作用是"**点击互斥**"（防同一用户 500ms 内狂点重复入库），与本节讨论的"**读侧缓存击穿**"锁是**两个完全不同的锁**，分别落在 `rediskey.LikeVideoLockKey` 和 `rediskey.LikeUserVideosFirstPageCacheBuildLockKey`——不要混淆。
 
 ### 12.2 幂等的三层防护
 
@@ -3938,7 +3938,7 @@ flowchart TD
 | 并发大 V 升级 | `UPDATE ... WHERE is_big_v=0` 天然幂等 |
 | 并发 outbox dispatch | `SELECT ... FOR UPDATE SKIP LOCKED` + `lock_token` |
 | 并发 Timeline 冷启动 | `fsz:feed:timeline:build_lock:{viewer}` 分布式锁 |
-| 并发列表缓存回源（interaction / social） | `LikeUserVideosPageCacheBuildLockKey` / `CommentListBuildLockKey` / `FollowerListBuildLockKey` / `FollowingListBuildLockKey` 分布式锁 + 本地 SingleFlight，抢锁失败短轮询 3×50ms，超时后本地兜底查 DB（详见 §12.1.1） |
+| 并发列表缓存回源（interaction / social） | `LikeUserVideosFirstPageCacheBuildLockKey` / `CommentFirstPageCacheBuildLockKey` / `FollowerListBuildLockKey` / `FollowingListBuildLockKey` 分布式锁 + 本地 SingleFlight，抢锁失败短轮询 3×50ms，超时后本地兜底查 DB（详见 §12.1.1） |
 | 并发匿名热榜成品缓存回源 | `anonymousHotFeedPageBuildGroup` 本地 SingleFlight + Redis 构建锁（详见 §12.1.1） |
 | 并发 profile 更新 | `INCR version` 原子 |
 | 并发未读数 bump | Lua 脚本 `INCR + DEL 旧 v key` 原子 |
@@ -4228,7 +4228,7 @@ T3'  R: Lua CAS: if GET version == v(n) then SET cacheKey ← ❌ v(n) ≠ v(n+1
 |---|---|
 | `BatchGetVideoStatsLogic` | Pipeline `HGetAll VideoStatsAuthKey(videoID)` 拿权威计数；MISS 走 Lua `videoStatsAuthCold*` 从 DB 冷备重建并 `EXPIRE VideoStatsAuthTTL`。 |
 | `ListCommentsLogic` | ① `GET CommentListVersionKey(videoID)` 得到版本 v；<br>② 拼 `CommentFirstPageCacheKey(videoID, v)` 查缓存；<br>③ MISS 时 `SET NX CommentFirstPageCacheBuildLockKey(cacheKey)` 分布式锁 + SingleFlight，回源 DB；<br>④ 回填用 Lua `KEYS = [CommentListVersionKey, cacheKey]`，脚本内部校验版本一致才写入，防止回填期间 bump 造成脏缓存。 |
-| `ListMyLikedVideosLogic` | ① `GET LikeUserVideosListVersionKey(userID)` → v；<br>② `GET LikeUserVideosPageCacheKey(userID, v, cursor, size)`；<br>③ MISS 时 `SET NX LikeUserVideosPageCacheBuildLockKey(cacheKey)` 抢锁 + SingleFlight；<br>④ 回填时同样用版本对齐 Lua 脚本写入。 |
+| `ListMyLikedVideosLogic` | ① `GET LikeUserVideosListVersionKey(userID)` → v；<br>② 仅当 `cursor_created_at=0 && cursor_like_id=0 && page_size≤20`（首页且 ≤ 窗口大小）时命中缓存：`GET LikeUserVideosFirstPageCacheKey(userID, v)`；历史页 / 大页直接查 MySQL 跳过缓存；<br>③ MISS 时 `SET NX LikeUserVideosFirstPageCacheBuildLockKey(cacheKey)` 抢锁 + SingleFlight，用 `page_size=20` 拉一份固定首页窗口；<br>④ 回填走 Lua 脚本 `KEYS = [LikeUserVideosListVersionKey, cacheKey, lockKey]`，同时校验版本一致 + `lockToken` 仍归自己所有才写入，防止陈旧版本 / 锁过期后被抢占者错写；<br>⑤ 小首页请求（page_size<20）从首页窗口截取 N 条返回，`has_more` 由窗口末条与 `HasMoreAfterWindow` 联合决定。 |
 | `IsLikedBatchLogic`（辅助） | Pipeline `GET LikeStateKey(videoID, userID)`；MISS 兜底查 MySQL 后 `SET LikeStateKey`。 |
 
 ##### （6）Kafka 消费侧：`job/interaction_sync`
@@ -4312,7 +4312,7 @@ T3'  R: Lua CAS: if GET version == v(n) then SET cacheKey ← ❌ v(n) ≠ v(n+1
 |---|---|---|
 | Account | `TokenKey` / `VerificationCodeKey` / **INCR** `AccountPublicProfileVersionKey` | `AccountPublicProfileKey(uid, v)` + `AccountPublicProfileVersionKey` |
 | Video | **INCR** `VideoEntityVersionKey` + **DEL** `VideoEntityKey / VideoDetailKey / VideoStatsAuthKey` | `VideoEntityKey(v)` + `VideoEntityVersionKey` |
-| Interaction 点赞 | `HINCRBY VideoStatsAuthKey` + `LikeState / LikeVideoUsers / LikeUserVideos` + `ZIncrBy HotVideoRealtimeKey` + **INCR** `LikeUserVideosListVersionKey` | `LikeState / LikeVideoUsers / LikeUserVideos` + `LikeUserVideosPageCacheKey(v)` + `LikeUserVideosListVersionKey` + `VideoStatsAuthKey` |
+| Interaction 点赞 | `HINCRBY VideoStatsAuthKey` + `LikeState / LikeVideoUsers / LikeUserVideos` + `ZIncrBy HotVideoRealtimeKey` + **INCR** `LikeUserVideosListVersionKey` | `LikeState / LikeVideoUsers / LikeUserVideos` + `LikeUserVideosFirstPageCacheKey(uid, v)`（仅首页 ≤20 条窗口） + `LikeUserVideosListVersionKey` + `VideoStatsAuthKey` |
 | Interaction 评论 | `HINCRBY VideoStatsAuthKey` + **INCR** `CommentListVersionKey` + `ZIncrBy HotVideoRealtimeKey` + `CommentIdempotencyKey` | `CommentFirstPageCacheKey(v)` + `CommentListVersionKey` + `VideoStatsAuthKey` + `CommentRateLimitKey` |
 | Social | `SocialFollowingStateKey` + **INCR** `AccountPublicProfileVersionKey`（双向） + **INCR** `SocialFollowersListVersionKey / SocialFollowingsListVersionKey` | `SocialFollowingStateKey` + `SocialFollowers/FollowingsFirstPageCacheKey(v)` + 对应 `ListVersionKey` |
 | Notification | **INCR** `UnreadCountVersionKey` | `UnreadCountKey(uid, v)` + `UnreadCountVersionKey` |
