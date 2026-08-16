@@ -3000,14 +3000,65 @@ sequenceDiagram
 
 #### 8.4.1 设计取舍与并发保护
 
-**为什么 accounts 双行 `FOR UPDATE` 要按 ID 升序？**
+**`lockFollowAccounts` 到底锁了什么，为什么双方都要锁？**
 
-经典死锁场景：A 关注 B 的同时 B 关注 A：
-- 事务 X（A→B）：先锁 A 行，再锁 B 行
-- 事务 Y（B→A）：先锁 B 行，再锁 A 行
-- 两个事务互等对方持有的锁 → **死锁**
+`lockFollowAccounts` 在 Follow/Unfollow 的 MySQL 事务开始阶段执行一次带 `FOR UPDATE` 的主键查询：
 
-`lockFollowAccounts` 强制按 `MIN(followerID, followingID) → MAX(...)` 顺序上锁，任何两个并发事务的加锁序列都相同，从根本上消除锁序反转。
+```sql
+SELECT id, follower_count, following_count, is_big_v
+FROM accounts
+WHERE id IN (:followerID, :followingID)
+ORDER BY id ASC
+FOR UPDATE;
+```
+
+它锁住的是 `accounts` 表中“关注者”和“被关注者”对应的**两条账户记录**，不是锁整张表。行锁从这条语句执行成功开始持有，直到当前事务 `COMMIT` 或 `ROLLBACK` 才释放。在此期间：
+
+- 其他事务对这两行执行 `UPDATE`、`DELETE` 或另一次 `SELECT ... FOR UPDATE` 时需要等待；
+- 普通非加锁 `SELECT` 仍可通过 InnoDB MVCC 读取自己的可见版本，不会因为这里的行锁全部阻塞；
+- 与这两个用户完全无关的账户行仍可并发处理，不受影响。
+
+锁双方而不是只锁被关注者，是因为一条真实关注关系会同时改变两侧账户状态：
+
+| 账户 | 本次 Follow 修改 | 本次 Unfollow 修改 |
+|---|---:|---:|
+| 关注者 `followerID` | `following_count + 1` | `following_count - 1` |
+| 被关注者 `followingID` | `follower_count + 1`，并可能晋升 `is_big_v=1` | `follower_count - 1` |
+
+与此同时，事务还要判断并修改 `follows` 关系、维护双方冗余计数并写业务/通知 Outbox。只有先获得双方账户行锁，才能让“关系状态、双向计数、大 V 判定、派生事件”作为一个不可被同类写事务穿插的整体完成。
+
+`accounts` 行还承担了这对用户的**稳定事务互斥点**。首次关注时 `(follower_id, following_id)` 对应的 `follows` 行尚不存在，无法对不存在的记录加普通记录锁；如果直接对联合唯一索引执行 `SELECT ... FOR UPDATE`，在默认隔离级别下还可能引入 gap lock，并与后续 `INSERT` 的插入意向锁冲突。账户行始终存在，因此可以先用它们串行化同一关系，再对 `follows` 做普通查询和必要的插入/更新。
+
+这个锁对典型并发的影响如下：
+
+| 并发请求 | 共享的账户行 | 实际效果 |
+|---|---|---|
+| A→B 与 C→B | B | 在 B 行上排队，串行维护 B 的 `follower_count` |
+| A→B 与 A→C | A | 在 A 行上排队，串行维护 A 的 `following_count` |
+| A→B 的 Follow 与 A→B 的 Unfollow | A、B | 后到事务等前一个提交，再读取最新关系状态，避免关系与计数方向相反 |
+| A→B 与 B→A | A、B | 必须按统一顺序抢锁，否则可能形成环路死锁 |
+| A→B 与 C→D | 无 | 两个事务可以真正并行执行 |
+
+例如同一关系的 Follow 和 Unfollow 如果不串行，两个事务可能都基于旧的 `follows` 状态作出判断：一个准备 `+1`，另一个准备 `-1`，最终关系状态、双方计数和 Outbox 事件可能不再描述同一个结果。双账户行锁使后到事务必须等前一个事务提交，然后基于最新状态重新判断；重复 Follow/Unfollow 也因此能够正确走幂等分支。
+
+`updateFollowAccountCounters` 虽然使用 `field = field + delta` 和一条 CASE UPDATE，能够避免单条计数语句本身的 Lost Update，但它不能替代上述行锁：原子加减只能保护“这一次算术”，无法保护算术之前的关系状态判断、锁内 `follower_count/is_big_v` 快照、大 V 晋升决策以及随后写入的 Outbox。这里需要的是**整个多步骤事务的串行化**，不只是一个字段的原子自增。
+
+函数查询时还顺便完成两个工作：查不到两条账户记录就返回 `gorm.ErrRecordNotFound`；查到后返回被关注者的 `follower_count/is_big_v` 锁内快照，让 Follow 在不额外查询数据库的情况下判断本次 `+1` 后是否首次达到大 V 阈值。
+
+**为什么 accounts 双行 `FOR UPDATE` 还必须按 ID 升序？**
+
+锁住双方解决了同一批状态的并发一致性，但如果不同事务用不同顺序获取这两把锁，反而会制造经典锁顺序反转。假设 `A.id=10`、`B.id=20`，A 关注 B 与 B 关注 A 同时发生：
+
+```text
+事务 X（A→B）：已经锁住 A，接下来等待 B
+事务 Y（B→A）：已经锁住 B，接下来等待 A
+```
+
+X 等 Y 释放 B，Y 又等 X 释放 A，形成等待环路；InnoDB 只能检测死锁并回滚其中一个事务。
+
+`lockFollowAccounts` 先计算 `MIN(followerID, followingID)` 和 `MAX(...)`，再通过 `ORDER BY id ASC FOR UPDATE` 强制所有事务使用同一全局顺序。上面的两个请求都会先尝试锁 ID=10，再锁 ID=20：一个事务先拿到并继续执行，另一个在第一把冲突锁上排队，不可能出现双方各持一把再互相等待的环路。
+
+主键升序本身没有业务含义，关键是它唯一、已有索引，而且能为所有调用路径提供确定且一致的锁顺序。该规则必须被 Follow、Unfollow 以及未来任何同时操作这两条账户行的路径共同遵守。固定锁序消除了这里最主要的双用户锁反转，但不能保证整个系统绝不出现其他索引或多表锁导致的死锁，因此外层仍保留针对 MySQL `1213/1205` 的有限退避重试。
 
 **为什么 `is_big_v` 是"只升不降"的标志位，而不是按实时 follower_count 判断？**
 
@@ -3062,12 +3113,12 @@ sequenceDiagram
 - Follow 根据锁内快照计算是否首次达到大 V 阈值，并在同一 CASE UPDATE 中只升不降；Unfollow 不回退 `is_big_v`。
 - `createSocialOutboxEvents` 把业务事件和通知事件合并为一次多值 INSERT，减少账户行锁持有期间的数据库往返。
 
-**同时移除了两个不必要的预检锁**：
+**同时移除了跨服务预检与不存在关系上的预锁**：
 
-- 旧实现在事务中先调 `AccountRpc.GetProfile` 预检目标用户是否存在，既多一次 RPC 往返，又在事务完成前可能造成长时间持锁。当前实现已删除预检，直接在 INSERT 命中外键/唯一键错误时把错误归一到 `codes.NotFound`。
+- 旧实现先调 `AccountRpc.GetProfile` 预检目标用户是否存在，增加了一次跨服务 RPC 往返，并且预检结果到本地事务真正开始之间仍存在状态变化窗口。当前实现不再跨服务预检，而是由事务内的 `lockFollowAccounts` 一次查询同时完成“双方存在性校验 + 双行加锁 + 被关注者快照读取”；不足两行时立即返回 `gorm.ErrRecordNotFound`。
 - 旧实现一开始就 `SELECT ... FOR UPDATE` 拉 follows 行，对不存在的唯一键会产生 **gap lock**，后续 `INSERT` 又升级为插入意向锁，导致高并发下频发 1213。当前实现改为**普通 `Take`**（不加锁）预读已存在关系，依靠 accounts 双行 FOR UPDATE 充当构件互斥。若不存在，使用 `INSERT ... ON DUPLICATE KEY DO NOTHING`，并在并发冲突的反馈（`RowsAffected == 0`）后才回读加锁处理。
 
-**关于“目标用户不存在”的错误反馈**：尽管写事务不再预检 `GetProfile`，Follow 接口末端仍然能识别目标不存在——INSERT 时会命中 follows 表的外键约束（`follows.following_id → accounts.id`）而直接报错，`Follow` 把它归一为 `codes.NotFound` “目标用户不存在”返回给上游。
+**关于“目标用户不存在”的错误反馈**：尽管写事务不再调用 `GetProfile`，`lockFollowAccounts` 要求主键集合必须返回两条账户记录，因此目标不存在会在任何 `follows` 写入之前被识别；Follow/Unfollow 再把 `gorm.ErrRecordNotFound` 归一为 `codes.NotFound` “目标用户不存在”返回给上游。数据库外键仍作为最后一道结构完整性兜底，但不再是正常业务路径识别目标不存在的主要手段。
 
 ---
 
