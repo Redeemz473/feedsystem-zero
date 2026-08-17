@@ -40,6 +40,7 @@
 15. [约定与最佳实践](#十五约定与最佳实践)
 16. [附录：核心代码文件索引](#十六附录核心代码文件索引)
 17. [最近更新（Changelog）](#十七最近更新changelog)
+18. [Docker 使用范围与运行边界](#十八docker-使用范围与运行边界)
 
 ---
 
@@ -5369,6 +5370,90 @@ go vet ./apps/... ./common/... ./tests/...
 - Social 引入固定顺序双账户行锁，Feed Timeline 增加 ready 丢失自愈，视频上传增加 Cleaning 等待、canonical URL 和文件魔数校验。
 - 当时新增的互动 delta pending/ack key 已被最终版本投影架构删除，不再属于当前 Redis 命名空间；保留这条记录仅用于说明演进原因。
 - Gateway 增加作者最新资料回填，`common/gormx` 增加可配置连接池上限。
+
+---
+
+## 十八、Docker 使用范围与运行边界
+
+### 18.1 当前结论
+
+本项目当前使用 Docker Compose **容器化并编排本地基础设施**，而不是把整套业务微服务全部容器化。`deploy/docker-compose.yml` 负责启动 MySQL、Redis、etcd、ZooKeeper 和 Kafka；Gateway、6 个 RPC、8 个 Job 以及 React 前端仍作为宿主机进程运行。
+
+因此，对当前部署形态最准确的描述是：
+
+> 使用 Docker Compose 编排 MySQL、Redis、etcd、Kafka、ZooKeeper 等基础设施，配置数据持久化、端口映射、关键服务健康检查及数据库初始化；Go 业务服务暂由宿主机统一启动脚本管理。
+
+不能把当前实现描述为“完成全部微服务容器化”“基于 Docker 部署整套业务系统”或“Kubernetes 集群部署”，因为仓库目前没有业务服务 Dockerfile，Compose 中也没有 Gateway、RPC、Job 和 Web 服务定义。
+
+### 18.2 Compose 中的容器
+
+| 容器 | 镜像 | 宿主机端口 | 持久化与职责 |
+|---|---|---:|---|
+| `feedsystem-zero-mysql` | `mysql:8.0` | `3308` | `mysql_data` 保存业务数据；首次创建空数据卷时自动执行 `deploy/sql` 下的初始化脚本 |
+| `feedsystem-zero-redis` | `redis:7-alpine` | `6380` | `redis_data` 保存 AOF；启用密码与 appendonly，承载缓存、统计投影、Timeline、热榜等数据 |
+| `feedsystem-zero-etcd` | `quay.io/coreos/etcd:v3.5.32` | `23790` | `etcd_data` 保存服务注册信息，为 go-zero RPC 提供服务注册与发现 |
+| `feedsystem-zero-zookeeper` | `confluentinc/cp-zookeeper:7.6.1` | `22181` | `zookeeper_data`、`zookeeper_log` 保存 Kafka 协调数据 |
+| `feedsystem-zero-kafka` | `confluentinc/cp-kafka:7.6.1` | `9094` | `kafka_data` 保存消息日志；关闭自动建 Topic，由项目脚本显式创建 6 个 Topic |
+
+除拉取镜像外，Compose 还统一处理以下本地环境职责：
+
+1. 为容器设置稳定名称和 `restart: unless-stopped` 重启策略。
+2. 通过端口映射同时支持容器内互联和宿主机上的 Go 服务访问。
+3. 为 MySQL、Redis、etcd、Kafka 配置健康检查，降低依赖尚未就绪时启动业务进程的概率。
+4. 使用命名数据卷保存数据库、AOF、Kafka 日志和 etcd 数据，普通重启不会丢失状态。
+5. 将 `deploy/sql` 只读挂载到 MySQL 初始化目录；需要注意，这些 SQL 只会在 MySQL 数据卷首次初始化时自动执行，已有数据库仍需按迁移顺序手动应用新增脚本。
+
+### 18.3 业务服务如何运行
+
+当前业务进程不在 Docker 网络中运行，而是在宿主机上连接映射端口：
+
+- Gateway、Account、Video、Interaction、Social、Notification、Feed 通过 Go 进程运行。
+- Outbox、Interaction Sync、Social Sync、Feed Timeline、HotRank、Notification、Asset Cleanup、Event Cleanup 通过独立 Go 进程运行。
+- `scripts/start_all.sh` 负责统一启动、停止、查看状态和收集日志；默认还会调用 Compose 启动依赖、等待关键端口就绪并创建 Kafka Topic，它是当前项目的本地一键编排入口。
+- React 前端通过 Node/Vite 开发服务器运行，不在当前 Compose 文件中。
+
+这种方式适合当前单机开发与压测：中间件版本和数据目录可重复创建，业务进程仍可直接使用调试器、`go test -race`、CPU Profile 和本地日志。它不等同于生产集群部署；生产化还需要补充业务镜像、多阶段构建、配置与密钥注入、容器健康探针、资源限额、日志采集以及滚动发布方案。
+
+### 18.4 常用命令与数据安全
+
+完整启动项目时，优先使用统一脚本：
+
+```bash
+# 启动基础设施、创建 Kafka Topic、构建并启动全部 Go 业务进程
+./scripts/start_all.sh start
+
+./scripts/start_all.sh status
+./scripts/start_all.sh stop
+```
+
+只需要单独管理基础设施容器时，可以直接使用 Compose：
+
+```bash
+# 启动基础设施容器
+sudo docker-compose -f deploy/docker-compose.yml up -d
+
+# 显式创建 Kafka Topic；脚本可重复执行
+sudo bash deploy/kafka/create_topics.sh
+
+# 查看容器状态
+sudo docker-compose -f deploy/docker-compose.yml ps
+
+# 停止并删除容器，但保留命名数据卷
+sudo docker-compose -f deploy/docker-compose.yml down
+```
+
+不要在仍需保留本地数据时执行下面的命令：
+
+```bash
+# 会同时删除 MySQL、Redis、Kafka、etcd、ZooKeeper 的命名数据卷
+sudo docker-compose -f deploy/docker-compose.yml down -v
+```
+
+基础设施已经运行、只想重新启动 Go 业务进程时，使用 `--no-deps` 跳过 Docker 与 Topic 初始化：
+
+```bash
+./scripts/start_all.sh start --no-deps
+```
 
 ---
 
