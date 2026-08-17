@@ -308,6 +308,7 @@ func refreshFollowingTimelineTTL(ctx context.Context, svcCtx *svc.ServiceContext
 	}
 }
 
+// 所有Timeline的冷启动重建
 func ensureTimeline(
 	ctx context.Context,
 	svcCtx *svc.ServiceContext,
@@ -332,6 +333,7 @@ func ensureTimeline(
 
 	// passiveOnly=true 表示当前 Timeline 由外部（Job）单点负责冷启动，rpc 侧只做等待。
 	// 这样避免 rpc 与 job 争抢同一把 build lock 导致相互阻塞。
+	// 用户关注流自己抢锁，全局热榜由 Job 负责
 	if passiveOnly {
 		if err := waitTimelineReady(ctx, svcCtx, readyKey); err != nil {
 			logx.WithContext(ctx).Errorf("wait timeline ready failed, build_group:%s error:%v", buildGroupKey, err)
@@ -346,6 +348,7 @@ func ensureTimeline(
 			return nil, err
 		}
 
+		//抢分布式锁
 		lockToken, locked, err := acquireTimelineBuildLock(ctx, svcCtx, lockKey)
 		if err != nil {
 			return nil, err
@@ -356,11 +359,13 @@ func ensureTimeline(
 		defer releaseTimelineBuildLock(ctx, svcCtx, lockKey, lockToken)
 
 		for attempt := 0; attempt < timelineBuildMaxAttempts; attempt++ {
+			//记录开始时的版本
 			version, err := loadTimelineVersion(ctx, svcCtx, versionKey)
 			if err != nil {
 				return nil, err
 			}
 
+			//从mysql全量拉数据
 			dbCtx, cancel := context.WithTimeout(ctx, feedDBTimeout(svcCtx))
 			members, err := loadMembers(dbCtx)
 			cancel()
@@ -368,6 +373,7 @@ func ensureTimeline(
 				return nil, err
 			}
 
+			//生成随机token，写到临时ZSet里
 			token, err := randomTimelineToken()
 			if err != nil {
 				return nil, err
@@ -377,6 +383,7 @@ func ensureTimeline(
 				return nil, err
 			}
 
+			//Lua脚本，版本匹配才替换
 			applied, err := replaceTimelineIfVersionMatch(
 				ctx, svcCtx, versionKey, timelineKey, readyKey, currentTempKey, version, ttl,
 			)

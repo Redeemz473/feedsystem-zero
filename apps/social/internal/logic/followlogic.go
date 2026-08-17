@@ -85,8 +85,7 @@ func (l *FollowLogic) Follow(in *social.FollowReq) (*social.FollowResp, error) {
 		}
 
 		var follow model.Follow
-		// 双方账户行已经充当该关注关系的事务互斥锁。这里使用普通查询，避免
-		// 对不存在的联合唯一键加 gap lock，随后 INSERT 时形成插入意向死锁。
+		// 双方账户行已经充当该关注关系的事务互斥锁。这里使用普通查询，避免对不存在的联合唯一键加 gap lock，随后 INSERT 时形成插入意向死锁。
 		err = tx.
 			Where("follower_id = ? AND following_id = ?", followerID, followingID).
 			Take(&follow).Error

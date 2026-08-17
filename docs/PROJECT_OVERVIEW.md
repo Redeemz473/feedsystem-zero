@@ -3865,6 +3865,179 @@ UNIQUE KEY uk_event_consumer (event_id, consumer_name)
 
 **总结一句话**：Outbox 保证消息一定进 Kafka（可能重复），consumer 用 `processed_events` 兜住重复，遇到永远失败的坏消息用 `dead_letter_events` 隔离，任何分区都不会被单条消息卡死。整套机制之所以能做到高吞吐同时不丢不重，前提就是本节开头那一条：**RPC 里的业务写入和 outbox 事件写入必须在同一个本地事务内**。
 
+#### 9.1.6 从 Outbox 到 Kafka Consumer：跨事务保序与并发吞吐的传导链
+
+前面几节讲了 Outbox 表本身的调度机制，本节把视角拉长——**一条事件从 outbox 行到 Kafka partition，再到 consumer worker 的处理流程**，重点回答一个问题：
+
+> 点赞和取消赞是两个独立事务写入 `outbox_events` 表的**两行**，为什么最终 consumer 一定能按"先点赞、后取消赞"的顺序消费？既然要保序，consumer 端又是怎么并发提升吞吐的？
+
+答案是四层机制层层传导，任何一层缺失顺序都会崩：**同 aggregate 保序 claim → aggregate_id 作 partition key → topic+partition 分组保序 → worker pool 组间并发**。
+
+##### 一、身份三元组：一条事件如何被识别
+
+每条 outbox 事件带三层身份，分别用于不同链路环节：
+
+| 身份字段 | 例子 | 用途 |
+|---|---|---|
+| **EventID** | `like:20260817-abc123...` | 全局唯一，用于 consumer 侧 `processed_events` 幂等去重 |
+| **AggregateID** | `100:42`（videoID:userID） | Kafka partition key + 保序单元；同 aggregate 的所有事件必然进同一 partition |
+| **EventType / Action / Delta** | `like.created` / `Like` / `+1` | 业务语义；consumer 按 Delta 累加得到净增量做一次 UPDATE |
+
+**幂等靠 EventID、保序靠 AggregateID、语义靠 EventType**——三者各司其职。像点赞聚合的 AggregateID 用 `videoID:userID` 而不是单独 `videoID` 是刻意选择：只有同一用户对同一视频的相邻操作才存在"必须保序"的因果关系（点赞→取消→点赞的最终状态取决于最后一次），跨用户跨视频完全可以乱序不影响正确性。用 `videoID` 单独做 key 会把热点视频的所有点赞都挤到一个 partition 造成热点；用 `userID` 单独做 key 又会把同用户对不同视频的独立操作错误地串行化。当前粒度是**保序开销只花在真正需要保序的地方**。
+
+##### 二、跨事务保序的核心：`NOT EXISTS` 谓词
+
+用户 U=42 对视频 V=100 在极短时间内点赞后又取消：
+
+```
+t=1  事务 A：INSERT outbox_events(id=1001, aggr="100:42", type=like.created, status=pending)
+     COMMIT
+t=2  事务 B：INSERT outbox_events(id=1002, aggr="100:42", type=like.deleted, status=pending)
+     COMMIT
+```
+
+这是**两个独立事务写入的两行**。如果 dispatcher 多实例并发 claim，完全可能 dispatcher-1 认领 id=1001、dispatcher-2 认领 id=1002，然后由于网络、GC、调度差异，dispatcher-2 先把 `like.deleted` 写入 Kafka，dispatcher-1 后把 `like.created` 写入——**Kafka partition 里的 offset 顺序就反了**。仅靠 partition key 无法解决这个问题：partition key 只保证"进同一 partition"，**不保证进入 partition 的先后顺序**。
+
+真正解决问题的是 `dueOutboxScope` 里的 `NOT EXISTS` 子查询：
+
+```sql
+NOT EXISTS (
+    SELECT 1 FROM outbox_events AS predecessor
+    WHERE predecessor.aggregate_type = outbox_events.aggregate_type
+      AND predecessor.aggregate_id   = outbox_events.aggregate_id
+      AND predecessor.id             < outbox_events.id
+      AND predecessor.status IN (pending, failed, dead, processing)
+)
+```
+
+**语义**：一条 outbox 记录能被 claim 的必要条件是——**同 aggregate 下所有 `id` 更小的记录都已经进入 `sent` 状态**。也就是说**同一个 (aggregate_type, aggregate_id) 任意时刻最多只有一条记录可以被投递**，前一条不 sent，后一条永远拿不到"投递许可证"。
+
+回到上面的例子：
+
+| 时刻 | id=1001 状态 | id=1002 是否可 claim | 原因 |
+|---|---|---|---|
+| t=2 之后 | pending | ❌ | 前驱 1001 是 pending，NOT EXISTS 不成立 |
+| dispatcher-1 认领 1001 后 | processing | ❌ | 前驱 1001 是 processing，NOT EXISTS 不成立 |
+| dispatcher-1 投递成功、markSent 之后 | sent | ✅ | 前驱 1001 是 sent，NOT EXISTS 成立 |
+
+这样就把"两个独立事务写的两行"硬约束成了**按 `id` 递增的严格串行流水线**。`id` 的严格递增又由业务链路本身保证：用户点赞是同步 RPC，客户端必须等第一次响应返回才能发第二次请求，所以第二个事务 INSERT 时 MySQL auto_increment 必然分配到更大的 id。**业务操作顺序 → RPC 事务串行提交 → outbox id 严格递增 → NOT EXISTS 顺序 claim → Kafka offset 顺序前进**这条因果链完整闭合。
+
+值得注意的是 `NOT EXISTS` 里把 `dead` 也算作"未完成"——这是刻意为之。如果某条 `like.created` 因坏 payload 或长期 Kafka 故障进入 dead，**后续同 aggregate 的 `like.deleted` 会被强制阻塞、等待人工介入**，宁可整条 aggregate 停摆也不允许"跳过点赞发取消赞"这种破坏因果的事发生。
+
+##### 三、投递到 Kafka：partition key 双保险
+
+Claim 到事件后，`publishEvents` 组装消息发到 Kafka：
+
+```go
+messages = append(messages, kafkax.Message{
+    Topic: event.Topic,
+    Key:   []byte(event.AggregateID),   // ← partition key
+    Value: []byte(event.Payload),
+    Headers: []kafkax.Header{{...event_id / event_type / aggregate_type / aggregate_id}},
+})
+```
+
+Kafka 的分区规则是 `partition = hash(Key) mod partitionCount`。因此 `AggregateID` 相同的消息**必然进同一个 partition**，加上前面 `NOT EXISTS` 保证的**顺序离开 outbox 表**，两层叠加就形成完整的保序传导：
+
+- **DB 层 NOT EXISTS**：同 aggregate 消息按 outbox id 顺序**逐条离开 outbox 表**（前一条不 sent、后一条不能 claim）；
+- **Kafka 层 partition key**：同 aggregate 消息**必然进入同一 partition**（否则跨 partition 就没有顺序可言）。
+
+**两者缺一不可**：只有 partition key 没有 NOT EXISTS，投递顺序会乱；只有 NOT EXISTS 没有 partition key，投递顺序对但消息进了不同 partition，Kafka 仍无法保证跨 partition 顺序。
+
+##### 四、Consumer 侧：topic+partition 组内保序，组间并发
+
+Kafka 只保证**单个 partition 内消息有序**，不保证跨 partition。所以 consumer 端不能对同一 partition 的消息并发处理，否则会破坏 Kafka 精心维持的顺序性。以 `interaction_sync` 的 `HandleBatch` 为例：
+
+**步骤 1：一次拉一批**（`RunBatch` 攒够 `Sync.BatchSize=500` 或 `FlushMs=1000ms` 触发）
+一批可能横跨多个 topic + partition，混合了不同 aggregate 的消息。
+
+**步骤 2：按 `topic:partition` 分组**（`groupMessagesByTopicPartition`）
+
+```go
+func messageGroupKey(msg kafkax.Message) string {
+    return fmt.Sprintf("%s:%d", msg.Topic, msg.Partition)
+}
+```
+
+把 500 条消息拆成若干个"保序小队列"，每个队列内部保持 Kafka 原始拉取顺序（同 partition 消息按 offset 递增排列，`append` 尾插不打乱顺序）。**组内不需要主动排序**——slice 里的顺序天然就是 offset 递增顺序。
+
+**为什么 group key 用 `topic:partition` 而不是只用 `partition`？**因为 consumer 同时订阅了 `interaction.like.events` 和 `interaction.comment.events` 两个 topic，两者各自都有 partition 0~5，只用 partition 号会错误合并 `like.events:0` 和 `comment.events:0`——虽然合并后处理不会破坏顺序（两者是不同事件类型），但会不必要地降低并发度。
+
+**步骤 3：worker pool 组间并发**
+
+```go
+workerCount := normalizeSyncWorkerCount(c.svcCtx.Config.Sync.WorkerCount, len(groups))
+// 默认 4，且不超过 groups 数量
+for i := 0; i < workerCount; i++ {
+    go func() {
+        for group := range jobs {
+            c.handleMessageGroup(ctx, group)  // 单个 group 内部串行 flush
+        }
+    }()
+}
+```
+
+- 每个 worker 从 `jobs` channel 领取**一整组**消息，独占地、顺序地处理完这一组；
+- 不同 worker 处理不同的组，彼此完全并行；
+- **任何时刻同一个 partition 只会被一个 worker 处理**——保序不破，并发不减。
+
+**worker 数为什么设 4 而 partition 有 6 个？** 一个 partition 一次只能被一个 worker 处理，多余 worker 也没用；但也不需要严格等于 partition 数，因为一批 500 条消息通常不会平均散布到全部 6 个 partition。`normalizeSyncWorkerCount(workerCount, groupCount)` 取两者的较小值，分组少时不会启满 4 个 worker，避免 goroutine 空转。
+
+##### 五、四层机制的因果传导全景
+
+```mermaid
+flowchart TD
+    subgraph L1[层 1: DB 层跨事务保序]
+        A1[事务 A: INSERT id=1001 like.created]
+        A2[事务 B: INSERT id=1002 like.deleted]
+        A1 --> NE["dispatcher SELECT ... NOT EXISTS<br/>同 aggregate 严格按 id 递增 claim"]
+        A2 --> NE
+    end
+
+    NE --> L2
+
+    subgraph L2[层 2: Kafka 层 partition key]
+        PK["Key=aggregate_id=100:42<br/>hash 到同一 partition"]
+    end
+
+    PK --> P3
+
+    subgraph L3[层 3: Kafka partition 内 offset 有序]
+        P3["Partition 3:<br/>offset=X   id=1001 like.created<br/>offset=X+K id=1002 like.deleted<br/>顺序等于 outbox id 递增顺序"]
+    end
+
+    P3 --> HB
+
+    subgraph L4[层 4: Consumer 组内保序 组间并发]
+        HB[HandleBatch 拉 500 条混合消息]
+        HB --> G["按 topic:partition 分组<br/>组内保 offset 递增顺序"]
+        G --> G3["组 like:3<br/>1001 → 1002 保序"]
+        G --> G1[组 like:1 其他 aggregate]
+        G --> G5[组 like:5 其他 aggregate]
+        G3 --> W1[Worker A 串行处理组 3]
+        G1 --> W2[Worker B 处理组 1]
+        G5 --> W3[Worker C 处理组 5]
+        W1 -.同一 partition 只有一个 worker.-> DB[(MySQL + processed_events 幂等)]
+        W2 --> DB
+        W3 --> DB
+    end
+```
+
+**四层机制的角色分工**：
+
+| 层 | 机制 | 保证的性质 | 缺失会怎样 |
+|---|---|---|---|
+| 1 | `NOT EXISTS` 谓词 | 同 aggregate 严格按 outbox id 顺序离开表 | dispatcher 并发投递会乱序（先取消赞后点赞） |
+| 2 | partition key = aggregate_id | 同 aggregate 消息进同一 partition | 消息分散到多 partition，跨 partition 无序 |
+| 3 | Kafka partition 内 offset 有序 | 单 partition 内消息按写入顺序读出 | Kafka 协议保证，无需自己维护 |
+| 4 | topic+partition 分组 + worker pool | 组内保序（正确性）+ 组间并发（吞吐） | 单 partition 内并发会打乱顺序；不分组则退化为单线程消费 |
+
+**每一层解决前一层无法解决的问题，每一层又依赖前一层的输出作为输入**——保序是正确性底线（不允许妥协），并发是性能上限（在保序前提下榨干 CPU），四层叠加起来在两者之间取了最优的平衡点。
+
+##### 六、一句话总结
+
+**跨事务保序**靠 `NOT EXISTS` 谓词把 outbox 表变成 aggregate 粒度的严格串行流水线；**跨节点保序**靠 Kafka partition key = AggregateID 让同聚合消息必然进同一 partition；**消费端保序 + 并发**靠 topic+partition 分组：组内交给同一个 worker 串行处理保住 Kafka 顺序，组间用 worker pool 并行处理榨干吞吐。这条从 MySQL 两行 INSERT 到 consumer worker 处理的完整因果链，是本项目"最终一致性但业务顺序绝不错乱"的核心保证。
+
 ### 9.2 Consumer 通用模式
 
 所有消费者都遵循：

@@ -26,8 +26,7 @@ func NewGetFollowingFeedLogic(ctx context.Context, svcCtx *svc.ServiceContext) *
 }
 
 // GetFollowingFeed 返回 viewer 的关注流。
-// 推拉结合：小 V 视频通过 inbox 推送；大 V（accounts.is_big_v = 1）视频由读侧
-// 按需拉取该作者的 outbox 并与 inbox 做归并合并，避免对大 V 的每次发布做扇出风暴。
+// 推拉结合：小 V 视频通过 inbox 推送；大 V（accounts.is_big_v = 1）视频由读侧按需拉取该作者的 outbox 并与 inbox 做归并合并，避免对大 V 的每次发布做扇出风暴。
 // is_big_v 只升不降，因此掉粉的大 V 仍会被读侧合并 outbox，历史视频不会消失。
 func (l *GetFollowingFeedLogic) GetFollowingFeed(in *feed.GetFollowingFeedReq) (*feed.GetFollowingFeedResp, error) {
 	viewerID := in.GetViewerId()

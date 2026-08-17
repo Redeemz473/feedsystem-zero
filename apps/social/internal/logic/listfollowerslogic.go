@@ -37,8 +37,7 @@ func NewListFollowersLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Lis
 // viewer_is_following 不进入公共缓存，而是按当前 viewer_id 动态批量计算。
 //
 // 缓存失效规则：
-// Follow/Unfollow 的 MySQL 事务提交且关系真实发生变化后，
-// applyFollowCacheAfterCommit 会执行：
+// Follow/Unfollow 的 MySQL 事务提交且关系真实发生变化后，applyFollowCacheAfterCommit 会执行：
 // INCR SocialFollowersListVersionKey(followingID)
 // INCR SocialFollowingsListVersionKey(followerID)
 // 旧版本首页缓存不扫描删除，等待自身 TTL 自动淘汰。

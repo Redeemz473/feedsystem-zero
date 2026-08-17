@@ -58,10 +58,8 @@ func (l *ListFollowingsLogic) ListFollowings(in *social.ListFollowingsReq) (*soc
 	useFixedWindow := false
 	cacheWriteAllowed := false
 	var lockKey, lockToken string
-	//  仅首页读取 SocialFollowingsListVersionKey 和
-	//  SocialFollowingsFirstPageCacheKey。所有首页 page_size 共用一份
-	//  固定 50 条窗口，缓存只保存基础关系和 has_more_after_window，
-	//  不保存请求级 has_more、下一页游标和 viewer_is_following。
+	//  仅首页读取 SocialFollowingsListVersionKey 和SocialFollowingsFirstPageCacheKey。所有首页 page_size 共用一份
+	//  固定 50 条窗口，缓存只保存基础关系和 has_more_after_window，不保存请求级 has_more、下一页游标和 viewer_is_following。
 	//  命中后按 page_size 切片，并动态计算响应游标和 has_more。
 	if !hasCursor {
 		if currentVersion, ok := l.getFollowingsListVersion(userID); ok {

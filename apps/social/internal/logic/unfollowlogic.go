@@ -80,8 +80,7 @@ func (l *UnfollowLogic) Unfollow(in *social.UnfollowReq) (*social.UnfollowResp, 
 		}
 
 		var follow model.Follow
-		// 同一关系的写入已经被双方账户行串行化，普通查询即可；对不存在关系
-		// 执行 FOR UPDATE 会持有 gap lock，并阻塞并发 Follow 的 INSERT。
+		// 同一关系的写入已经被双方账户行串行化，普通查询即可；对不存在关系执行 FOR UPDATE 会持有 gap lock，并阻塞并发 Follow 的 INSERT。
 		err := tx.
 			Where("follower_id = ? AND following_id = ?", followerID, followingID).
 			Take(&follow).Error
