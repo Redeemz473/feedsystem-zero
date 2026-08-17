@@ -269,8 +269,8 @@ func ensureGlobalTimeline(ctx context.Context, svcCtx *svc.ServiceContext) error
 }
 
 // 用户首次访问或 Timeline 过期时，通过本地 SingleFlight 和 Redis 分布式锁
-// 从 MySQL 的 follows + videos 构建快照，并用版本号避免覆盖并发写入。
-// ensureFollowingTimeline 在用户 Timeline 未初始化或已过期时，从 MySQL 关注关系构建完整快照。
+// 从 MySQL 的 follows + videos 构建小 V inbox 快照，并用版本号避免覆盖并发写入。
+// 大 V 视频不写入 inbox，由读侧从作者 outbox 拉取后归并。
 func ensureFollowingTimeline(ctx context.Context, svcCtx *svc.ServiceContext, userID uint64) error {
 	if userID == 0 {
 		return status.Error(codes.Unauthenticated, "未登录")
@@ -365,7 +365,7 @@ func ensureTimeline(
 				return nil, err
 			}
 
-			//从mysql全量拉数据
+			// 从 MySQL 拉取受容量上限约束的完整冷启动快照。
 			dbCtx, cancel := context.WithTimeout(ctx, feedDBTimeout(svcCtx))
 			members, err := loadMembers(dbCtx)
 			cancel()
@@ -430,12 +430,15 @@ func loadFollowingTimelineMembers(ctx context.Context, svcCtx *svc.ServiceContex
 		Table("videos AS v").
 		Select("v.id", "v.author_id", "v.status", "v.deleted_at", "v.created_at").
 		Joins("JOIN follows AS f ON f.following_id = v.author_id").
+		Joins("LEFT JOIN accounts AS a ON a.id = v.author_id").
 		Where("f.follower_id = ? AND f.status = ? AND f.deleted_at IS NULL", userID, model.FollowStatusActive).
+		// 与 Job 的判定保持一致：账号记录异常缺失时保守视为小 V，避免视频无处可读。
+		Where("COALESCE(a.is_big_v, 0) = 0").
 		Where("v.status = ? AND v.deleted_at IS NULL", model.VideoStatusNormal).
 		Order("v.created_at DESC, v.id DESC").
 		Limit(int(limit)).
 		Find(&videos).Error; err != nil {
-		return nil, fmt.Errorf("查询关注流快照失败: %w", err)
+		return nil, fmt.Errorf("查询小V关注流快照失败: %w", err)
 	}
 	return timelineMembersFromVideos(videos)
 }

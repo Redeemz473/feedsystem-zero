@@ -100,6 +100,19 @@ end
 return 1
 `
 
+// invalidateUserTimelineScript 用于无法按 member 精确清理的边界场景。
+// 先递增版本再删除 inbox/ready，能够让并发冷启动的版本校验失败并重试；
+// 下一次读请求会只按当前有效的小 V 关注关系重建 inbox。
+const invalidateUserTimelineScript = `
+redis.call("INCR", KEYS[2])
+redis.call("DEL", KEYS[1], KEYS[3])
+local ttl = tonumber(ARGV[1])
+if ttl and ttl > 0 then
+    redis.call("EXPIRE", KEYS[2], ttl)
+end
+return 1
+`
+
 // mutateAuthorOutboxScript 与用户 Timeline 脚本同构：
 //   - 版本号无条件递增，冷启动检测到版本变化会走版本比较分支重试；
 //   - outbox ZSet 只在 ready 标记存在时写入，避免部分写入产生脏数据；
@@ -306,7 +319,10 @@ func (c *TimelineConsumer) applyFollowEvent(ctx context.Context, event eventx.Fo
 		return err
 	}
 
-	// 大 V 无需 inbox 回填 / 清理：读侧会自动 union / 剔除该作者的 outbox。
+	// 大 V 关注时无需 inbox 回填，读侧会自动 union 该作者的 outbox。
+	// 取关时仍要让 inbox 失效：作者可能在晋升大 V 前曾向该用户 push，旧版冷启动
+	// 也可能把大 V 视频写入 inbox。直接失效并按当前小 V 集合重建，比扫描作者全部
+	// 历史视频逐条 ZREM 更完整，也能与并发构建通过版本号正确互斥。
 	// is_big_v 只升不降，即使该作者后续掉粉低于阈值，已经入 outbox 的历史视频仍可被读到，
 	// 不会像直接比较 follower_count 那样出现阈值反向穿越导致视频消失。
 	isBigV, err := c.loadAuthorBigVFlag(ctx, event.FollowingID)
@@ -314,6 +330,9 @@ func (c *TimelineConsumer) applyFollowEvent(ctx context.Context, event eventx.Fo
 		return err
 	}
 	if feedx.IsBigCreator(isBigV) {
+		if !followed {
+			return c.invalidateUserTimeline(ctx, event.FollowerID)
+		}
 		return nil
 	}
 
@@ -500,6 +519,28 @@ func (c *TimelineConsumer) mutateUserTimelines(ctx context.Context, userIDs []ui
 
 func (c *TimelineConsumer) mutateUserTimeline(ctx context.Context, userID uint64, action string, members []string) error {
 	return c.mutateUserTimelines(ctx, []uint64{userID}, action, members)
+}
+
+func (c *TimelineConsumer) invalidateUserTimeline(ctx context.Context, userID uint64) error {
+	if userID == 0 {
+		return nil
+	}
+	redisCtx, cancel := context.WithTimeout(ctx, c.redisTimeout())
+	defer cancel()
+	_, err := c.svcCtx.RedisCli.Eval(
+		redisCtx,
+		invalidateUserTimelineScript,
+		[]string{
+			rediskey.FeedTimelineKey(userID),
+			rediskey.FeedTimelineVersionKey(userID),
+			rediskey.FeedTimelineReadyKey(userID),
+		},
+		strconv.FormatInt(int64(c.userTimelineTTL()/time.Second), 10),
+	).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("invalidate user timeline failed, user_id:%d: %w", userID, err)
+	}
+	return nil
 }
 
 // mutateAuthorOutbox 对大 V 的 outbox 进行 add / remove。

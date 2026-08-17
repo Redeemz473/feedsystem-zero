@@ -765,7 +765,7 @@ func publicProfileDBLoadKey(userIDs []uint64) string {
 flowchart TD
     Start["客户端选中视频文件"] --> Hash["本地读文件 → 计算 SHA256(fileHash) 获取 fileSize / filename"]
     Hash --> Init["POST /upload/init 只发 { fileHash, fileSize, filename, chunkSize } —— 一次几十字节的元信息请求"]
-    Init --> Q1{"服务端查 Redis + MySQL 是否已有同 hash 且 Active/PendingDelete?"}
+    Init --> Q1{"服务端查 MySQL 是否已有同 hash 且 Active，并用 os.Stat 确认磁盘文件存在?"}
     Q1 -- "命中 (EnableInstantUpload=true)" --> Instant["✅ 真·秒传 返回 { Needupload:false, Needchunk:false, Playurl } 客户端 0 字节文件内容传输"]
     Q1 -- "未命中" --> Q2{"fileSize > ChunkThresholdBytes?"}
     Q2 -- "小文件" --> Small["返回 { Needupload:true, Needchunk:false } → 客户端 POST /upload/video (multipart) 整体一次性上传"]
@@ -796,7 +796,7 @@ flowchart TD
    - 保留写路径的价值是"**缓存已经热着**"——未来如果想启用 Redis 加速（在函数开头加 `GET` 短路 MySQL 查询），不需要冷启动预热，改动只有几行；也方便运维/外部系统旁路查询 hash → URL 映射。
 5. **秒传 TTL（默认 7 天）过期后不影响秒传能力**。因为读路径本来就直接查 MySQL，Redis 有没有、准不准都不影响判定结果。TTL 的作用只是限制**写入 Redis 后的最长驻留时间**，避免 asset_cleanup 之外的意外场景（比如运维手改 DB）留下过久的脏缓存。这个 TTL 从来不是秒传能否命中的门槛。
 6. **分片路径的断点续传**：`/upload/init` 内 `reuseUploadSession` 会查 `fsz:chunkupload:session:{userID}:{fileHash}`，如果存在同一会话且元数据（fileHash/fileSize/finalExt/chunkSize）**强一致校验**通过，就返回已存在的 `uploadID` + 已上传的分片编号数组，客户端只需补传缺失分片。任一元数据不一致则视为新会话。
-7. **上传路径与 `ref_count` 的边界**：无论走哪条路，`file_assets.ref_count` 的 `+=1` 都**不在上传时发生**，而是在后续 `/video/publish` 调用 video-rpc `PublishVideo` 的事务里完成。这样"上传成功但没发布"的孤立资产会在 Grace 期后被 asset_cleanup 回收，不会长期占存储。
+7. **上传路径与 `ref_count` 的边界**：无论走哪条路，`file_assets.ref_count` 的 `+=1` 都**不在上传时发生**，而是在后续 `/video/publish` 调用 video-rpc `PublishVideo` 的事务里完成。当前 `asset_cleanup` 只处理 `PendingDelete`、超时 `Cleaning` 和 Active 巡检；上传完成但从未发布的资产会保持 `Active, ref_count=0`，不会自动进入 Grace 清理。若要治理这类孤立上传，需要后续增加 `uploaded_at/expires_at` 或单独的 orphan 扫描条件，不能把现有 Grace 机制描述成已经覆盖该场景。
 
 **举个连贯的例子**（用户 A 首发、用户 B 秒传）：
 
@@ -1501,14 +1501,14 @@ T4：用户点开视频 → 404 事故
 
 | 状态 | 含义 | 可秒传 | 可被 asset_cleanup 抢占 |
 |---|---|---|---|
-| `Active(1)` | 正常引用中（ref_count 可为 0 但仍在 grace 期） | ✅ | ref_count=0 且过了 GraceSeconds |
+| `Active(1)` | 当前可用；ref_count 可大于 0，也可能是上传后尚未发布的 0 | ✅（还需 `os.Stat`） | 只参与 Active 巡检，不因 ref_count=0 自动进入延迟删除 |
 | `PendingDelete(2)` | 最后一个引用删除后标记待删 | ❌ | ✅ |
-| `Cleaning(4)` | 已被 asset_cleanup 临时抢占，即将物理删除 | ❌（轮询等待） | 只能同一抢占者推进 |
+| `Cleaning(4)` | asset_cleanup 已开始物理删除流程 | ❌（轮询等待） | 失败回退、超时可由后续实例重新处理 |
 | `Deleted(3)` | 已物理删除（**软删除标记，DB 行仍存在**） | ❌（但可被复活） | ❌ |
 
 **四状态在"上传路径 `upsertFileAsset`"视角下的判定与差异**：
 
-DB 中"记录存在与否"和"status 字段值"是**两件完全不同的事**——尤其是 `Deleted` 状态（DB 行还在、只是 status 字段值为 3）与"行被 asset_cleanup Job 从表里 `DELETE` 掉"（行彻底不存在）**必须严格区分**，这直接决定了 `upsertFileAsset` 的 SELECT 循环里走 `break` 还是 `return`：
+DB 中"记录存在与否"和"status 字段值"是**两件完全不同的事**。当前 asset_cleanup 只把记录更新为 `Deleted` 墓碑，**不会执行 `DELETE FROM file_assets`**；真正的 record not found 只表示该 hash 从未登记、数据被人工清理或发生了异常，而不是 Job 的正常状态迁移。
 
 | 情况 | DB 行 | 磁盘文件 | SELECT 结果 | upsertFileAsset 行为 |
 |---|---|---|---|---|
@@ -1516,13 +1516,13 @@ DB 中"记录存在与否"和"status 字段值"是**两件完全不同的事**�
 | **状态 = PendingDelete** | 存在（status=2） | 存在 | ✅ 拿到行 | `break` 出循环 → 走"复活"分支：`os.Stat` 校验磁盘文件 + CAS `WHERE id=? AND status=?` 改回 Active |
 | **状态 = Cleaning** | 存在（status=4） | 即将被 os.Remove | ✅ 拿到行 | **不 break**，进入 `select { ctx.Done, time.After(50ms) }` 轮询等待，直到状态变化或 5s 超时 |
 | **状态 = Deleted** | 存在（status=3） | 已被物理删除，但 DB 行仍作为"墓碑"保留 | ✅ 拿到行 | `break` 出循环 → 走"复活"分支：`os.Stat(storagePath)` 校验**本次刚落盘的新副本**在磁盘上，然后 CAS `Deleted → Active` |
-| **行被物理 DELETE** | ❌ 不存在（asset_cleanup 在极少数场景下会硬删行；或行还没被创建） | ❌ 不存在 | ❌ `record not found` | `return err` **退出整个函数**——调用方拿到错误后重试整个 `upsertFileAsset`，重试时段落 2 的 `INSERT ... ON CONFLICT DO NOTHING` 会成功走"全新插入"分支 |
+| **行不存在** | ❌ 不存在（hash 从未登记、被人工清理或异常丢失） | 未知 | ❌ `record not found` | 当前查询返回错误；正常首次登记应在前面的 `INSERT ... ON CONFLICT DO NOTHING` 分支完成 |
 
 **关键区别（回答"为什么 Deleted 是 break、record not found 是 return"）**：
 
 - **`Deleted` 状态是"软删除标记"**：DB 行还在表里，只是 `status` 字段值改成了 3、`deleted_at` 打了时间戳。此时 `existing` 有完整数据（`id/file_hash/file_type` 全都能读到），完全可以通过 CAS `UPDATE WHERE id=? AND status=Deleted` **原子复活**——`break` 出循环让复活路径继续处理。
-- **"行被物理 DELETE"是"硬删除"**：整行从表里消失，SELECT 返回 `gorm.ErrRecordNotFound`，`existing` 是零值结构体、没有任何有效字段可用来做后续决策——**必须 return** 让调用方从头重试。重试时 `file_hash` 唯一键约束已消失，段落 2 的幂等 INSERT 会插入全新行，走情况 A 完成登记。
-- **`Cleaning` 之所以既不 break 也不 return，而是"等"**：Job 的 `os.Remove` 已在飞行途中且不可撤销，上传路径贸然把 status 改回 Active 会导致"DB 说资产活着但磁盘文件被 Job 顺手删了"的错乱——唯一安全的选择是让 Job 先干完，等 status 稳定到 `Deleted`（或整行被 DELETE）后再决策。
+- **"行不存在"不是正常清理终态**：当前 Job 不会硬删除 `file_assets` 行；SELECT 返回 `gorm.ErrRecordNotFound` 时没有现成资产可供复活，应按未登记或异常数据处理。
+- **`Cleaning` 之所以既不 break 也不 return，而是"等"**：Job 的 `os.Remove` 已在飞行途中且不可撤销，上传路径贸然把 status 改回 Active 会导致"DB 说资产活着但磁盘文件被 Job 顺手删了"的错乱——唯一安全的选择是让 Job 先干完，等状态稳定到 `Deleted`、`PendingDelete` 或 `Active` 后再决策。
 
 **上传路径决策一览（配合 `upsertFileAsset` for 循环阅读）**：
 
@@ -1554,7 +1554,7 @@ stateDiagram-v2
     [*] --> Active : ① upsertFileAsset 段落 2 INSERT DO NOTHING 成功 （新 hash 首次登记）
 
     Active --> Active : ref_count += 1 （新视频引用同一资产）
-    Active --> PendingDelete : ② video-rpc SoftDeleteVideo ref_count 减到 0 deleted_at = now
+    Active --> PendingDelete : ② video-rpc DeleteVideo ref_count 减到 0 deleted_at = now
     Active --> Deleted : ③ asset_cleanup 巡检异常 reconcileActiveAsset： 磁盘丢失 AND 真实引用=0 （跳过 PendingDelete）
 
     PendingDelete --> Active : ⑥ asset_cleanup claimAsset 事务内二次校验真实引用>0 （Grace 期被复用，自纠错）
@@ -1564,8 +1564,8 @@ stateDiagram-v2
     Cleaning --> Deleted : ⑦ removeAssetFile 成功 UPDATE + DEL Redis 全局缓存
     Cleaning --> Cleaning : 抢占者崩溃 → 过 ClaimTimeout 被其他实例重抢
 
-    Deleted --> Active : ④/⑨ upsertFileAsset 段落 4 用户上传同 hash CAS 复活（os.Stat 校验通过后）
-    Deleted --> [*] : ⑩ 兜底 GC 长时间无复活 → 硬 DELETE 整行
+    PendingDelete --> Active : upsertFileAsset 用户重新上传同 hash CAS 复活
+    Deleted --> Active : ④ upsertFileAsset 用户上传同 hash CAS 复活（os.Stat 校验通过后）
 
     note right of Cleaning
       Gateway upsertFileAsset 遇到 Cleaning
@@ -1577,7 +1577,7 @@ stateDiagram-v2
     note left of PendingDelete
       不立即物理删除的原因：
       · 秒传 Grace 期允许"取消发布→再发布"
-      · asset_cleanup 单进程延迟清理
+      · asset_cleanup 定时延迟清理
     end note
 ```
 
@@ -1586,34 +1586,32 @@ stateDiagram-v2
 | # | From → To | 触发者 | 前置条件 | 代码位置 |
 |---|---|---|---|---|
 | ① | ∅ → Active | Gateway 上传路径 | 该 hash 从未在 `file_assets` 存在 | `upsertFileAsset` 段落 2：`INSERT ... ON CONFLICT DO NOTHING`，`RowsAffected==1` |
-| ② | Active → PendingDelete | video-rpc 软删除 | 视频软删除后该资产 `ref_count` 减到 0 | `SoftDeleteVideo` 事务内 `UPDATE status=PendingDelete, deleted_at=NOW()` |
+| ② | Active → PendingDelete | video-rpc 删除视频 | `DeleteVideo` 事务中软删除视频后，该资产最后一个逻辑引用消失 | `decreaseFileAssetRefInTx` 锁资产行并更新 `status=PendingDelete, deleted_at=NOW()` |
 | ③ | **Active → Deleted**（异常跳过） | asset_cleanup 巡检 | `reconcileActiveAsset` 发现磁盘文件已丢失 **且** 真实 `videos` 引用=0 | `cleaner.go` `reconcileActiveAsset`：`fileExists==false && actualRefs==0` |
 | ④ | Deleted → Active | Gateway 上传路径 | 用户上传同 hash，本次副本 `os.Stat` 通过 | `upsertFileAsset` 段落 4：CAS `UPDATE ... WHERE id=? AND status=Deleted SET status=Active` |
 | ⑤ | PendingDelete → Cleaning | asset_cleanup 抢占 | `deleted_at ≤ now - GraceSeconds(300s)` **且** 事务内 `SELECT FOR UPDATE` 二次校验 `ref_count=0` 且真实引用=0 | `cleaner.go` `claimAsset`：`UPDATE status=Cleaning` |
-| ⑥ | PendingDelete → Active（Job 自纠错） | asset_cleanup 抢占 | `claimAsset` 二次校验发现真实 `videos` 引用>0（Grace 期内被新视频复用） | `cleaner.go` `claimAsset`：`activeRefs>0` 分支 `UPDATE status=Active, ref_count=activeRefs, deleted_at=NULL` |
+| ⑥ | PendingDelete → Active（Job 自纠错） | asset_cleanup 抢占 | `claimAsset` 二次校验发现真实 `videos` 引用>0，说明 ref_count 或状态存在历史漂移 | `cleaner.go` `claimAsset`：`activeRefs>0` 分支 `UPDATE status=Active, ref_count=activeRefs, deleted_at=NULL` |
 | ⑦ | Cleaning → Deleted | asset_cleanup 清理 | `removeAssetFile` 成功 `os.Remove` | `cleaner.go` `cleanOne`：`UPDATE ... WHERE status=Cleaning AND ref_count=0 SET status=Deleted`，并 `DEL fsz:chunkupload:hash:global:{hash}` |
 | ⑧ | Cleaning → PendingDelete（回退） | asset_cleanup 清理失败 | `removeAssetFile` 报错（I/O、权限、context 超时） | `cleanOne` 失败分支：`UPDATE ... SET status=PendingDelete`，等下一轮重试 |
-| ⑨ | Deleted → Active | 同 ④ | 说明这条边可以被上传路径反复触发（每次同 hash 上传都能复活） | 同 ④ |
-| ⑩ | Deleted → ∅ | GC 兜底 | 长时间无复活的 Deleted 行被硬删除 | 兜底 GC（`DELETE FROM file_assets WHERE ...`） |
+| ⑨ | PendingDelete → Active | Gateway 上传路径 | 用户重新上传同 hash，本次副本通过 `os.Stat`，按查询到的旧状态执行 CAS | `upsertFileAsset` 非 Active 分支 |
 
-**五类边分类速览**：
+**四类边分类速览**：
 
 | 类别 | 边 | 语义 |
 |---|---|---|
 | **主干路径** | ① → ② → ⑤ → ⑦ | 新登记 → 引用归零 → 抢占清理 → 物理删除完成，正常生命周期 |
-| **复活边** | ④/⑨ Deleted→Active、⑥ PendingDelete→Active | 上传复活 & Job 自纠错——**资产可反复复用**是软删除+内容寻址的核心 |
+| **复活边** | ④ Deleted→Active、⑥/⑨ PendingDelete→Active | 上传复活与 Job 自纠错——**资产可反复复用**是状态墓碑+内容寻址的核心 |
 | **回退边** | ⑧ Cleaning→PendingDelete | 清理失败不卡死在 Cleaning，回退等待下轮 |
 | **异常跳过** | ③ Active→Deleted | 磁盘已丢失+无引用，无需走 PendingDelete 宽限期，直接标 Deleted |
-| **终点边** | ⑩ Deleted→∅ | 兜底 GC，让墓碑最终消失，回到"下次新登记"的初始状态 |
 
 **关键洞察**：
 - **不是** `Active → PendingDelete → Cleaning → Deleted` 单线路径，而是**多入口、多出口、多回退、多复活**的有向图。
 - **Cleaning 是极短过渡态**（只有 `os.Remove` 一次系统调用的耗时），存在的意义是**告诉其他路径"我正在删物理文件，请等我"**。
-- **PendingDelete 是最长的"等待态"**（默认 300s Grace），故意留 5 分钟给"反悔"的机会（用户重传同 hash → 走边 ④；新视频引用 → 走边 ⑥）。
-- **Deleted 是可复活的"墓碑"，不是终点**——只要还没被 GC 硬删除，任何时候用户上传同 hash 都能通过边 ④ 复活。这就是为什么 `file_assets` 用**软删除 + 内容寻址**，而不是每次都物理 DELETE 再重新 INSERT。
+- **PendingDelete 是最长的"等待态"**（默认 300s Grace），给重新上传复活和引用漂移自纠错留出窗口；它只由最后引用删除或 Cleaning 失败回退产生。
+- **Deleted 是可复活的长期墓碑**——当前没有硬删除 `file_assets` 行的 GC；用户重新上传同 hash 时可以通过边 ④ 复活，保留 hash 唯一记录和历史状态。
 - **边 ③（Active→Deleted）是唯一跳过 PendingDelete 的边**：磁盘文件已经丢失、真实引用又是 0，说明这份资产已经彻底"不可用"，没必要再走 Grace 期宽限，直接进 Deleted 让下次上传走复活/新登记。
 
-**秒传正确性保护**：`upsertFileAsset` 发现已存在相同 hash 的记录时，如果处于 `Cleaning` 则必须轮询等待（默认 5s），**绝不能直接将 Cleaning 改回 Active**——否则 asset_cleanup 可能在激活后删除新上传文件。若已处于 `PendingDelete/Deleted`，则以本次上传文件为准将其 UPDATE 回到 `Active`（边 ④/⑨，含 `os.Stat` 兜底防止登记死链接）。
+**秒传正确性保护**：`upsertFileAsset` 发现已存在相同 hash 的记录时，如果处于 `Cleaning` 则必须轮询等待（默认 5s），**绝不能直接将 Cleaning 改回 Active**——否则 asset_cleanup 可能在激活后删除新上传文件。若已处于 `PendingDelete/Deleted`，则以本次上传文件为准将其 UPDATE 回到 `Active`（边 ④/⑨，含 `os.Stat` 兜底防止登记死链接）。需要注意，上传后从未发布的 `Active/ref_count=0` 资产当前不会自动进入 PendingDelete，这属于尚未实现的孤立上传治理边界。
 
 **文件魔数二次校验**：`saveMultipartUpload` 和分片合并时都会调用 `validateUploadedFileSignature`，根据扩展名预期校验前 12 字节魔数（jpg/png/webp/mp4/webm），防止伪造后缀或传输损坏。
 
@@ -2993,7 +2991,7 @@ sequenceDiagram
 
     OB->>K: 双事件
     K->>JS: FollowEvent → 再次刷缓存 & bump version（幂等兜底）
-    K->>JF: FollowEvent → 拉取被关注者最近 200 视频 → 写 follower 的 Timeline
+    K->>JF: FollowEvent → 小 V 回填最近 100 条 / 大 V 读侧拉 outbox / 大 V 取关失效 inbox
     K->>JN: NotificationEvent → INSERT notifications → BumpUnreadVersion
 ```
 
@@ -3265,95 +3263,162 @@ for attempt := 0; ; attempt++ {
 
 Feed RPC **只返回 video_id 和排序信息**，具体视频详情、作者昵称、点赞数由 Gateway 分别通过三个 Batch 接口聚合，避免 Feed 服务越权访问其他领域数据。
 
-#### 8.6.1 推拉分离核心思想
+#### 8.6.1 数据结构与推拉边界
 
-|  | 小 V (is_big_v=0) | 大 V (is_big_v=1) |
+这里的“推 / 拉”描述的是 **Timeline 在什么时候、按谁的维度物化**，不是“Redis 还是 MySQL”：
+
+- **推（fanout-on-write）**：作者发布后，异步 Job 把视频 member 提前写进每个活跃粉丝的 inbox。
+- **拉（fanout-on-read）**：作者发布后只维护一份作者 outbox；粉丝读取关注流时，再按当前关注关系拉取这些 outbox。
+- **MySQL 始终是事实来源**：Redis Timeline 丢失或过期时，无论 inbox 还是 outbox 都可以从 MySQL 冷启动重建。
+
+| 数据结构 | Redis Key | 保存内容 | 写入者 | 读取者 |
+|---|---|---|---|---|
+| 用户 inbox | `fsz:feed:timeline:user:{userID}` | 该用户关注的**小 V**视频 | `feed_timeline` Job 写扩散；Feed RPC 冷启动 | `GetFollowingFeed` |
+| 作者 outbox | `fsz:feed:author:{authorID}:outbox` | 单个**大 V**最近视频 | `feed_timeline` Job；Feed RPC 冷启动 | `GetFollowingFeed` |
+| 全局 Timeline | `fsz:feed:global_timeline` | 全站最新正常视频 | `feed_timeline` Job | `GetRecommendFeed` |
+
+|  | 小 V（`is_big_v=0`） | 大 V（`is_big_v=1`） |
 |---|---|---|
-| 写路径 | 发视频时 fanout 到所有粉丝的 inbox ZSet | 只写自己的 author outbox ZSet |
-| 读路径 | 直接读 inbox | 拉取关注列表中的大 V outbox 合并 |
-| 优点 | 读快 | 写快，不放大 |
-| 缺点 | 写放大 | 读时多几次 ZRANGE |
+| 发布视频 | 分批查询活跃粉丝并 push 到各自 inbox | 只写作者自己的 outbox |
+| 新增关注 | 回填作者最近 100 条正常视频到 follower inbox | 不回填 inbox，读时按当前关注关系拉 outbox |
+| 读取关注流 | 一次读取用户 inbox | 拉取该用户关注的大 V outbox，再和 inbox 合并 |
+| 冷启动 | 用户 inbox 只从 MySQL 重建小 V 快照 | 每个作者 outbox 单独从 MySQL 懒加载 |
+| 主要取舍 | 写放大、读成本低 | 写入 O(1)、读侧 fan-in 增加 |
 
-**大 V 判定采用 `is_big_v` 标志位而非实时 `follower_count`**：
+**大 V 判定只使用 `accounts.is_big_v`，不在 Feed 链路实时比较 `follower_count`**：
 
-- 一旦升为大 V 就永久保留（`WHERE is_big_v=0` 幂等升级）。
-- 避免大 V 掉粉后再涨粉的"反向穿越"：如果按粉丝数实时判定，掉粉那一瞬间历史视频从粉丝的 inbox 里 fanout 走了，反向穿越时再涨回来也拿不回来。
+1. Social 在关注事务中首次达到阈值时把 `is_big_v` 从 0 更新为 1。
+2. 标记只升不降；掉粉不会重新变回小 V，因此写侧和读侧不会因阈值抖动采用不同策略。
+3. 作者晋升前已经 push 进粉丝 inbox 的历史视频允许暂时保留；读侧按 `video_id` 去重，Timeline 过期重建后这些大 V member 会自然离开 inbox。
 
-#### 8.6.2 GetFollowingFeed 流程
+#### 8.6.2 视频发布与删除：feed_timeline 写路径
+
+Video RPC 在发布/删除视频的 MySQL 事务中写入 `feed.video.events` Outbox。Dispatcher 投递 Kafka 后，`feed_timeline` 按 `topic+partition` 分组消费，并且每次都回读 MySQL 最终状态，不直接相信可能重复或滞后的事件动作。
 
 ```mermaid
 flowchart TD
-    A[GetFollowingFeed viewer, cursor] --> B[ZREVRANGEBYLEX fsz:feed:timeline:user:viewer]
-    B --> C{Timeline 有数据?}
-    C -->|有| D[得到小 V 视频集合 A]
-    C -->|冷启动/miss| E[获取 build_lock:viewer]
-    E --> F{抢到锁?}
-    F -->|抢到| G[SELECT follows 关注列表 MySQL 拉最近 200 视频 ZADD 回填 inbox]
-    F -->|没抢到| H[等待 200ms 重读]
-    G --> D
-    H --> D
-
-    D --> I[SELECT accounts WHERE is_big_v=1 AND id IN 关注列表]
-    I --> J[对每个大 V ZREVRANGEBYLEX author_outbox]
-    J --> K[得到大 V 视频集合 B]
-    K --> L[合并 A∪B → 按 published_at DESC 归并]
-    L --> M[游标裁剪 → 返回 items + next_cursor]
+    A[video.published 或 video.deleted] --> B[回读 videos 最终 status deleted_at author_id created_at]
+    B --> C[编码定长 Timeline member]
+    C --> D[更新全局 Timeline]
+    D --> E[查询 accounts.is_big_v]
+    E -->|小 V| F[按 500 条关注关系分页查询活跃粉丝]
+    F --> G[Redis Pipeline 批量变更粉丝 inbox]
+    E -->|大 V| H[只变更作者 outbox]
+    G --> I[每个目标 Timeline 先 INCR version]
+    H --> J[作者 outbox 先 INCR version]
+    I --> K{ready 存在?}
+    J --> L{ready 存在?}
+    K -->|是| M[ZADD 或 ZREM 并裁剪和续期]
+    K -->|否| N[不写不完整 ZSet 等待读侧冷启动]
+    L -->|是| O[ZADD 或 ZREM 并裁剪和续期]
+    L -->|否| P[不写不完整 ZSet 等待读侧冷启动]
 ```
 
-#### 8.6.3 feed_timeline Job 事件驱动
+关键点：
 
-- **video.published**：查作者 `is_big_v`。小 V → fanout 到所有活跃粉丝 inbox；大 V → 只 ZADD 作者 outbox。
-- **video.deleted**：从相应 ZSet 中移除（回读 MySQL 事实状态兜底）。
-- **follow.created**：拉取被关注者最近 200 视频，写 follower inbox（如果被关注者是大 V，跳过，直接依赖读侧合并 outbox）。
-- **follow.deleted**：从 follower inbox 中移除被关注者的所有视频。
+- **全局 Timeline 始终维护**。若 `ready` 意外丢失，写入返回 `errGlobalTimelineNotReady`，Consumer 会持分布式锁执行 `BootstrapGlobalTimeline`，完成后重试当前事件。
+- **小 V fanout 分批进行**。MySQL 每批最多读取 500 条关注关系，Redis 使用 Pipeline 更新不同用户的 inbox，避免一次加载全部粉丝或逐条网络往返。
+- **大 V 发布是常数级写入**。无论有多少粉丝，只更新一份作者 outbox，不制造百万级 ZADD 风暴。
+- **`ready` 不存在时只推进版本，不追加单条事件**。否则 Redis 刚被清空后收到一条发布事件，就会把“只有一条数据的残缺 Timeline”错误标记为可读；当前方案让后续冷启动从 MySQL 建完整快照。
+- **删除也按最终状态执行**。视频软删除后，从对应 Timeline 移除；若视频行被异常物理删除，则使用 `fsz:feed:video:{videoID}:member` 映射兜底定位旧 member。
 
-**Global Timeline ready 禁不可丢**：全局最新流 ZSet `fsz:feed:global_timeline` 需要配套一个 `ready` 标记才可以接受写入，防止尚未初始化时写了一半的数据。一旦指标丢失（例如 Redis flush），writer 会返回 `errGlobalTimelineNotReady`；旧方案靠 Kafka 无限重试无人恢复。新方案：**consumer 层捕获该错误后调用 `BootstrapGlobalTimeline`（带分布式锁）完成一次重建，再重试当前事件**，避免 Kafka 原地重试风暴。
+#### 8.6.3 关注与取关：小 V 和大 V 的不同处理
 
-**Timeline 冷启动保护**：
-- `fsz:feed:timeline:build_lock:{viewer}` 5-10s 锁，避免同一用户多个请求并发触发 MySQL 全量回填。
-- `fsz:feed:timeline:user:{viewer}` 使用 `EXPIRE 7d`，长期不活跃用户自动淘汰。
-#### 8.6.4 Timeline ZSet 编码
+`social.follow.events` 到达后，Job 先通过 `(follower_id, following_id)` 回读 `follows` 最终状态，再读取被关注者的 `is_big_v`：
+
+| 最终关系 | 小 V | 大 V |
+|---|---|---|
+| 已关注 | 查询该作者最近 100 条正常视频，回填 follower inbox | 不写 inbox；下一次读取根据当前关注关系合并作者 outbox |
+| 已取关 | 查询该作者可能存在于 inbox 的视频 member，并批量 ZREM | 原子执行 `version + 1`，删除用户 inbox 和 `ready`，下次读取只按当前小 V 关系重建 |
+
+大 V 取关不能简单“什么都不做”。原因是该作者可能曾是小 V，历史视频已经 push 进用户 inbox；旧版本冷启动也曾把所有作者视频写入 inbox。当前使用 `invalidateUserTimelineScript`：
+
+```text
+INCR  fsz:feed:timeline:user:{userID}:version
+DEL   fsz:feed:timeline:user:{userID}
+DEL   fsz:feed:timeline:user:{userID}:ready
+EXPIRE version 30d
+```
+
+下一次 `GetFollowingFeed` 会重新构建只含当前有效小 V 的 inbox。相比查询大 V 的全部历史视频逐条 ZREM，这种方式不会漏掉晋升前的旧 member；先递增版本也能让正在并发构建的旧快照 CAS 失败，避免它重新覆盖回来。
+
+#### 8.6.4 GetFollowingFeed 完整读流程
+
+```mermaid
+flowchart TD
+    A[GetFollowingFeed] --> B[校验 viewer cursor page_size]
+    B --> C{用户 inbox ready 存在?}
+    C -->|否| D[本地 SingleFlight 合并同实例请求]
+    D --> E[SETNX 获取用户构建锁]
+    E -->|未持锁| F[有界等待其他实例完成]
+    E -->|持锁| G[读取 inbox version]
+    G --> H[MySQL JOIN follows accounts videos]
+    H --> I[只选择 is_big_v=0 的正常视频 最多 2000 条]
+    I --> J[写入临时 ZSet]
+    J --> K{Lua 校验 version 未变化?}
+    K -->|否| G
+    K -->|是| L[RENAME 临时 ZSet 设置 ready INCR version 和 TTL]
+    F --> C
+    C -->|是| M[读取 inbox 当前游标页]
+    L --> M
+    M --> N[MySQL 查询当前关注的大 V author_id]
+    N --> O[逐个确保 author outbox ready]
+    O --> P[读取各 outbox 当前游标页]
+    P --> Q[按 published_at 和 video_id 倒序合并]
+    Q --> R[按 video_id 去重并截取 page_size]
+    R --> S[刷新用户 inbox ready version 的滑动 TTL]
+    S --> T[返回 items next_cursor has_more]
+```
+
+读路径的几个边界：
+
+1. `ready` 是“完整快照已经发布”的标记，不能用 `ZCARD>0` 代替。用户确实没有小 V 视频时 ZSet 可以为空，但仍必须保留 `ready=1`，否则每次请求都会重复回源。
+2. inbox 冷启动 SQL 使用 `follows + accounts + videos`，明确过滤 `COALESCE(accounts.is_big_v,0)=0`；账号记录异常缺失时保守按小 V 处理，和 Job 的判定一致。
+3. 大 V 列表来自当前 MySQL 关注关系，不信任 inbox 中可能存在的历史 member；每个大 V outbox 最多保留/冷启动 500 条。
+4. `mergeFeedItems` 对 inbox 与多个 outbox 做 `video_id` 去重，再按 `(publishedAt DESC, videoID DESC)` 排序，兼容作者晋升期间的双份历史数据。
+5. 当前 `MaxBigCreatorFanIn` 默认 100：按 `follower_count DESC, author_id ASC` 选取最多 100 个大 V，防止单次请求拉取无限多个 ZSet。它是保护系统的显式降级边界；如果产品要求关注任意数量大 V 都完整展示，应进一步增加大 V 关注列表缓存、分批 Pipeline 或多级聚合，而不是直接移除上限。
+
+#### 8.6.5 三类 Timeline 的冷启动
+
+| 冷启动对象 | 触发者 | MySQL 快照 | 默认容量 | 构建方式 |
+|---|---|---|---:|---|
+| 用户 inbox | Feed RPC 首次读取或 30 天 TTL 到期 | 当前关注关系中所有小 V 的最新正常视频 | 2000 | SingleFlight + 用户级 Redis 锁 + version CAS + 临时 ZSet |
+| 大 V author outbox | Feed RPC 首次需要拉取该作者或 30 天 TTL 到期 | 该作者最新正常视频 | 500 | SingleFlight + 作者级 Redis 锁 + version CAS + 临时 ZSet |
+| 全局 Timeline | `feed_timeline` Job 启动或 ready 丢失自愈 | 全站最新正常视频 | 10000 | Job 级 Redis 锁 + version CAS + 临时 ZSet |
+
+用户 inbox 和作者 outbox 复用 `ensureTimeline`，完整过程如下：
+
+1. 先检查 `ready`；命中直接返回，不查询 MySQL。
+2. 同进程通过包级 SingleFlight 合并相同构建请求。
+3. 多实例通过 `SET NX EX` 构建锁竞争；锁值是随机 token，释放时使用 Lua 比较 token，不能误删后来实例的新锁。
+4. 未持锁者最多等待 `BuildWaitMs`（当前 1500ms），轮询 `ready`；不会无限阻塞 RPC。
+5. 持锁者记录构建前 `version`，查询 MySQL 完整快照并写入随机临时 ZSet。
+6. Lua 再比较当前版本：一致才删除旧正式 Key、`RENAME` 临时 Key、递增版本、写 `ready` 并设置 TTL；不一致说明构建期间发生发布/删除/关注变化，删除临时 Key后重试，最多 3 次。
+7. 空快照同样写 `ready`；正式 ZSet 可以不存在，语义仍是“完整但为空”。
+
+这套版本校验处理了最危险的竞态：冷启动正在查询 MySQL 时，Kafka Job 又处理了一条新事件。Job 无论 `ready` 是否存在都会先递增相同版本号，因此旧构建者不能用查询开始时的快照覆盖新状态；它只能重新读取 MySQL 后再发布。
+
+#### 8.6.6 Timeline ZSet 编码与分页
 
 来自 `common/feedx/timeline.go`：
 
 - 所有元素 `score=0`，实际顺序由 member 字典序决定。
-- Member 格式：`{publishedAt:19位}:{videoID:20位}`，前 0 补齐，保证 lex 排序等价于数值排序。
-- 使用 `ZREVRANGEBYLEX` 分页，游标格式 `(member` 实现排他上界，无重复无遗漏。
+- Member 格式为 `{publishedAt:19位}:{videoID:20位}`，前面补 0，保证字典序等价于数值顺序。
+- 读取使用 `ZREVRANGEBYLEX`，按照 `(publishedAt DESC, videoID DESC)` 排列。
+- 下一页使用 `(` + 上一页最后一个 member 作为排他上界，避免重复和遗漏。
+- 读取到损坏 member 时跳过并异步 ZREM，不让单个脏元素阻断整页。
 
-#### 8.6.5 设计取舍与抗压分析
+#### 8.6.7 设计取舍与复杂度
 
-**为什么用推拉分离而不是纯推 / 纯拉？**
-
-| 方案 | 写路径 | 读路径 | 致命缺陷 |
+| 方案 | 写路径 | 读路径 | 主要问题 |
 |---|---|---|---|
-| **纯推（写扩散）** | 发视频 → 写到所有粉丝 inbox | 直接 ZREVRANGE | 大 V 一次写扩散上千万条 ZADD → **打爆 Redis** |
-| **纯拉（读扩散）** | 发视频 → 只写作者 outbox | 拉关注列表 N 个 outbox 归并 | 关注了几千人的用户每次拉 Feed 都要拉几千个 ZSet → **读放大灾难** |
-| **推拉分离**（当前） | 小 V 写扩散 / 大 V 只写自己 outbox | inbox（小 V 已扇入）+ 关注的大 V outbox 合并 | 兼顾读写，大 V 数量有限 → 读侧合并可控 |
+| 纯推 | 发视频写所有粉丝 inbox | 一次读 inbox | 大 V 写扩散可能产生百万级 Redis 写入 |
+| 纯拉 | 只写所有作者 outbox | 拉取全部关注作者 outbox | 普通用户关注数较多时读放大严重 |
+| 当前推拉分离 | 小 V push，大 V 只写作者 outbox | 1 个 inbox + N 个大 V outbox | 将写放大限制在小 V，将读放大限制在最多 100 个大 V |
 
-**读侧成本估算**：假设用户关注 500 人，其中大 V 20 人（`is_big_v=1`）：
-- 480 个小 V 的最近视频**已经在 inbox**里（feed_timeline 写扩散过） → 1 次 ZREVRANGEBYLEX
-- 20 个大 V 分别拉 outbox → 20 次 ZREVRANGEBYLEX（可以 pipeline 并发）
-- 合并归并 → O(K log K)，K 是 pagesize 200
+例如用户关注 500 位作者，其中 20 位是大 V：小 V 的视频已经聚合在一个 inbox 中，只需一次范围读取；大 V 再读取 20 个作者 outbox，最后在内存中合并去重。小 V 发布的成本约为 `O(粉丝数)`，大 V 发布的 Timeline 成本为 `O(1)`；读侧成本约为 `O(1 + 大V数)`。
 
-**写侧成本估算**：
-- 小 V 发视频（假设 1000 粉丝）→ 1000 次 ZADD，几十毫秒，可接受
-- 大 V 发视频（假设 100 万粉丝）→ **1 次 ZADD**（只写自己 outbox） → 常数时间
-
-**Timeline 冷启动的三层保护**：
-
-1. **build_lock 分布式锁**：`fsz:feed:timeline:build_lock:{viewer}` SETNX 10s，同一用户多个并发请求只让**一个**去回源 MySQL
-2. **7 天 TTL**：不活跃用户的 inbox 自动淘汰，避免亿级用户全量常驻 Redis
-3. **懒加载**：冷用户第一次拉 Feed 才触发构建（`SELECT follows` + 拉每个关注对象最近 200 视频）
-
-**Global Timeline ready 自愈**：`fsz:feed:global_timeline` 需要 `ready` 标记才允许写入，防止半初始化状态。旧方案在 `errGlobalTimelineNotReady` 时靠 Kafka 无限重试等人恢复。新方案：consumer 层捕获后调用 `BootstrapGlobalTimeline`（内部分布式锁，避免多实例重复重建）完成一次重建，再重试当前事件，**自愈无人工介入**。
-
-**为什么 feed_timeline job 用回读 MySQL 事实状态而不是靠事件 OccurredAt 排序？**
-
-事件流可能存在：
-- Kafka 重试导致乱序（例如先收到 delete 再收到 create）
-- 消费者宕机重启后重放（重复处理旧事件）
-
-如果单纯靠 `OccurredAt.Before(existing)` 跳过旧事件，任何一次 ZSet 数据丢失都无法通过重放恢复。改成**每次都回读 MySQL 的 status/is_big_v 事实状态**决定 add/remove，**天然幂等**、天然自愈。代价是每个事件多一次 SELECT，但比数据错乱强得多。
+**为什么事件消费要回读 MySQL 最终状态？** Kafka 至少一次投递会发生重放，旧事件也可能晚到。若只按事件中的 `action/occurred_at` 修改 Redis，重放可能把 Timeline 回滚。当前视频事件回读 `videos.status/deleted_at`，关注事件回读 `follows.status/deleted_at`，作者类型回读 `accounts.is_big_v`，再执行幂等的 ZADD/ZREM 或失效操作；代价是多一次主键/索引查询，换来可重放和自愈能力。
 
 ---
 
@@ -4077,6 +4142,15 @@ flowchart TD
 
 这样即使消费到 stale 事件也能正确重放到最新状态，天然幂等。
 
+**推拉写入分流**：
+
+- 小 V 视频事件按活跃粉丝分页，每批 500 条关系，通过 Redis Pipeline 修改已就绪用户的 inbox。
+- 大 V 视频事件只修改该作者 outbox，发布成本不随粉丝数增长。
+- 任何用户 inbox/作者 outbox 在 `ready` 缺失时都只递增 version，不把当前单条事件写成一份残缺 Timeline；完整内容由 Feed RPC 下一次读取时从 MySQL 冷启动。
+- 小 V 关注回填最近 100 条正常视频，取关批量清理；大 V 关注不写 inbox，大 V 取关则原子递增用户 Timeline 版本并删除 inbox/ready，下一次读取按当前小 V 关系重建。
+
+**并发构建保护**：Job 的每次事件变更都会推进 Timeline version。Feed RPC 冷启动先记录 version，MySQL 查询完成后再由 Lua 比较；构建期间只要发生任何事件，旧快照就不能 `RENAME` 成正式 Key，只能重新查询。这让异步写入与读侧懒加载无需跨 MySQL/Redis 分布式事务也不会永久互相覆盖。
+
 **Global Timeline ready 丢失自愈**：`errGlobalTimelineNotReady` 不再靠 Kafka 无限重试；`HandleBatch` 层包裹 `applyEventWithTimelineRecovery`，捕获后主动调用 `BootstrapGlobalTimeline`（内部带分布式锁，避免多实例重复重建）后重试当前事件。
 
 ### 9.4 notification Job 特殊设计
@@ -4089,23 +4163,66 @@ flowchart TD
 
 **定位**：一个无 Kafka 依赖的定时扫库 Job。它一方面默认每 30s 处理 `PendingDelete/Cleaning` 资产的延迟物理删除，另一方面按主键游标默认每 60s 巡检一批 Active 资产，持续校准 MySQL 引用计数与磁盘状态。
 
-**流程**：
+#### 9.5.1 `PendingDelete` 从哪里产生
+
+`asset_cleanup` 不负责把正常资产首次改成 `PendingDelete`。该状态主要由 video-rpc 的 `DeleteVideo` 事务产生：
+
+1. `DeleteVideo` 在事务内用 `SELECT ... FOR UPDATE` 锁定目标 `videos` 行，校验操作者并把视频软删除。
+2. 对 `play_url`、`cover_url` 聚合后按 URL 固定顺序处理；同一 URL 同时作为视频和封面时按两个逻辑引用扣减。
+3. `decreaseFileAssetRefInTx` 对相应 `file_assets` 行执行 `SELECT ... FOR UPDATE`，并在同一事务中重新统计软删除之后仍正常的 `videos` 引用。
+4. 若扣减后仍有引用，则保持 `Active` 并修正 `ref_count`；只有最后一个逻辑引用消失时，才写入 `ref_count=0, status=PendingDelete, deleted_at=now`。
+5. 视频软删除、资产引用变化和 `video.deleted` Outbox 在同一个 MySQL 事务内提交；任何一步失败都会整体回滚，不会出现视频已删除而资产引用未扣减的半完成状态。
+
+例如两个用户通过秒传发布同一物理文件时，`ref_count=2`。第一个用户删除视频只会把引用减为 1，资产继续保持 `Active`；第二个用户删除最后一条引用后，资产才进入 `PendingDelete`。
+
+`PendingDelete` 还有一条回退入口：Job 已把资产改为 `Cleaning`，但 `os.Remove` 因权限、I/O 或超时失败时，会把状态退回 `PendingDelete`，等待下一轮重试。
+
+| 当前状态 | 触发条件 | 下一状态 | 是否删除 MySQL 行 |
+|---|---|---|---|
+| `Active` | 删除视频后 `ref_count > 0` | `Active` | 否 |
+| `Active` | 删除视频后最后一个引用消失 | `PendingDelete` | 否 |
+| `PendingDelete` | 超过 Grace，复核真实引用仍为 0 | `Cleaning` | 否 |
+| `PendingDelete` | 复核发现仍有正常视频引用 | `Active` | 否 |
+| `Cleaning` | 磁盘文件删除成功 | `Deleted` | 否，仅保留墓碑记录 |
+| `Cleaning` | 磁盘文件删除失败 | `PendingDelete` | 否 |
+| `Cleaning` | 抢占者崩溃并超过 ClaimTimeout | `Cleaning` | 否，由后续实例重新处理 |
+| `PendingDelete/Deleted` | 相同 hash 文件重新上传且新文件可用 | `Active` | 否，复用原资产行 |
+
+需要特别区分：`file_assets.status=Deleted` 只是状态墓碑，当前 Job **不会执行 `DELETE FROM file_assets`**。此外，上传完成但从未发布的记录是 `Active, ref_count=0`，当前候选条件不会把它自动变成 `PendingDelete`；这类孤立上传不属于现有清理闭环。
+
+#### 9.5.2 延迟物理删除完整流程
 
 ```
-1. 每 30s 扫描：选中
+1. 每 30s 无锁扫描最多 BatchSize 条候选 ID：
      status = PendingDelete AND ref_count = 0 AND deleted_at <= now - GraceSeconds
    或 status = Cleaning   AND ref_count = 0 AND updated_at <= now - ClaimTimeoutSeconds（超时重抢）
 2. 逐条 claimAsset（事务内先 SELECT FOR UPDATE）：
      • 若发现 videos 仍有 play_url/cover_url = asset.URL 的 status=1 记录 → activeRefs>0 →
        ref_count 回填真实值、状态→ Active、deleted_at → NULL（引用复活兜底）；
-     • 否则 UPDATE → Cleaning、抢到物理清理权。
-3. removeAssetFile：严格限定在 Upload.Dir 子目录内，拒绝删除非普通文件/目录，
-   删除失败 → 将状态回退 PendingDelete 供下一轮重试。
-4. 成功后：UPDATE Cleaning → Deleted + DEL `fsz:chunkupload:hash:global:{fileHash}`
+     • 否则 UPDATE → Cleaning 并 COMMIT，释放 MySQL 行锁。
+3. 事务外执行 removeAssetFile：严格限定在 Upload.Dir 子目录内，拒绝删除非普通文件/目录；
+   删除失败 → 条件 UPDATE Cleaning → PendingDelete，供下一轮重试。
+4. 删除成功：条件 UPDATE Cleaning → Deleted，再 DEL `fsz:chunkupload:hash:global:{fileHash}`
    （使 gateway 秒传全局缓存失效，数据库才是权威来源）。
 ```
 
-**Active 资产巡检**：
+这里故意不在持有 MySQL 行锁时执行物理删除。`os.Stat/os.Remove` 可能被慢磁盘、权限检查或网络文件系统阻塞；若把它放在事务内，会延长锁持有时间并阻塞发布、删除和重新上传。事务提交后的 `Cleaning` 状态相当于一份有超时时间的逻辑认领标记，而不是仍然存在的数据库行锁。
+
+#### 9.5.3 加锁范围与多实例行为
+
+| 阶段 | 是否显式加锁 | 锁的作用与释放时机 |
+|---|---|---|
+| 候选 ID 扫描 | 否 | 普通 `SELECT/Pluck`，只找候选，不保证独占；多个实例可能读到同一 ID |
+| `claimAsset` | 是，单条 `file_assets` 行 `FOR UPDATE` | 串行复核状态、引用数并迁移到 `Cleaning/Active`；事务提交或回滚后释放 |
+| 磁盘 `os.Remove` | 否 | 不持有 DB 行锁，通过 `Cleaning` 状态阻止正常发布路径继续引用该资产 |
+| 最终状态更新 | 无显式 `FOR UPDATE` | 条件 `UPDATE ... WHERE status=Cleaning AND ref_count=0` 本身由 InnoDB 对命中行加排他锁，语句提交后释放 |
+| Active 巡检 | 是，单条 `file_assets` 行 `FOR UPDATE` | 防止巡检用旧引用数覆盖并发发布或删除事务的新状态 |
+
+发布事务对资产执行条件 `UPDATE`，删除事务和巡检执行 `SELECT ... FOR UPDATE`；它们最终都会竞争同一条 `file_assets` 记录锁，因此同一资产的引用增减、状态迁移和校准会串行化，不同资产仍可并行。
+
+候选扫描没有使用 `SKIP LOCKED`，`asset_cleanup` 也没有类似 Outbox 的 `lock_token`。多实例可能在扫描阶段拿到相同 ID，随后在 `FOR UPDATE` 处串行复核；极端的预选竞争下可能发生重复但幂等的 `os.Remove` 尝试，第二次看到文件不存在会按成功处理，最终条件更新也允许 `RowsAffected=0`。`ClaimTimeoutSeconds` 解决的是进程在写入 `Cleaning` 后崩溃造成的状态滞留，不是让 MySQL 行锁持续 300 秒；数据库行锁在 claim 事务结束时已经释放。
+
+#### 9.5.4 Active 资产巡检
 
 ```
 1. 按 id 游标读取一批 Active 资产（默认 200，最大 500），避免反复扫描表头。
@@ -4116,9 +4233,11 @@ flowchart TD
    防止继续秒传或发布，同时保留故障证据供人工/存储修复。
 ```
 
+巡检的候选页查询不加锁，但处理单条资产时会开启事务并加 `FOR UPDATE`。当前实现会在这把行锁内统计真实引用并执行 `os.Stat`，因此它比主清理路径持锁稍长；批量上限和逐条处理用于控制影响范围。
+
 **一致性保障**：
 - `GraceSeconds`（默认 300s）：避免刚刚软删、尚未成功返回的写路径与清理时长上碰撞。
-- `ClaimTimeoutSeconds`（默认 300s）：旧 Cleaning 抢占者崩溃后自动释放。
+- `ClaimTimeoutSeconds`（默认 300s）：旧 Cleaning 处理者崩溃后允许其他实例重新处理；它是状态租约超时，不是数据库锁超时。
 - 发布、删除、引用复活和 Active 巡检都锁定同一 `file_assets` 行，避免巡检用旧计数覆盖刚提交的新引用。
 - Gateway 秒传 `upsertFileAsset` 遇到 Cleaning 必须轮询等待，**绝不会同时存在“Gateway 把 Cleaning 改回 Active” + “Job 正在 Cleaning 删除”的双写**。
 - Redis 删除失败不回滚已完成的物理删除，Gateway 秒传会以 DB 状态二次校验（`lookupInstantUploadedFile` 发现 asset 不存在会主动清 Redis）。
@@ -4131,11 +4250,52 @@ flowchart TD
 
 旧实现没有独立生命周期治理，压测历史数据会持续堆积；直接执行 `DELETE ... WHERE ... ORDER BY ... LIMIT` 时，即使每批只有 100 行，也可能因范围扫描、排序和删除写放大耗时约 3 秒，并反复触发慢 SQL 或单轮超时。当前实现改为“覆盖索引选主键 + 主键小批删除”，把昂贵扫描与实际删除范围拆开，既便于限时，也避免一次长事务持续抢占业务库。
 
-- `outbox_events`：仅删除 `status=sent` 且 `sent_at` 超过保留期的记录，默认保留 7 天。
-- `processed_events`：按每条记录已有的 `expire_at` 删除，默认由事件写入时设置 14 天有效期。
-- `dead_letter_events`：默认不自动删除，便于审计和重放；只有 `DeadLetterRetentionHours > 0` 时才按配置清理。
-- 每批先通过覆盖索引只取最多 100 个 ID，再按主键删除，避免 `DELETE ... ORDER BY` 自己做范围扫描和排序；批间暂停 200ms、每轮最多 20 批且总运行预算 30 秒，每批还有 5 秒超时。历史积压留给后续 5 分钟轮询周期渐进清理，日志中的 `deleted:2000` 表示本轮达到上限，并非 Job 卡死。多实例选中相同 ID 时少删或删不到都属于幂等成功。
-- `017_stats_projection_and_event_cleanup.sql` 提供 `(status, sent_at, id)`、`(expire_at, id)`、`(created_at, id)` 索引，保证清理按时间和主键稳定向前扫描。
+#### 9.6.1 删除对象与状态边界
+
+| 表 | 删除条件 | 默认保留策略 | 是否物理删除 MySQL 行 |
+|---|---|---|---|
+| `outbox_events` | `status=sent` 且 `sent_at` 早于保留期 | 7 天 | 是 |
+| `processed_events` | `expire_at < now` | 事件写入时通常设置 14 天 | 是 |
+| `dead_letter_events` | `created_at` 早于配置保留期 | 默认 `DeadLetterRetentionHours=0`，永久保留 | 配置大于 0 时才删除 |
+
+未发送、投递中、等待重试或失败的 Outbox 不满足 `status=sent`，不会被清理。与 `asset_cleanup` 只更新状态不同，`event_cleanup` 使用真正的 `DELETE FROM ... WHERE id IN (...)`，记录提交后从 MySQL 表中消失。
+
+#### 9.6.2 每批完整流程
+
+```text
+1. 通过覆盖索引执行普通 SELECT，只读取最多 BatchSize 个过期主键 ID；
+2. SELECT 与 DELETE 不放在同一个显式事务中，也不使用 FOR UPDATE；
+3. 执行 DELETE FROM <table> WHERE id IN (...候选ID...)；
+4. InnoDB 对实际删除的聚簇索引记录及相关二级索引记录自动加排他锁；
+5. DELETE 的自动提交事务结束后立即释放锁；
+6. 批次达到上限时休眠 BatchInterval，再开始下一批。
+```
+
+先选 ID 再按主键删除，避免 `DELETE ... WHERE ... ORDER BY ... LIMIT` 同时承担范围扫描、排序和删除写放大。`017_stats_projection_and_event_cleanup.sql` 提供 `(status, sent_at, id)`、`(expire_at, id)`、`(created_at, id)` 覆盖索引，候选查询可以沿时间和主键稳定向前扫描。
+
+#### 9.6.3 有没有行锁，以及为什么不使用 `FOR UPDATE`
+
+候选查询是普通一致性读，**不会显式锁住候选行**；真正执行 `DELETE` 时，InnoDB 必然对实际删除记录加排他锁，并在该条删除语句提交后释放。因此它不是“完全不加锁”，而是“不做提前认领，只让删除语句短暂持锁”。
+
+这里不需要 `SKIP LOCKED`、`lock_token` 或“先认领再删除”，原因是待清理数据已经处于终态：sent Outbox 不再参与投递，过期 `processed_events` 也不再承载新的业务变化。删除操作天然幂等，多实例即使同时选到相同 ID，也只会出现：
+
+- 实例 A 先删除并提交；
+- 实例 B 随后删除相同 ID，`RowsAffected=0` 或只删除仍存在的部分行；
+- 两者都视为成功，不会重复产生业务副作用。
+
+如果某行恰好仍被其他事务锁定，本批 `DELETE` 最多等待当前配置的 5 秒；超时后本批返回错误，未删除数据留到下一轮，不会扩大为长事务。当前配置每批 100 行、每轮最多 20 批、批间暂停 200ms、整轮预算 30 秒、每 5 分钟执行一轮，因此单表单轮通常最多删除 2000 行。日志中的 `deleted:2000` 表示达到本轮限额，不是 Job 卡死。
+
+#### 9.6.4 两个清理 Job 的锁模型对比
+
+| 对比项 | `asset_cleanup` | `event_cleanup` |
+|---|---|---|
+| 清理对象 | 共享物理文件及 `file_assets` 状态 | 已终态/过期的事件记录 |
+| 候选扫描 | 普通查询，不加锁 | 覆盖索引普通查询，不加锁 |
+| 显式认领锁 | 单资产 `SELECT ... FOR UPDATE` | 无 |
+| 慢操作是否持有 DB 锁 | `os.Remove` 在事务外，不持锁 | 没有跨存储慢操作 |
+| 最终 DB 动作 | `Cleaning → Deleted`，保留资产行 | `DELETE WHERE id IN (...)`，物理删除事件行 |
+| 多实例协调 | 行锁 + Cleaning 状态 + ClaimTimeout；重复删除幂等 | 不提前协调；重叠 ID 依赖 DELETE 幂等 |
+| 失败恢复 | 回退 PendingDelete 或等待 Cleaning 超时重抢 | 保留原行，下一轮重新筛选 |
 
 ---
 
@@ -4175,7 +4335,18 @@ sequenceDiagram
     Note over U2: 2) 粉丝拉取关注流
     U2->>G: GET /feed/following
     G->>F: GetFollowingFeed
-    F->>R: ZREVRANGEBYLEX inbox + 关注的大 V outbox 合并
+    F->>R: 检查用户 inbox ready
+    alt inbox 冷启动
+        F->>DB: JOIN follows + accounts + videos，仅查小 V 正常视频
+        F->>R: build lock + version CAS + 临时 ZSet 原子发布
+    end
+    F->>R: ZREVRANGEBYLEX 小 V inbox
+    F->>DB: 查询当前关注的大 V author_id
+    loop 每个大 V
+        F->>R: 确保 author outbox ready，必要时从 MySQL 冷启动
+        F->>R: ZREVRANGEBYLEX author outbox
+    end
+    F->>F: 合并、按 video_id 去重并按复合游标排序
     F-->>G: video_ids
     G->>V: BatchGetVideos
     G->>N: (可选) 未读数
@@ -4247,10 +4418,13 @@ sequenceDiagram
 | | `fsz:comment:list:version:{videoID}` | 评论列表版本号 | 长期 |
 | | `fsz:comment:first:{videoID}:{version}` | 评论首页固定窗口缓存 | 短 |
 | | `fsz:comment:idempotency:{userID}:{requestID}` | 评论发布幂等键，value=commentID | 24 小时 |
-| **Feed** | `fsz:feed:timeline:user:{userID}` | 用户 inbox ZSet | 7 天 |
-| | `fsz:feed:author_outbox:{authorID}` | 大 V outbox ZSet | 30 天 |
-| | `fsz:feed:global_timeline` | 全局最新视频 ZSet | 长期 |
-| | `fsz:feed:timeline:build_lock:{userID}` | 冷启动构建锁 | 10 秒 |
+| **Feed** | `fsz:feed:timeline:user:{userID}` | 只物化小 V 视频的用户 inbox ZSet | 30 天滑动续期 |
+| | `fsz:feed:timeline:user:{userID}:version` / `:ready` | 用户 inbox 冷启动 CAS 版本与完整快照标记 | 30 天滑动续期 |
+| | `fsz:feed:timeline:user:{userID}:lock` | 用户 inbox 冷启动构建锁，value=随机 token | 15 秒 |
+| | `fsz:feed:author:{authorID}:outbox` | 大 V 作者 outbox ZSet | 30 天 |
+| | `fsz:feed:author:{authorID}:outbox:version` / `:ready` | 大 V outbox 冷启动 CAS 版本与完整快照标记 | 30 天 |
+| | `fsz:feed:author:{authorID}:outbox:lock` | 单个大 V outbox 冷启动构建锁 | 15 秒 |
+| | `fsz:feed:global_timeline` / `:version` / `:ready` | 全局最新视频及完整构建状态 | 常驻；丢失由 Job 重建 |
 | **HotRank** | `fsz:hot:video:realtime` | Interaction 在线路径维护的累计实时热度 | 长期 |
 | | `fsz:hot:window:{yyyyMMddHHmm}` | HotRank Consumer 维护的 UTC 单分钟净热度 ZSet | 默认 2 小时 |
 | | `fsz:hot:merge:{asOf}` / `:ready` | Feed 合并最近窗口得到的固定分页快照及完成标记 | 默认 30 分钟 |
@@ -4368,7 +4542,7 @@ flowchart TD
 2. **Redis `SETNX` 分布式锁——跨实例互斥**
    - `lockKey` 用 `rediskey.LikeUserVideosFirstPageCacheBuildLockKey(cacheKey)` / `CommentFirstPageCacheBuildLockKey` / `FeedTimelineBuildLockKey` 等；
    - `lockToken = randomHex(8/16)` 是**当前协程独有的随机串**，`SetNX(lockKey, token, EX=lockTTL)`；
-   - `lockTTL` 都设得很短：`likedVideosListCacheLockTTL = 2s`、评论列表 5s、Timeline 10s。作用是防止持锁协程崩溃后锁永远不释放；
+   - `lockTTL` 都设得很短：`likedVideosListCacheLockTTL = 2s`、评论列表 5s、Timeline 当前配置 15s。作用是防止持锁协程崩溃后锁永远不释放；
    - 释放时**必须走 Lua 校验 token**（`releaseRedisLock`，见 `interactionhelper.go:104`）——`GET lockKey == myToken then DEL`，避免"我持锁 → 我卡住 → TTL 到期锁被别人拿去 → 我最后再删把别人的锁误删了"这种经典 bug。
 
 3. **短轮询兜底——防"抢锁失败者永远拿不到数据"**
@@ -4397,7 +4571,7 @@ flowchart TD
 | `interaction.ListComments` | `CommentFirstPageCacheKey`（固定 20 条首页窗口，小页从窗口截取） | `CommentListVersionKey` | `CommentFirstPageCacheBuildLockKey` | 5s | 3×50ms | `syncx.SingleFlight` |
 | `social.ListFollowers` | `FollowerListPageKey` | `FollowerListVersionKey` | `FollowerListBuildLockKey` | 3s | 3×50ms | `followListLoadGroup` |
 | `social.ListFollowings` | `FollowingListPageKey` | `FollowingListVersionKey` | `FollowingListBuildLockKey` | 3s | 3×50ms | `followListLoadGroup`（分命名空间） |
-| `feed.GetFollowingFeed`（Timeline 冷启动） | `FeedTimelineKey` | — | `fsz:feed:timeline:build_lock:{viewer}` | 10s | 200ms 轮询 | `timelineBuildGroup` |
+| `feed.GetFollowingFeed`（小 V inbox 冷启动） | `FeedTimelineKey` | `FeedTimelineVersionKey` | `fsz:feed:timeline:user:{viewer}:lock` | 15s | 每 50ms 轮询，最多等待 1500ms | `timelineBuildGroup` |
 | `gateway` 匿名热榜成品缓存 | 匿名 hot feed page cache | — | 匿名 hot feed build lock | 短 TTL | 短轮询 | `anonymousHotFeedPageBuildGroup` |
 
 ##### ④ 为什么不改成"全项目统一都加分布式锁"
@@ -4603,7 +4777,7 @@ flowchart TD
 | 并发写同一 notification business_key | `notifications.uk_notification_business` 唯一索引兜底，冲突时事务回滚重试 |
 | 并发大 V 升级 | `UPDATE ... WHERE is_big_v=0` 天然幂等 |
 | 并发 outbox dispatch | `SELECT ... FOR UPDATE SKIP LOCKED` + `lock_token` |
-| 并发 Timeline 冷启动 | `fsz:feed:timeline:build_lock:{viewer}` 分布式锁 |
+| 并发 Timeline 冷启动 | 本地 `timelineBuildGroup` + `fsz:feed:timeline:user:{viewer}:lock` 分布式锁 + version CAS + 临时 ZSet 原子替换 |
 | 并发列表缓存回源（interaction / social） | `LikeUserVideosFirstPageCacheBuildLockKey` / `CommentFirstPageCacheBuildLockKey` / `FollowerListBuildLockKey` / `FollowingListBuildLockKey` 分布式锁 + 本地 SingleFlight，抢锁失败短轮询 3×50ms，超时后本地兜底查 DB（详见 §12.1.1） |
 | 并发匿名热榜成品缓存回源 | `anonymousHotFeedPageBuildGroup` 本地 SingleFlight + Redis 构建锁（详见 §12.1.1） |
 | 并发 profile 更新 | `INCR version` 原子 |
@@ -4748,7 +4922,7 @@ T3'  R: Lua CAS: if GET version == v(n) then SET cacheKey ← ❌ v(n) ≠ v(n+1
 
 这就是"**版本号 = 数据时代戳，回填只允许发生在同一时代内**"这条不变量的完整含义。
 
-#### 12.7.2 项目内 9 个版本号一览
+#### 12.7.2 项目内 10 个版本号一览
 
 | # | Version Key | 粒度 | INCR 触发点 | 保护什么缓存 | 存在原因 |
 |---|---|---|---|---|---|
@@ -4759,8 +4933,8 @@ T3'  R: Lua CAS: if GET version == v(n) then SET cacheKey ← ❌ v(n) ≠ v(n+1
 | 5 | `fsz:social:followers:list:{userID}:version` | 单用户 | `Follow` / `Unfollow` 事务提交后（[socialhelper.go:480](d:\feedsystem-zero-main-git\apps\social\internal\logic\socialhelper.go)）+ social_sync job 消费 Kafka 时二次 INCR（[syncconsumer.go:395](d:\feedsystem-zero-main-git\apps\job\social_sync\internal\logic\syncconsumer.go)） | 粉丝列表首页缓存 | 粉丝关系变化必须让"我的粉丝列表""TA 的粉丝列表"立即翻新，防止"刚关注了我却看不到"的直觉不符 |
 | 6 | `fsz:social:followings:list:{userID}:version` | 单用户 | 同上 | 关注列表首页缓存 | 同上，对称设计 |
 | 7 | `fsz:feed:timeline:global:version` | 全局 | feed_timeline job 完成一次全量重建（[timelinewriter.go:450](d:\feedsystem-zero-main-git\apps\job\feed_timeline\internal\logic\timelinewriter.go)）后 INCR | 全局热榜/发现流 Timeline ZSet | job 重建 Timeline 是"整块替换"式，需要一个全局版本号让读侧感知"新一轮 Timeline 已上线"、避免在切换瞬间读到半新半旧的混合数据 |
-| 8 | `fsz:feed:timeline:{userID}:version` | 单用户 | 用户 Timeline 冷启动重建完成后 INCR + 定期 EXPIRE 续期 | 用户个人 Timeline ZSet 与快照缓存 | 单用户 Timeline 有"懒重建"逻辑（inbox + 关注的大 V outbox 合并），版本号用来判定"我这次读到的 ZSet 是否属于当前一致性纪元"，冷启动重建期间旧读者不会污染新缓存 |
-| 9 | `fsz:feed:author:outbox:{authorID}:version` | 单作者 | 大 V 发布视频后 feed_timeline job 追加 outbox 时 INCR（[timelinewriter.go:529](d:\feedsystem-zero-main-git\apps\job\feed_timeline\internal\logic\timelinewriter.go)） | 大 V outbox ZSet | 大 V 在"推拉分离"下只写自己的 outbox，粉丝读侧懒加载合并；版本号保证"我拉到的 outbox 内容与当时那次拉取时快照一致"，避免粉丝读到半推半拉的空档 |
+| 8 | `fsz:feed:timeline:user:{userID}:version` | 单用户 | 小 V 发布/删除/关注/取关事件；用户 inbox 冷启动成功；大 V 取关失效 inbox | 只包含小 V 的用户 inbox ZSet | Job 即使发现 ready 缺失也先 INCR；冷启动查询前后用版本 CAS，防止 MySQL 旧快照覆盖构建期间的新事件。大 V 取关先 INCR 再 DEL inbox/ready，使并发旧构建必然失败并按当前小 V 关系重来 |
+| 9 | `fsz:feed:author:{authorID}:outbox:version` | 单作者 | 大 V 发布/删除事件；作者 outbox 冷启动成功 | 大 V 作者 outbox ZSet | 大 V 只维护一份作者 outbox，粉丝读侧按需合并；构建期间发生新视频事件时 version 变化会拒绝旧临时快照，避免单条事件和 MySQL 冷启动互相覆盖 |
 | 10 | `fsz:notification:unread:{userID}:version` | 单用户 | 任何影响未读数的入口（新建通知、标记已读、标记全部已读、删除未读通知）事务提交后通过 `BumpUnreadVersion` INCR（[notificationcache/unread.go](d:\feedsystem-zero-main-git\common\notificationcache\unread.go)） | `fsz:notification:unread:{uid}:v:{n}` 未读数 int 缓存 | 未读数是**极高频读、中低频写**的典型场景，版本号让"写侧只 INCR、读侧发现新版本就 miss 回源 COUNT"，读多写少下几乎所有读都命中缓存；Redis 挂了直接降级 COUNT，无脏数据风险 |
 
 > 注：#5 和 #6 之所以 **INCR 两次**（socialhelper 一次 + social_sync job 一次），是因为在线路径先本地更新缓存并 INCR，Kafka 消费者再兜底 INCR 一次，保证在线 pipeline 失败时列表缓存仍能被作废——是"两次都 INCR"而不是"两次都 SET"，得益于版本号本身是**单调递增**的、多 INCR 一次只是"跳一版"、不会破坏正确性。

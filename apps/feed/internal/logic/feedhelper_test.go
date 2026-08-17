@@ -5,12 +5,35 @@ import (
 	"testing"
 	"time"
 
+	"feedsystem-zero/apps/feed/feed"
 	"feedsystem-zero/apps/feed/internal/config"
 	"feedsystem-zero/apps/feed/internal/svc"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func TestMergeFeedItemsDeduplicatesInboxAndAuthorOutbox(t *testing.T) {
+	inbox := []*feed.FeedVideoItem{
+		{VideoId: 9, PublishedAt: 900},
+		{VideoId: 7, PublishedAt: 700},
+	}
+	outbox := []*feed.FeedVideoItem{
+		{VideoId: 9, PublishedAt: 900},
+		{VideoId: 8, PublishedAt: 800},
+	}
+
+	items := mergeFeedItems(inbox, outbox, 10)
+	if len(items) != 3 {
+		t.Fatalf("len(items)=%d want=3", len(items))
+	}
+	want := []uint64{9, 8, 7}
+	for index, videoID := range want {
+		if items[index].GetVideoId() != videoID {
+			t.Fatalf("items[%d].video_id=%d want=%d", index, items[index].GetVideoId(), videoID)
+		}
+	}
+}
 
 func TestNormalizeFeedPageSize(t *testing.T) {
 	svcCtx := &svc.ServiceContext{Config: config.Config{Timeline: config.TimelineConf{

@@ -41,7 +41,8 @@ func (l *GetFollowingFeedLogic) GetFollowingFeed(in *feed.GetFollowingFeedReq) (
 	}
 	pageSize := normalizeFeedPageSize(l.svcCtx, in.GetPageSize())
 
-	// inbox 冷启动仍由 rpc 自身兜底：如果 timeline 未 ready 就从 MySQL 快照建一份。
+	// inbox 冷启动仍由 rpc 自身兜底：如果 timeline 未 ready，就从 MySQL
+	// 重建只包含小 V 的快照；大 V 始终由后续 outbox 拉取路径补齐。
 	if err := ensureFollowingTimeline(l.ctx, l.svcCtx, viewerID); err != nil {
 		l.Errorf(
 			"ensure following timeline failed, viewer_id:%d cursor_published_at:%d cursor_video_id:%d error:%v",
