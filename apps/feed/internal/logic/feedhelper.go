@@ -420,6 +420,7 @@ func loadGlobalTimelineMembers(ctx context.Context, svcCtx *svc.ServiceContext) 
 	return timelineMembersFromVideos(videos)
 }
 
+// 从 MySQL 全量拉一份"最近 N 条来自小 V 的关注流"回来，用于重建 Redis 里那份 ZSet 快照。
 func loadFollowingTimelineMembers(ctx context.Context, svcCtx *svc.ServiceContext, userID uint64) ([]string, error) {
 	limit := svcCtx.Config.Timeline.UserTimelineMaxLen
 	if limit <= 0 {

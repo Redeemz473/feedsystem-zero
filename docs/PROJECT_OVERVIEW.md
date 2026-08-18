@@ -3263,6 +3263,95 @@ for attempt := 0; ; attempt++ {
 
 Feed RPC **只返回 video_id 和排序信息**，具体视频详情、作者昵称、点赞数由 Gateway 分别通过三个 Batch 接口聚合，避免 Feed 服务越权访问其他领域数据。
 
+#### 8.6.0 概念入门：inbox / outbox 与端到端流程
+
+在深入 8.6.1 及后续细节之前，先用一组通俗定义把这套架构的两个核心概念讲清楚。所有后续章节都建立在这两个概念之上。
+
+##### （1）什么是 inbox 和 outbox
+
+借用"邮箱"做比喻最容易理解：
+
+- **inbox（收件箱）—— 每个"读者/粉丝"一份**
+  - Redis Key：`fsz:feed:timeline:user:{viewerID}`（ZSet）
+  - 谁往里写：**小 V 发视频时**，`feed_timeline` Job 主动扇出（fanout），把视频 ID `ZADD` 到该小 V**所有活跃粉丝**的 inbox
+  - 谁读：读者刷"关注 Tab"时，`ZREVRANGE` 自己的 inbox
+  - 装的东西：**仅小 V 的视频**
+  - 比喻：小 V 发视频像发一封信 → 邮差（Job）复印 N 份 → 塞进 N 个粉丝的信箱 → 粉丝打开信箱即可看到
+
+- **outbox（发件箱）—— 每个"大 V 作者"一份**
+  - Redis Key：`fsz:feed:author:{authorID}:outbox`（ZSet）
+  - 谁往里写：**大 V 发视频时**，只 `ZADD` 到自己这一份 outbox，**不做扇出**
+  - 谁读：读者刷关注流时，读侧临时把"我关注的所有大 V 的 outbox"拉过来，和自己的 inbox 做归并
+  - 装的东西：**仅该大 V 的视频**
+  - 比喻：大 V 发视频像贴公告，只贴在自己门口的公告栏（outbox）→ 想看的粉丝自己路过来看 → 邮差不投递（因为粉丝数量太大，投递成本爆炸）
+
+##### （2）为什么要区分 inbox 和 outbox
+
+假设一个大 V 有 1000 万粉丝：
+
+| 方案 | 大 V 发一条视频的写入成本 | 粉丝读关注流的成本 |
+|---|---|---|
+| 全走 inbox 推 | 瞬间 1000 万次 `ZADD`，Redis 崩 | 一次 `ZREVRANGE` |
+| 全走 outbox 拉 | 只写 1 次自己的 outbox | 粉丝要合并 N 个作者 outbox，N 越大越慢 |
+| **当前推拉分离** | **小 V 推（成本可控）、大 V 拉（写侧 O(1)）** | **1 个 inbox + 最多 100 个大 V outbox** |
+
+结论：**小 V 走 inbox 推、大 V 走 outbox 拉**，是"写扩散成本"与"读合并成本"的最优折中。大 V 判定用 `accounts.is_big_v` 标记位，只升不降，避免阈值抖动导致写/读侧策略分裂。
+
+##### （3）端到端流程：从"作者发视频"到"用户看到视频"
+
+```mermaid
+flowchart TB
+    subgraph Publish[① 作者发视频]
+        P1[作者调用 Video RPC PublishVideo] --> P2[MySQL 事务:<br/>写 videos + 写 outbox_events]
+        P2 --> P3[Outbox Dispatcher 投递到 Kafka<br/>topic: feed.video.events]
+    end
+
+    subgraph Job[② feed_timeline Job 消费事件]
+        P3 --> J1[回读 MySQL 拿到最终 videos 状态<br/>+ accounts.is_big_v]
+        J1 --> J2{is_big_v?}
+        J2 -->|小 V| J3[分批查询活跃粉丝<br/>Redis Pipeline ZADD 到每个粉丝的 inbox]
+        J2 -->|大 V| J4[只 ZADD 到大 V 自己的 outbox]
+        J3 --> J5[同时更新全局 Timeline]
+        J4 --> J5
+    end
+
+    subgraph Read[③ 用户刷关注流 GetFollowingFeed]
+        R1[用户请求关注流] --> R2[ensureFollowingTimeline<br/>确保 inbox 就绪]
+        R2 --> R2a{inbox ready?}
+        R2a -->|否 冷启动| R2b[SingleFlight+分布式锁+版本CAS<br/>从 MySQL 拉小 V 视频重建 inbox<br/>COALESCE is_big_v,0 = 0]
+        R2a -->|是| R3
+        R2b --> R3[ZREVRANGE inbox 拿本页小 V 视频]
+        R1 --> R4[MySQL 查当前关注的大 V 列表<br/>按 follower_count DESC 取前 100]
+        R4 --> R5[并行 ensureAuthorOutbox<br/>ZREVRANGE 每个大 V 的 outbox]
+        R3 --> R6[归并 + 按 publishedAt/videoID 倒序 + 去重<br/>截取 pageSize 返回]
+        R5 --> R6
+        R6 --> R7[Gateway 用 video_id 批量补齐<br/>视频详情+作者信息+互动计数]
+        R7 --> R8[前端展示]
+    end
+```
+
+**读者视角的一句话总结**：用户看到的关注流 =`ZREVRANGE 自己的 inbox`（小 V 视频）+`并行 ZREVRANGE 关注的所有大 V 的 outbox`（大 V 视频），两部分按时间倒序归并去重后返回一页。
+
+##### （4）关注/取关时 inbox / outbox 也会同步维护
+
+不仅"发视频"会触发 inbox/outbox 变更，"关注关系变化"同样会：
+
+- **关注小 V** → 回填该作者最近 100 条视频到 follower inbox（让新关注立刻能看到历史）
+- **关注大 V** → 什么都不写（下一次读取时按当前关注关系去合并大 V 的 outbox）
+- **取关小 V** → 精确从 follower inbox 中 `ZREM` 属于该作者的 member
+- **取关大 V** → 递增 inbox 版本号 + `DEL inbox + DEL ready`，下次读取时冷启动一个纯净的 inbox（原因见 8.6.3：该作者可能曾经是小 V，历史视频已被 push 进 inbox，简单"什么都不做"会残留脏数据）
+
+##### （5）冷启动兜底：MySQL 才是事实来源
+
+Redis 里的 inbox 和 outbox 都只是**加速用的缓存快照**，可能过期（默认 30 天 TTL）、可能被驱逐、可能因故障丢失。任何时候只要 `ready` 标志不存在，读侧都能通过 `ensureTimeline`（详见 8.6.5）从 MySQL 全量重建：
+
+- **inbox 冷启动**：`SELECT videos JOIN follows JOIN accounts WHERE follower_id = viewer AND COALESCE(a.is_big_v, 0) = 0`，即"该 viewer 关注的所有小 V 的最近 N 条正常视频"
+- **outbox 冷启动**：`SELECT videos WHERE author_id = 大V AND status = normal`，即"该大 V 的最近 N 条正常视频"
+
+冷启动用 SingleFlight + 分布式锁 + 版本号 CAS + 临时 ZSet 原子 RENAME 五层防护，保证任何并发情况下都不会出现半成品、脏数据或缓存击穿。**冷启动逻辑与 Job 的 `is_big_v` 判定完全对齐**（都用 `COALESCE(is_big_v, 0) = 0` 保守把 NULL 视为小 V），从而写侧和读侧不会出现"Job 已经推进 inbox 但冷启动又把它排除"的分裂。
+
+---
+
 #### 8.6.1 数据结构与推拉边界
 
 这里的“推 / 拉”描述的是 **Timeline 在什么时候、按谁的维度物化**，不是“Redis 还是 MySQL”：
