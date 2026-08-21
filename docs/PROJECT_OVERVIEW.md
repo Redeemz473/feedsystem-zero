@@ -3984,6 +3984,50 @@ wg.Wait()
 
 无缓冲 channel 是"天然背压"—— 主 goroutine 塞不进去时说明所有 worker 都在忙，主 goroutine 就阻塞，绝不会预分发一堆积压任务。ctx 取消时 `close(jobs)` 立刻通知所有 worker 停止取新 batch，剩余没塞进去的 batch **直接丢弃** —— 这些事件仍在 DB 里 `status=processing`，60s 后其他实例（或本实例重启后）通过 `staleBefore` 兜底重领，**不丢消息**。
 
+**补充：分片粒度与背压的当前生效范围**
+
+上面说"无缓冲 channel = 天然背压"是通用结论，但在当前实现下需要精确到具体数字才好理解。看 `splitOutboxBatches` 的实际算法（`dispatcher.go`）：
+
+```go
+func splitOutboxBatches(events []model.OutboxEvent, batchCount int) [][]model.OutboxEvent {
+    if len(events) == 0 || batchCount <= 0 { return nil }
+    if batchCount > len(events) { batchCount = len(events) }
+
+    batchSize := (len(events) + batchCount - 1) / batchCount   // ceil(N/W)
+    batches := make([][]model.OutboxEvent, 0, batchCount)
+    for start := 0; start < len(events); start += batchSize {
+        end := start + batchSize
+        if end > len(events) { end = len(events) }
+        batches = append(batches, events[start:end])
+    }
+    return batches
+}
+```
+
+调用点是 `splitOutboxBatches(events, workerCount)` —— **传入的 `batchCount` 就是 `workerCount` 本身**。结论是：
+
+> **`len(batches) == workerCount`**（在 `normalizeOutboxWorkerCount` 收敛之后严格成立）
+
+具体的数量对照（默认 `BatchSize=100 / WorkerCount=4`）：
+
+| 本轮 claim 到的事件数 | worker 数 | batchSize（每片大小） | batch 总数 |
+|:-:|:-:|:-:|:-:|
+| 100 | 4 | 25 | 4 |
+| 50 | 4 | 13 | 4（13/13/13/11）|
+| 10 | 4 | 3 | 4（3/3/3/1）|
+| 3 | 3 | 1 | 3 |
+| 1 | 1 | 1 | 1 |
+
+**这意味着无缓冲 channel 在当前实现下的实际角色是什么？**
+
+因为 batch 数恒等于 worker 数，主 goroutine 塞入 channel 的次数正好等于 worker 数，**每一次 `jobs <- batch` 都能立刻被一个空闲 worker 接走**——"塞不进去时阻塞"这个背压路径在当前场景下**几乎不会真正触发**。所以无缓冲 channel 在这里更精确的价值有三点：
+
+1. **握手同步语义**：`jobs <- batch` 完成的那一刻，一定有 worker 已经接手了这个 batch。这保证主 goroutine 走到 `close(jobs)` 时，所有 batch **都被 worker 接住了**，不会有"塞进 channel 但被 close 吞掉"的悬空 batch。如果换成有缓冲 channel，主 goroutine 秒塞完毕后 close，ctx 若同时取消，worker 从 range 里读到的 batch 就可能被跳过。
+2. **`ctx.Done()` 即时响应**：每次 `jobs <- batch` 都是真实的握手时机，`select { case <-ctx.Done(): ...; case jobs <- batch: }` 能在这个时机检查取消信号。worker 都在跑几十毫秒的 Kafka 网络往返时，主 goroutine 也能在等待握手期间立刻响应取消。
+3. **留有演进空间**：如果将来把 `splitOutboxBatches` 改成"按固定 batch 大小切分"（比如每片固定 25 条），batch 数就会大于 worker 数，那时无缓冲 channel 的"塞不进去阻塞"就会真正开始发挥限流背压的作用——**无需改并发代码**就能自动生效。
+
+一句话：当前配置下 batch 数 == worker 数、握手直接一一对应；无缓冲 channel 更多是在保证"交接语义严格"和"退出响应即时"，而不是抢救过载。真正的过载兜底另有其人——第 ② 层 `inFlight cap=1` 早在 `DispatchOnce` 层就把恢复期打成串行了。
+
 #### 9.1.5 消费者侧失败处理：消息消费不下去了怎么办？
 
 Outbox 只解决"上游一定发出去"，消息成功进入 Kafka 之后就归下游 consumer 管。所有 job（`interaction_sync / social_sync / notification / feed_timeline / hotrank`）都遵循**同一套失败处理骨架**，实现分散在各自的 `internal/logic/*consumer.go`：
