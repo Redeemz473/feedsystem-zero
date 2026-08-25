@@ -302,7 +302,103 @@ erDiagram
     }
 ```
 
-### 5.1 SQL 迁移文件时间线
+### 5.1 索引设计：业务约束、游标分页与后台扫描
+
+本项目并不是只有字段和主键。除所有表统一使用的 `BIGINT UNSIGNED AUTO_INCREMENT` 聚簇主键外，还按实际查询路径设计了三类二级索引：
+
+1. **唯一索引负责业务不变量和幂等**：例如同一用户对同一视频只能有一条点赞关系、同一对用户只能有一条关注关系、同一消费者只能处理一次相同事件。唯一索引不仅加速查询，也是并发请求最终落到 MySQL 时的最后一道一致性约束。
+2. **联合普通索引负责在线列表和游标分页**：通常把等值过滤列放在前面，把时间、游标主键放在后面，例如 `(user_id, status, updated_at, id)` 对应 `WHERE user_id=? AND status=? ORDER BY updated_at DESC,id DESC`。
+3. **任务索引负责 Dispatcher、Consumer 和 Cleanup 小批量扫描**：把状态、到期时间和主键组合起来，使 Job 可以按索引找到有限批次，而不必全表扫描或一次锁住大量记录。
+
+#### 5.1.1 核心表索引与查询路径
+
+| 表 | 关键索引 | 类型 | 主要用途 |
+|---|---|---|---|
+| `accounts` | `uk_username(username)`、`uk_email(email)`、`uk_refresh_token(refresh_token)` | 唯一 | 登录标识与 Refresh Token 唯一；按 Token 精确定位账户 |
+| `videos` | `uk_video_request(author_id,request_id)` | 联合唯一 | 同一作者发布请求幂等；`request_id=NULL` 时仍允许正常发布多个视频 |
+| `videos` | `idx_author_status_created(author_id,status,created_at,id)` | 联合普通 | 用户视频列表和 Feed 按作者冷启动，支持稳定时间游标分页 |
+| `videos` | `idx_status_created_id(status,created_at,id)` | 联合普通 | 推荐流、全局最新视频按状态和发布时间扫描 |
+| `videos` | `idx_play_url_status(play_url,status,deleted_at)`、`idx_cover_url_status(cover_url,status,deleted_at)` | 联合普通 | `file_assets` 引用核对、视频文件安全清理前确认有效引用 |
+| `videos` | `idx_likes_id(likes_count,id)`、`idx_popularity_created_id(popularity,created_at,id)` | 联合普通 | 点赞数/热度排序与持久层兜底查询；在线热榜主路径仍走 Redis ZSet |
+| `file_assets` | `uk_file_hash(file_hash)`、`uk_url(url)` | 唯一 | 内容 Hash 去重、秒传规范副本和 URL 唯一定位 |
+| `file_assets` | `idx_status_ref(status,ref_count,id)` | 联合普通 | `asset_cleanup` 按状态和零引用分批扫描，随后逐条加行锁认领 |
+| `tags` | `uk_name(name)` | 唯一 | 并发发布时相同标签只保留一行 |
+| `video_tags` | `uk_video_tag(video_id,tag_id)` | 联合唯一 | 防止同一视频重复关联同一标签 |
+| `video_tags` | `idx_tag_video(tag_id,video_id)`、`idx_video(video_id)` | 联合/单列普通 | 同时支持按标签查视频、按视频批量查标签 |
+| `likes` | `uk_video_user(video_id,user_id)` | 联合唯一 | 点赞、取消点赞和重新点赞复用一条关系记录，防止重复点赞行 |
+| `likes` | `idx_user_status_updated(user_id,status,updated_at,id)` | 联合普通 | “我的喜欢”列表按最新操作时间稳定游标分页 |
+| `likes` | `idx_video_status_created(video_id,status,created_at)` | 联合普通 | 查询视频有效点赞事实、统计与对账 |
+| `comments` | `uk_comment_request(user_id,request_id)` | 联合唯一 | 客户端重试发布评论时保持幂等 |
+| `comments` | `idx_video_status_deleted_created(video_id,status,deleted_at,created_at,id)` | 联合普通 | 有效评论列表的过滤、倒序游标分页与软删除判断 |
+| `comments` | `idx_user_status_created(user_id,status,created_at,id)` | 联合普通 | 按用户查询有效评论及审计 |
+| `follows` | `uk_follower_following(follower_id,following_id)` | 联合唯一 | 一对用户只保留一条关注关系，取关/重新关注通过状态切换 |
+| `follows` | `idx_following_status_updated(following_id,status,updated_at,id)` | 联合普通 | 粉丝列表按最近关注时间稳定分页 |
+| `follows` | `idx_follower_status_updated(follower_id,status,updated_at,id)` | 联合普通 | 关注列表按最近关注时间稳定分页 |
+| `follows` | `idx_following_status_id(following_id,status,id)` | 联合普通 | `feed_timeline` 按被关注者主键游标分批读取粉丝并执行小 V fanout |
+| `notifications` | `uk_notification_business(business_key)` | 唯一 | 同一点赞/评论/关注业务关系复用通知行，支持撤回后再次激活 |
+| `notifications` | `idx_receiver_status_created(receiver_id,status,occurred_at,id)` | 联合普通 | 收件箱按接收者和未读状态进行稳定游标分页 |
+| `notifications` | `idx_receiver_created(receiver_id,occurred_at,id)` | 联合普通 | 不区分状态的通知列表分页 |
+| `interaction_events` | `uk_event_id(event_id)` | 唯一 | 业务事件身份唯一，支持追踪和幂等 |
+| `interaction_events` | `(video_id,created_at,id)`、`(user_id,created_at,id)`、`(event_type,created_at,id)` | 联合普通 | 按视频、用户或事件类型审计互动流水 |
+| `outbox_events` | `uk_event_id(event_id)` | 唯一 | 一个业务事件只产生一条对应 Outbox 记录 |
+| `outbox_events` | `idx_status_next_retry(status,next_retry_at,id)`、`idx_status_locked(status,locked_at,id)` | 联合普通 | Dispatcher 查找到期任务、回收超时认领记录 |
+| `outbox_events` | `idx_aggregate_status_id(aggregate_type,aggregate_id,status,id)` | 联合普通 | 检查同一聚合前序事件，保证相同业务实体的投递顺序 |
+| `outbox_events` | `idx_status_sent_id(status,sent_at,id)` | 联合普通 | `event_cleanup` 按发送时间分批清理历史已发送事件 |
+| `processed_events` | `uk_event_consumer(event_id,consumer_name)` | 联合唯一 | Kafka at-least-once 投递下，每个消费者对事件只应用一次 |
+| `processed_events` | `idx_expire_id(expire_at,id)` | 联合普通 | `event_cleanup` 按过期时间小批量删除消费幂等记录 |
+| `dead_letter_events` | `uk_consumer_message(consumer_name,topic,partition_no,offset_no)` | 联合唯一 | 用 Kafka 消息坐标防止同一坏消息被重复写入死信表 |
+| `dead_letter_events` | `idx_topic_created(topic,created_at,id)`、`idx_created_id(created_at,id)` | 联合普通 | 按 Topic 审计死信以及按保留期分批归档/清理 |
+
+#### 5.1.2 联合索引为什么按这个顺序
+
+以“我的喜欢列表”为例，核心 SQL 的形态是：
+
+```sql
+SELECT ...
+FROM likes
+WHERE user_id = ?
+  AND status = 1
+  AND (updated_at < ? OR (updated_at = ? AND id < ?))
+ORDER BY updated_at DESC, id DESC
+LIMIT ?;
+```
+
+因此索引设计为：
+
+```sql
+KEY idx_user_status_updated (user_id, status, updated_at, id)
+```
+
+- `user_id`、`status` 是等值过滤列，放在最左侧先缩小扫描范围；
+- `updated_at`、`id` 同时承担排序和复合游标，保证相同时间戳下仍能稳定翻页；
+- `id` 作为最终排序键，避免新增/删除数据后出现重复项或漏项；
+- 查询只读取 `pageSize+1` 条判断 `has_more`，不使用大偏移量 `OFFSET`。
+
+联合索引遵循 **最左前缀原则**。例如 `(author_id,status,created_at,id)` 可以高效支持 `author_id`，以及 `author_id+status` 开头的查询，但不能替代只以 `status` 开头的全局视频查询，所以 `videos` 另外提供 `(status,created_at,id)`。项目不会为每个字段盲目创建单列索引，因为索引越多，发布、点赞、关注等写事务维护 B+Tree 的成本越高；只为真实过滤、排序、幂等和清理路径建索引。
+
+#### 5.1.3 逻辑外键而不是数据库外键
+
+ER 图中的 `videos.author_id → accounts.id`、`likes.video_id → videos.id`、`follows.following_id → accounts.id` 等属于**逻辑外键**。当前建表 SQL 没有声明 `FOREIGN KEY ... REFERENCES`，但这不等于没有关系约束：
+
+- 写入前由 RPC 查询目标实体的状态，事务内再通过行锁或条件更新复核；
+- 唯一索引保证点赞、关注、通知和事件幂等，即使并发请求同时到达也不能产生重复关系；
+- 删除采用状态字段和 `deleted_at` 软删除，避免数据库级联删除扩大锁范围或误删审计数据；
+- `asset_cleanup`、`interaction_sync` 和对账 SQL 负责修复跨异步链路可能出现的短暂漂移。
+
+这种设计降低了跨模块写入时的级联锁和迁移耦合，但代价是业务代码必须始终执行存在性检查、事务约束和定期对账，不能把引用完整性完全交给数据库。
+
+本地 MySQL 是否真正应用了这些索引，应以 `information_schema.STATISTICS` 为准，而不是只看仓库 SQL：
+
+```sql
+SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE,
+       GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS columns_name
+FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'feedsystem_zero'
+GROUP BY TABLE_NAME, INDEX_NAME, NON_UNIQUE
+ORDER BY TABLE_NAME, INDEX_NAME;
+```
+
+### 5.2 SQL 迁移文件时间线
 
 | 文件 | 内容摘要 |
 |---|---|
@@ -3117,7 +3213,7 @@ X 等 Y 释放 B，Y 又等 X 释放 A，形成等待环路；InnoDB 只能检�
 - 旧实现先调 `AccountRpc.GetProfile` 预检目标用户是否存在，增加了一次跨服务 RPC 往返，并且预检结果到本地事务真正开始之间仍存在状态变化窗口。当前实现不再跨服务预检，而是由事务内的 `lockFollowAccounts` 一次查询同时完成“双方存在性校验 + 双行加锁 + 被关注者快照读取”；不足两行时立即返回 `gorm.ErrRecordNotFound`。
 - 旧实现一开始就 `SELECT ... FOR UPDATE` 拉 follows 行，对不存在的唯一键会产生 **gap lock**，后续 `INSERT` 又升级为插入意向锁，导致高并发下频发 1213。当前实现改为**普通 `Take`**（不加锁）预读已存在关系，依靠 accounts 双行 FOR UPDATE 充当构件互斥。若不存在，使用 `INSERT ... ON DUPLICATE KEY DO NOTHING`，并在并发冲突的反馈（`RowsAffected == 0`）后才回读加锁处理。
 
-**关于“目标用户不存在”的错误反馈**：尽管写事务不再调用 `GetProfile`，`lockFollowAccounts` 要求主键集合必须返回两条账户记录，因此目标不存在会在任何 `follows` 写入之前被识别；Follow/Unfollow 再把 `gorm.ErrRecordNotFound` 归一为 `codes.NotFound` “目标用户不存在”返回给上游。数据库外键仍作为最后一道结构完整性兜底，但不再是正常业务路径识别目标不存在的主要手段。
+**关于“目标用户不存在”的错误反馈**：尽管写事务不再调用 `GetProfile`，`lockFollowAccounts` 要求主键集合必须返回两条账户记录，因此目标不存在会在任何 `follows` 写入之前被识别；Follow/Unfollow 再把 `gorm.ErrRecordNotFound` 归一为 `codes.NotFound` “目标用户不存在”返回给上游。当前数据库没有声明物理外键，结构完整性由锁内存在性校验、`uk_follower_following` 联合唯一约束和事务共同保证。
 
 ---
 
