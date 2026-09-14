@@ -3565,23 +3565,210 @@ flowchart TD
 
 #### 8.6.5 三类 Timeline 的冷启动
 
-| 冷启动对象 | 触发者 | MySQL 快照 | 默认容量 | 构建方式 |
+##### 8.6.5.1 冷启动到底是什么
+
+这里的“冷启动”不是启动 Go 进程，而是某一份 Redis Timeline **尚未形成可信的完整快照**。常见原因包括：第一次访问、30 天 TTL 到期、Redis 淘汰或重启，以及关注关系变化后主动删除用户 inbox。MySQL 中的 `videos`、`follows` 和 `accounts` 始终是事实来源，Redis 只保存受容量限制的读模型。
+
+每份 Timeline 都有三个核心 Key：
+
+| Key | 含义 |
+|---|---|
+| Timeline ZSet | 已物化的视频 member，member 编码了 `published_at + video_id` |
+| `:version` | 并发变更序号；发布、删除、关注变更以及成功重建都会推进 |
+| `:ready` | “这份 ZSet 是完整快照”的发布标记 |
+
+代码通过 `EXISTS readyKey` 判断是否就绪，**不是读取一个 `ready=0` 的状态值**：
+
+- `ready` 存在且值为 `1`：正式 Timeline 可以读取。
+- `ready` 不存在：Timeline 尚未构建完成，即使 ZSet 中碰巧有 member 也不能当成完整数据读取。
+- `ready` 存在但 ZSet 不存在：表示 MySQL 查询得到的是一个**完整的空快照**，不是缓存穿透。
+
+三类 Timeline 的冷启动边界并不相同：
+
+| 冷启动对象 | 触发者 | MySQL 快照 | 默认容量 | 生命周期与构建方式 |
 |---|---|---|---:|---|
-| 用户 inbox | Feed RPC 首次读取或 30 天 TTL 到期 | 当前关注关系中所有小 V 的最新正常视频 | 2000 | SingleFlight + 用户级 Redis 锁 + version CAS + 临时 ZSet |
-| 大 V author outbox | Feed RPC 首次需要拉取该作者或 30 天 TTL 到期 | 该作者最新正常视频 | 500 | SingleFlight + 作者级 Redis 锁 + version CAS + 临时 ZSet |
-| 全局 Timeline | `feed_timeline` Job 启动或 ready 丢失自愈 | 全站最新正常视频 | 10000 | Job 级 Redis 锁 + version CAS + 临时 ZSet |
+| 用户 inbox | Feed RPC 首次读取、TTL 到期或主动失效 | 当前用户关注的全部小 V 中，最新的正常视频 | 2000 | 30 天滑动 TTL；SingleFlight + 用户级 Redis 锁 + version CAS |
+| 大 V author outbox | Feed RPC 第一次需要读取该作者或 TTL 到期 | 该大 V 自己最新的正常视频 | 500 | 30 天 TTL；SingleFlight + 作者级 Redis 锁 + version CAS |
+| 全局 Timeline | `feed_timeline` Job 启动或 ready 丢失自愈 | 全站最新正常视频 | 10000 | Job 单点负责；Redis 锁 + version CAS，正式 Key 常驻 |
 
-用户 inbox 和作者 outbox 复用 `ensureTimeline`，完整过程如下：
+因此，“小 V 冷启动”并不是为每个小 V 建一份 outbox，而是**按读者维度重建一份聚合 inbox**；“大 V 冷启动”才是**按作者维度逐个重建 outbox**。
 
-1. 先检查 `ready`；命中直接返回，不查询 MySQL。
-2. 同进程通过包级 SingleFlight 合并相同构建请求。
-3. 多实例通过 `SET NX EX` 构建锁竞争；锁值是随机 token，释放时使用 Lua 比较 token，不能误删后来实例的新锁。
-4. 未持锁者最多等待 `BuildWaitMs`（当前 1500ms），轮询 `ready`；不会无限阻塞 RPC。
-5. 持锁者记录构建前 `version`，查询 MySQL 完整快照并写入随机临时 ZSet。
-6. Lua 再比较当前版本：一致才删除旧正式 Key、`RENAME` 临时 Key、递增版本、写 `ready` 并设置 TTL；不一致说明构建期间发生发布/删除/关注变化，删除临时 Key后重试，最多 3 次。
-7. 空快照同样写 `ready`；正式 ZSet 可以不存在，语义仍是“完整但为空”。
+##### 8.6.5.2 用户 inbox 与大 V outbox 的通用构建协议
 
-这套版本校验处理了最危险的竞态：冷启动正在查询 MySQL 时，Kafka Job 又处理了一条新事件。Job 无论 `ready` 是否存在都会先递增相同版本号，因此旧构建者不能用查询开始时的快照覆盖新状态；它只能重新读取 MySQL 后再发布。
+Feed RPC 中的 `ensureFollowingTimeline` 和 `ensureAuthorOutbox` 最终都进入 `ensureTimeline`，过程如下：
+
+1. **快速检查**：先检查 `ready`。已经就绪就直接读 Redis，不访问 MySQL。
+2. **进程内合并**：同一个 Go 实例用包级 `SingleFlight` 合并相同用户或相同作者的并发构建请求，只让一个协程继续回源。
+3. **跨实例互斥**：多个 Feed RPC 实例通过 Redis `SET lockKey token NX EX 15s` 竞争构建权。随机 token 标识锁的所有者；释放时 Lua 先比较 token，避免旧请求误删别人后来取得的新锁。
+4. **未持锁者有界等待**：未抢到锁的请求每 50ms 检查一次 `ready`，最多等待 `BuildWaitMs`（默认 1500ms）。超时返回 `Unavailable`，不会让所有请求绕过锁一起打 MySQL。
+5. **记录版本**：持锁者读取当前 `version`；Key 不存在时按 0 处理。
+6. **读取 MySQL 快照**：查询只选 `id/author_id/status/deleted_at/created_at`，并受 3 秒 DB 超时和 Timeline 容量上限约束。
+7. **构造临时 ZSet**：把结果编码为固定宽度 member，按每批 500 条写入带随机 token 的临时 Key。正式 Timeline 在这一阶段保持不变，读者看不到半成品。
+8. **Lua 原子发布**：Lua 再读取 `version`。只有它仍等于步骤 5 的版本，才会删除旧正式 Key、将临时 ZSet `RENAME` 为正式 Key、递增版本、写入 `ready=1`，并统一设置 TTL。
+9. **版本冲突重建**：若版本已经变化，说明查询期间发生了发布、删除或关注关系变更；Lua 删除临时 Key并拒绝发布，持锁者重新读版本和 MySQL，最多尝试 3 次。
+10. **持续高频变化时降级**：连续 3 次都冲突则返回“Feed 初始化失败，请稍后重试”。系统宁可让本次请求失败，也不会发布一份已知不完整的缓存。
+
+构建锁解决“谁来查 MySQL”，版本 CAS 解决“查出来的快照还能不能发布”。即使构建超过锁 TTL、另一个实例重新拿到锁，两位构建者也不能同时覆盖正式数据：第一位成功发布后会递增版本，另一位的旧版本 CAS 随即失败。
+
+##### 8.6.5.3 小 V：如何从 MySQL 冷启动用户 inbox
+
+当用户 U 第一次打开关注流，或 `fsz:feed:timeline:user:{U}:ready` 已过期/被主动删除时，Feed RPC 以 U 为维度执行下面的快照查询。等价 SQL 为：
+
+```sql
+SELECT v.id, v.author_id, v.status, v.deleted_at, v.created_at
+FROM videos AS v
+JOIN follows AS f ON f.following_id = v.author_id
+LEFT JOIN accounts AS a ON a.id = v.author_id
+WHERE f.follower_id = :viewer_id
+  AND f.status = 1
+  AND f.deleted_at IS NULL
+  AND COALESCE(a.is_big_v, 0) = 0
+  AND v.status = 1
+  AND v.deleted_at IS NULL
+ORDER BY v.created_at DESC, v.id DESC
+LIMIT 2000;
+```
+
+这条查询的含义是：
+
+1. 从 `follows` 找到 U 当前仍有效的关注关系。
+2. 连接 `accounts`，只保留 `is_big_v=0` 的作者；异常缺少账号行时用 `COALESCE(...,0)` 保守按小 V 处理，与 Job 写侧判定一致。
+3. 连接 `videos`，只保留正常且未软删除的视频。
+4. 按 `(created_at DESC,id DESC)` 取最近 2000 条，重建的是“U 关注的所有小 V 的合并收件箱”，不是某一个作者的列表。
+
+`follows` 的 follower 侧联合索引负责收窄 U 的有效关注关系，`videos.idx_author_status_created` 支持按作者筛选正常视频；跨多个作者做全局时间排序时仍可能发生排序，因此容量上限既是 Redis 边界，也是冷启动 DB 成本边界。
+
+冷启动成功后，`GetFollowingFeed` 从这一个 inbox 读取 `pageSize+1` 条小 V 视频。后续小 V 发布视频不再回源：`feed_timeline` Job 会按关注关系每批查询最多 500 个粉丝，再通过 Redis Pipeline 把新 member 写入每位已就绪粉丝的 inbox。
+
+##### 8.6.5.4 大 V：如何从 MySQL 冷启动作者 outbox
+
+大 V 不参与用户 inbox 的 MySQL 重建。每次读取关注流时，Feed RPC 先查询 U 当前关注的大 V：
+
+```sql
+SELECT f.following_id
+FROM follows AS f
+JOIN accounts AS a ON a.id = f.following_id
+WHERE f.follower_id = :viewer_id
+  AND f.status = 1
+  AND f.deleted_at IS NULL
+  AND a.is_big_v = 1
+ORDER BY a.follower_count DESC, f.following_id ASC
+LIMIT 100;
+```
+
+随后逐个检查这些大 V 的 `fsz:feed:author:{authorID}:outbox:ready`。某位作者尚未就绪时，以作者为维度执行：
+
+```sql
+SELECT id, author_id, status, deleted_at, created_at
+FROM videos
+WHERE author_id = :author_id
+  AND status = 1
+  AND deleted_at IS NULL
+ORDER BY created_at DESC, id DESC
+LIMIT 500;
+```
+
+该查询由 `videos.idx_author_status_created(author_id,status,created_at,id)` 支撑。构建完成后，所有关注这位大 V 的用户共享同一份 outbox，避免每位粉丝各自存一份副本。Feed RPC 再读取“U 的小 V inbox + 最多 100 份大 V outbox”，按 `(published_at DESC,video_id DESC)` 归并、去重并截断到本页。
+
+如果某一份大 V outbox 构建失败，当前实现只记录错误并暂时跳过该作者，不阻断其余关注流；下一次请求会继续尝试。这是一种可用性优先的短暂降级，不会改变 MySQL 中的真实数据。
+
+##### 8.6.5.5 全局 Timeline：由 Job 单点冷启动
+
+全局 Timeline 用于推荐流，所有用户共享。它不由 Feed RPC 回源构建，避免 RPC 与 Job 同时争抢全局构建锁。`feed_timeline` Job 启动时先检查 `fsz:feed:global_timeline:ready`；缺失时取得 30 秒构建锁，并从 MySQL 查询：
+
+```sql
+SELECT id, author_id, status, deleted_at, created_at
+FROM videos
+WHERE status = 1
+  AND deleted_at IS NULL
+ORDER BY created_at DESC, id DESC
+LIMIT 10000;
+```
+
+`videos.idx_status_created_id(status,created_at,id)` 支撑这条最新视频查询。Job 同样使用“读取版本 → 写临时 ZSet → Lua 比较版本 → 原子 RENAME → 设置 ready”的协议，最多重试 3 次。其他 Job 实例未取得锁时最多等待 5 秒；Feed RPC 只做有界等待，ready 建立后再读取，不自行创建第二套全局快照。
+
+全局 Timeline 与用户 inbox/作者 outbox有一个重要差别：视频事件处理时若全局 `ready` 丢失，Lua 先递增全局版本并返回 `errGlobalTimelineNotReady`；Consumer 捕获后主动执行 `BootstrapGlobalTimeline`，再**重试同一条事件**。因此全局流不会因为未就绪而静默跳过当前事件。
+
+##### 8.6.5.6 冷启动时小 V 又发布视频：全部时序
+
+以下以“用户 U 正在重建小 V inbox，U 关注的小 V S 发布视频 X”为例。X 必须先在 Video RPC 的 MySQL 事务中完成 `videos + outbox_events` 提交，Dispatcher 才可能把事件送到 Kafka，因此 Consumer 看见事件时 MySQL 中一定已经有 X。
+
+小 V 的 Redis 变更脚本严格按以下顺序执行：
+
+```text
+INCR 用户 inbox version
+检查 ready 是否存在
+├─ 不存在：直接返回，不 ZADD 单条视频
+└─ 存在：ZADD 视频 member，裁剪容量并刷新 TTL
+```
+
+之所以未就绪时不直接 `ZADD`，是因为“一条刚发布的视频”不等于“最近 2000 条完整关注流”。具体竞态有以下几种：
+
+| 时序 | 实际过程 | 最终结果 |
+|---|---|---|
+| **A. 冷启动先发布，Consumer 后执行** | 构建者查询 MySQL 并成功 CAS、`ready=1`；随后 Consumer `INCR version`，看到 ready 已存在并 `ZADD X` | X 被补进正式 inbox；即使快照中已经有 X，ZSet 对相同 member 的 `ZADD` 也是幂等的 |
+| **B. Consumer 在版本读取与 CAS 之间执行** | 构建者记下版本 V；Consumer 把版本改为 V+1。若 ready 尚不存在，Consumer 不写 X；构建者用 V 做 CAS 时失败 | 临时快照被删除，构建者重新查询 MySQL；因为 X 已提交，新快照会包含 X |
+| **C. Consumer 先执行，冷启动后开始** | Consumer 先推进版本，ready 不存在所以不写 X；之后构建者读取新版本并查询 MySQL | MySQL 快照直接包含 X，随后正常发布完整 inbox |
+| **D. MySQL 查询已经包含 X，但 Consumer 又推进版本** | 虽然临时快照已有 X，Consumer 在 CAS 前仍把版本推进 | CAS 保守失败并多重建一次；有少量额外开销，但不会错发旧快照 |
+| **E. 两段 Lua 看似同时执行** | Redis 单线程串行执行脚本，不存在命令级穿插 | Consumer 先执行则走 B/C；替换脚本先执行则走 A，不会出现“检查 ready 后被覆盖”的中间态 |
+| **F. 视频已提交但 Kafka 尚未消费** | 冷启动 SQL 如果已经看见 X，会提前把 X 带入快照；若查询发生在提交前，则先发布旧快照 | 后一种情况会在 Consumer 到达后走 A，把 X 加入；只存在异步链路允许的短暂可见性延迟 |
+
+这里的关键不是要求 MySQL 和 Redis 同时提交，而是保证两种合法结局之一：**旧构建 CAS 失败后重查 MySQL**，或者**完整快照先发布、Consumer 随后增量 ZADD**。发布和删除使用同一版本协议，删除时把 `ZADD` 换成 `ZREM`，结论相同。
+
+##### 8.6.5.7 冷启动时大 V 又发布视频：全部时序
+
+假设用户 U 正在读取大 V B，B 的 author outbox 尚未就绪，同时 B 发布视频 Y。大 V 脚本也遵循“先递增版本，再检查 ready”的顺序，但作用域从“某位粉丝 inbox”变为“B 唯一的一份 author outbox”：
+
+```text
+INCR B 的 author outbox version
+检查 B 的 outbox ready 是否存在
+├─ 不存在：不 ZADD，等待该作者的 MySQL 完整快照
+└─ 存在：ZADD Y，并裁剪为最近 500 条
+```
+
+对应结果如下：
+
+1. **outbox 冷启动先完成**：`ready=1` 建立后 Consumer 到达，直接把 Y 加入 B 的 outbox。
+2. **Consumer 在构建 CAS 前到达**：版本发生变化，旧临时 outbox 不能替换正式 Key；构建者重查 MySQL，新查询包含已经提交的 Y。
+3. **Consumer 在构建开始前到达**：它只推进版本、不制造一条数据的残缺 outbox；后来的 MySQL 查询直接读取 Y。
+4. **查询已经包含 Y 但版本仍被推进**：发生一次保守重建，结果仍正确；后续重复 `ZADD` 不会生成重复视频。
+5. **Kafka 晚于快照发布**：用户可能在一个很短窗口里先看到旧页，Consumer 到达后补入 Y；这是 Outbox/Kafka 最终一致链路的预期延迟。
+
+大 V 情况不需要对每个粉丝分别处理这些竞态。无论 B 有多少粉丝，都只维护同一个版本、ready 和 outbox；之后所有粉丝在读侧共享它。这正是大 V 使用“拉模式”能够避免写扩散的原因。
+
+##### 8.6.5.8 一张图串起构建与并发发布
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant V as Video RPC
+    participant DB as MySQL
+    participant F as Feed RPC 构建者
+    participant R as Redis
+    participant J as feed_timeline Job
+
+    F->>R: EXISTS ready = 0，获取构建锁
+    F->>R: GET version = V
+    F->>DB: 查询小 V inbox 或大 V outbox 完整快照
+    V->>DB: COMMIT videos + feed outbox event
+    DB-->>J: Dispatcher/Kafka 异步投递发布事件
+    J->>R: Lua INCR version
+    alt ready 尚不存在
+        J->>R: 不写单条 member
+    else ready 已存在
+        J->>R: ZADD 新视频 member
+    end
+    F->>R: 写随机临时 ZSet
+    F->>R: Lua CAS expected version=V
+    alt version 已被 Job 改变
+        R-->>F: 拒绝替换并删除临时 Key
+        F->>DB: 重新查询，快照包含新视频
+    else version 未改变
+        R-->>F: RENAME 临时 Key，INCR version，SET ready=1
+    end
+```
+
+最终读取仍只拿到 `video_id + published_at`。Gateway 会再批量调用 Video、Interaction 和 Account RPC 补齐视频详情、实时互动统计、查看者 `is_liked` 与作者资料；Timeline 冷启动不会复制这些变化频繁的字段。
 
 #### 8.6.6 Timeline ZSet 编码与分页
 
