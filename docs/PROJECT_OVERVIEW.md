@@ -3796,40 +3796,126 @@ sequenceDiagram
 
 ### 8.7 HotRank 热榜模块
 
-**职责**：以独立 Consumer Group 直接消费 `interaction.like.events` 和 `interaction.comment.events`，将每条互动按发生时间写入 UTC 单分钟热度窗口；Feed 读侧把最近 N 个窗口按时间衰减合并成稳定分页快照。
+热榜不是定时扫描 `videos` 表再按累计点赞数排序，而是一条独立的事件投影链路：点赞、取消点赞、评论和删除评论先通过 Transactional Outbox 可靠投递到 Kafka，`hotrank-job` 再把事件实时投影到 Redis 分钟窗口；Feed 读侧只合并有限数量的窗口，并把结果发布为固定快照。因此，MySQL 保存业务事实和长期累计统计，Redis 保存面向近期趋势的热榜派生视图。
 
-**核心机制**：
+默认配置如下：
 
-- 点赞权重为 `3`，评论权重为 `5`；取消点赞/删除评论写入对应负分。
-- 每分钟一个 ZSET：`fsz:hot:window:{yyyyMMddHHmm}`，member=videoID，score=该分钟净热度。
-- Redis Lua 在同一原子块中写 `ProcessedEventKey(eventID, hotrank)` 与 `ZINCRBY`，Kafka 重放不会重复计分。
-- 消息按 `topic+partition` 分组，组内保序、组间默认 4 worker 并发；坏消息进入 `dead_letter_events`。
-- 分钟窗口默认保留 2 小时；超过保留期的旧消息只写幂等标记，不复活过期窗口。
-- `GetHotFeed` 默认聚合最近 60 个分钟窗口，按 30 分钟半衰期加权，通过临时 ZSET + Lua 校验锁 + `RENAME` 原子发布快照。
-- 快照 key 为 `fsz:hot:merge:{asOf}`，`ready` key 即使值为 0 也表示“已成功构建空榜”，避免缓存穿透。
+| 配置 | 默认值 | 含义 |
+|---|---:|---|
+| `WindowRetentionSeconds` | 7200 秒 | 单分钟窗口保留 2 小时，覆盖聚合范围并为迟到消息留出余量 |
+| `WindowMinutes` | 60 分钟 | 每份热榜快照聚合最近 60 个分钟窗口 |
+| `HalfLifeMinutes` | 30 分钟 | 热度每经过 30 分钟衰减为原来的一半 |
+| `MaxRankSize` | 1000 | 固定快照只保留 Top 1000，限制内存占用和分页上限 |
+| `SnapshotTTLSeconds` | 1800 秒 | 固定快照及其 `ready` 标记保留 30 分钟 |
+| `WorkerCount` | 4 | HotRank Consumer 默认并发处理 4 个 `topic+partition` 消息组 |
 
 ```mermaid
 flowchart LR
-    I[Interaction RPC Outbox] --> K[Kafka like/comment events]
-    K --> H[hotrank Job 独立 Consumer Group]
-    H --> L[Redis Lua 事件幂等 + ZINCRBY]
+    I[Interaction RPC 写业务表与 Outbox] --> D[Outbox Dispatcher]
+    D --> K[Kafka 互动事件]
+    K --> H[hotrank-job 独立 Consumer Group]
+    H --> L[Lua 事件幂等与 ZINCRBY]
     L --> W[UTC 单分钟窗口 ZSET]
 
-    F[Feed.GetHotFeed] --> C{snapshot ready?}
+    F[Feed.GetHotFeed] --> C{快照是否 ready}
     C -->|是| S[读取固定 merge 快照]
     C -->|否| SF[本地 SingleFlight]
     SF --> DL[Redis 分布式构建锁]
-    DL --> ZU[ZUNIONSTORE 最近 60 分钟 + 衰减权重]
-    ZU --> TMP[临时 ZSET 只保留 Top K]
-    TMP --> P[Lua 校验锁并原子发布 merge + ready]
+    DL --> ZU[最近 60 分钟按衰减权重合并]
+    ZU --> TMP[临时 ZSET 保留 Top K]
+    TMP --> P[Lua 校验 token 并原子发布]
     P --> S
 ```
 
-#### 8.7.1 为什么使用分钟窗口 + 固定快照
+#### 8.7.1 写侧：互动事件如何进入分钟窗口
 
-直接按 `videos.popularity` 全表排序无法表达时间窗口，而且数据量增长后排序成本高。分钟窗口让写入只做一次 `ZINCRBY`，读侧再通过 `ZUNIONSTORE` 合并有限窗口；同一个 `snapshot_at` 只构建一次并缓存 30 分钟，后续分页始终读取同一份榜单，不会因新互动导致翻页重复或遗漏。
+`hotrank-job` 使用独立 Consumer Group 同时订阅 `interaction.like.events` 和 `interaction.comment.events`。它和互动统计落库、通知等消费者各自维护 Kafka offset，同一条事件可以被多个业务投影独立消费，互不抢占。
 
-缓存命中与冷构建的本机实测见 §14.6：匿名非空热榜在 Gateway 2 秒成品缓存命中时，50 并发三轮中位数为 8468.8 QPS、P99 15ms；显式删除当前分钟 merge、ready 和 Gateway 成品缓存后，三次单请求冷构建平均 11.77ms、最大 15.86ms，且每次都返回 20 条视频。这里必须区分“持续缓存命中吞吐”和“单次冷构建耗时”，不能再用持续 30 秒压测的 QPS 代表一次快照构建成本。
+每类事件先转换为热度增量：
+
+| 事件 | 热度增量 |
+|---|---:|
+| 点赞 `like.created` | `+3` |
+| 取消点赞 `like.deleted` | `-3` |
+| 发布评论 `comment.created` | `+5` |
+| 删除评论 `comment.deleted` | `-5` |
+
+处理一条合法事件时执行以下步骤：
+
+1. 校验 Kafka envelope、业务 action、delta、`video_id` 和事件时间；不合法且无法重试的消息写入 `dead_letter_events`，避免脏消息永久阻塞分区。
+2. 使用事件的 `occurred_at`，而不是 Consumer 当前时间，按 UTC 截断到分钟。例如北京时间 `2026-08-13 03:05:34` 对应 UTC 分钟桶 `fsz:hot:window:202608121905`。
+3. ZSET 的 member 是 `videoID`，score 是该视频在这一分钟内的净热度。一次事件执行一次 `ZINCRBY windowKey delta videoID`，单次写入复杂度约为 `O(log N)`。
+4. Lua 在同一个原子块中先检查 `ProcessedEventKey(eventID, hotrank)`，再写幂等标记并执行 `ZINCRBY`。如果 Redis 已更新但 Kafka offset 尚未提交，消息重放只会命中幂等标记，不会重复计分。
+5. 窗口的绝对过期时间固定为“分钟起点 + 2 小时”，迟到消息不会给旧窗口续期。如果事件到达时对应窗口已经过期，只记录已处理标记，不重新创建过期窗口。
+
+Consumer 先按 `topic+partition` 分组：同组串行保证该 Kafka 分区内的事件顺序，组间通过 worker pool 并发提高吞吐。一个批次使用 Redis Pipeline 减少网络往返，但每条事件仍由独立 Lua 保证“幂等标记 + 热度增量”的原子性。
+
+#### 8.7.2 读侧：分钟窗口如何按时间衰减合并
+
+客户端第一次请求热榜时通常不传 `snapshot_at`。Feed RPC 将当前时间规范化到 UTC 分钟边界，得到本次榜单的基准时间 `T`，再选取 `T` 到 `T-59min` 共 60 个窗口。视频 `v` 的快照热度为：
+
+```text
+HotScore(v, T) = Σ WindowScore(v, T-age) × 0.5^(age / 30)
+                 age=0..59
+```
+
+当前分钟权重为 `1`，15 分钟前约为 `0.7071`，30 分钟前为 `0.5`，59 分钟前约为 `0.2559`。因此近期互动贡献更大，历史累计点赞很多但近期没有互动的视频会自然下沉。
+
+构建逻辑使用 Redis 原生命令完成，不把 60 个窗口全部拉回 Go 进程：
+
+1. `ZUNIONSTORE tempKey 60 ... WEIGHTS ... AGGREGATE SUM` 按衰减权重合并窗口。
+2. `ZREMRANGEBYSCORE tempKey -inf 0` 删除净热度小于等于 0 的视频。
+3. `ZREMRANGEBYRANK` 只保留分数最高的 Top `MaxRankSize`，默认 1000 条。
+4. 临时 key 设置短 TTL，构建进程异常退出时会自动清理。
+
+这个过程只处理最近 60 个 Redis ZSET，不扫描 MySQL `videos` 全表，也不按持久化累计热度做大范围排序。热榜表达的是“近期趋势”，而 `videos.popularity` 表达的是异步落库后的累计统计，两者职责不同。
+
+#### 8.7.3 固定快照如何并发构建和原子发布
+
+每个 UTC 分钟对应一组 key：
+
+| Key | 作用 |
+|---|---|
+| `fsz:hot:merge:{asOf}` | 已发布、只读的热榜 ZSET 快照 |
+| `fsz:hot:merge:{asOf}:ready` | 快照完成标记，值为快照条数 |
+| `fsz:hot:merge:{asOf}:lock` | 跨 Feed 实例的构建锁，值为随机 token |
+| 临时 ZSET | 构建中的中间结果，成功后原子替换正式快照 |
+
+并发请求同时发现快照不存在时，单实例先通过 SingleFlight 合并相同 `asOf` 的构建任务，多实例再通过 Redis `SET NX EX` 竞争分布式锁。持锁者负责合并窗口；未持锁者只做有界等待并重读 `ready`，不会同时重复执行 60 窗口聚合。
+
+构建完成后不能依次执行“删除旧 key、复制数据、设置 ready”，否则读请求可能看到半份榜单。当前实现使用 Lua 完成发布：
+
+1. 校验 lock key 中的 token 仍属于当前构建者，防止锁超时后旧构建者覆盖新结果。
+2. 删除同名旧快照，通过 `RENAME tempKey snapshotKey` 原子替换正式 ZSET。
+3. 为正式快照设置 30 分钟 TTL。
+4. 最后写入 `ready`，其值为快照条数，并设置相同 TTL。
+
+`ready=0` 也表示“空榜已成功构建”，不是缓存未命中。这样没有热点视频时不会让每个请求反复重建空榜。如果 `ready>0` 但正式 ZSET 因异常淘汰而不存在，读取逻辑会删除损坏的 `ready` 并按未构建处理。
+
+#### 8.7.4 固定快照为什么能保证稳定分页
+
+首页返回的不只有视频列表，还返回 `snapshot_at=T`。后续请求必须携带同一个 `snapshot_at` 和新的 `offset`，Feed RPC 始终对 `fsz:hot:merge:{T}` 执行 `ZREVRANGE WITHSCORES`：
+
+1. 每次读取 `page_size+1` 条，用额外一条判断 `has_more`。
+2. 当前页 rank 等于 `offset + 页内下标 + 1`。
+3. 若还有下一页，返回 `next_offset = offset + 本页条数`。
+4. 快照内发现无法解析的 member 时跳过并异步 `ZREM`，单个脏元素不会阻断整页。
+
+假设用户在 `10:00` 读取第一页，快照顺序是 `[A,B,C,D,...]`；随后 A 获得新点赞、E 获得大量评论。这些事件只更新分钟窗口，不会修改已经发布的 `10:00` merge 快照。用户读取第二页时仍基于 `snapshot_at=10:00`，因此不会因为榜单实时重排而出现视频重复或遗漏。到 `10:01` 发起新的首页请求时，会使用新的 `asOf` 构建快照，最新互动才反映到新榜单中。
+
+只有首页 `offset=0` 可以创建快照。若客户端请求后续页时快照已经过期或丢失，服务返回“快照失效，请从首页重新开始”，而不是重新构建同一个历史快照。原因是原始分钟窗口可能已经收到迟到事件，重新构建的排序不一定等于用户读取第一页时的排序，继续翻页会破坏一致性。
+
+因此这里保证的是**一次分页会话内的排名稳定**，不是毫秒级实时排序：同一分钟快照发布后的新互动会进入分钟窗口，并在下一分钟的新快照中体现，以最多约 1 分钟的新鲜度换取分页不重不漏和高缓存复用率。
+
+#### 8.7.5 高性能来源、降级边界与实测
+
+- **事件驱动写入**：不轮询 MySQL，每个互动事件只更新所属分钟的一个 ZSET member。
+- **有限窗口聚合**：冷构建固定合并 60 个窗口并裁剪为 Top 1000，成本不随历史事件总量线性增长。
+- **同分钟快照复用**：同一分钟的请求共享一份 merge 快照，绝大多数请求只执行一次 `ZREVRANGE`。
+- **匿名成品缓存**：Gateway 还会把补全视频、作者和统计后的匿名 HTTP 响应缓存 2 秒，吸收首页突发流量；登录用户因 `is_liked` 个性化而绕过这层成品缓存。
+- **保护 MySQL**：HotRank 是 Redis 派生视图。Redis 不可用或快照构建失败时返回可重试错误，不降级为 MySQL 全表排序，避免故障时把压力转移到数据库。
+
+缓存命中与冷构建的本机实测见 §14.6：匿名非空热榜在 Gateway 2 秒成品缓存命中时，50 并发三轮中位数为 8468.8 QPS、P99 15ms；显式删除当前分钟 merge、ready 和 Gateway 成品缓存后，三次单请求冷构建平均 11.77ms、最大 15.86ms，且每次都返回 20 条视频。这里必须区分“持续缓存命中吞吐”和“单次冷构建耗时”，不能用持续 30 秒压测的 QPS 代表一次快照构建成本。
 
 ---
 
@@ -4352,9 +4438,37 @@ UNIQUE KEY uk_event_consumer (event_id, consumer_name)
 
 > 点赞和取消赞是两个独立事务写入 `outbox_events` 表的**两行**，为什么最终 consumer 一定能按"先点赞、后取消赞"的顺序消费？既然要保序，consumer 端又是怎么并发提升吞吐的？
 
-答案是四层机制层层传导，任何一层缺失顺序都会崩：**同 aggregate 保序 claim → aggregate_id 作 partition key → topic+partition 分组保序 → worker pool 组间并发**。
+答案不是“相同 Key 自动有序”这么简单，而是五道关卡共同传导：**业务入口按点赞关系串行化 → 同 aggregate 按 Outbox ID 保序 claim → aggregate_id 作 partition key → Kafka partition 内 offset 有序 → topic+partition 组内保序、组间并发**。其中 partition key 只解决“发到同一条有序日志”，并不负责把并发发布请求按业务时间重新排序。
 
-##### 一、身份三元组：一条事件如何被识别
+##### 一、业务入口：先确定哪一个操作真正先成功
+
+点赞的保序单元不是“某个视频”，而是“某个用户对某个视频的点赞关系”。`LikeVideo` 和 `UnlikeVideo` 使用完全相同的 Redis 短锁：
+
+```text
+LikeActionLockKey(videoID, userID)
+```
+
+锁通过 `SET NX EX 3s` 获取，value 是随机 token，释放时由 Lua 比较 token 后再删除。正常的“先点赞成功，再取消点赞”过程是：
+
+```text
+LikeVideo 取得关系锁
+  → MySQL 事务提交 likes=active + interaction_event + like.created outbox
+  → 事务后更新 Redis 实时状态
+  → token 校验后释放关系锁
+  → UnlikeVideo 才能取得同一把锁
+  → MySQL 事务提交 likes=deleted + interaction_event + like.deleted outbox
+```
+
+第二个请求若在第一个请求仍持锁时到达，不会在服务端排队，而是返回 `codes.Aborted / 操作过于频繁，请稍后重试`。客户端稍后重试后才会进入第二个事务。因此两次**成功的**业务操作会先在 MySQL 中形成确定顺序：点赞 Outbox 行在前，取消点赞 Outbox 行在后。
+
+这把锁还有两层业务价值：
+
+1. 点赞和取消点赞不能同时根据同一份旧状态做判断，避免两个事务交叉修改同一条 `(video_id,user_id)` 关系。
+2. 重复点赞或重复取消会根据 Redis/MySQL 最终状态幂等返回，不会为没有发生的状态转换再写一条 Outbox。
+
+但后端不能恢复“用户手指点击的绝对时间顺序”。如果客户端真正并发发送两个请求，网络可能让取消请求先到服务器；系统只能按**服务端实际取得锁并成功提交的顺序**处理，另一个并发请求通常会收到 `Aborted`。需要严格体现 UI 点击顺序时，客户端也应串行发送或在收到响应后再发送下一次状态变更。
+
+##### 二、身份三元组：一条事件如何被识别
 
 每条 outbox 事件带三层身份，分别用于不同链路环节：
 
@@ -4366,7 +4480,7 @@ UNIQUE KEY uk_event_consumer (event_id, consumer_name)
 
 **幂等靠 EventID、保序靠 AggregateID、语义靠 EventType**——三者各司其职。像点赞聚合的 AggregateID 用 `videoID:userID` 而不是单独 `videoID` 是刻意选择：只有同一用户对同一视频的相邻操作才存在"必须保序"的因果关系（点赞→取消→点赞的最终状态取决于最后一次），跨用户跨视频完全可以乱序不影响正确性。用 `videoID` 单独做 key 会把热点视频的所有点赞都挤到一个 partition 造成热点；用 `userID` 单独做 key 又会把同用户对不同视频的独立操作错误地串行化。当前粒度是**保序开销只花在真正需要保序的地方**。
 
-##### 二、跨事务保序的核心：`NOT EXISTS` 谓词
+##### 三、跨事务保序的核心：`NOT EXISTS` 谓词
 
 用户 U=42 对视频 V=100 在极短时间内点赞后又取消：
 
@@ -4401,11 +4515,21 @@ NOT EXISTS (
 | dispatcher-1 认领 1001 后 | processing | ❌ | 前驱 1001 是 processing，NOT EXISTS 不成立 |
 | dispatcher-1 投递成功、markSent 之后 | sent | ✅ | 前驱 1001 是 sent，NOT EXISTS 成立 |
 
-这样就把"两个独立事务写的两行"硬约束成了**按 `id` 递增的严格串行流水线**。`id` 的严格递增又由业务链路本身保证：用户点赞是同步 RPC，客户端必须等第一次响应返回才能发第二次请求，所以第二个事务 INSERT 时 MySQL auto_increment 必然分配到更大的 id。**业务操作顺序 → RPC 事务串行提交 → outbox id 严格递增 → NOT EXISTS 顺序 claim → Kafka offset 顺序前进**这条因果链完整闭合。
+这样就把“两个独立事务写的两行”硬约束成了**按 `id` 递增的严格串行流水线**。前一节的关系锁让同一 `(videoID,userID)` 上两次成功的状态变更按服务端顺序进入事务；第一个事务提交并释放锁后，第二个事务才会写入 Outbox，因此 MySQL auto_increment 为后者分配更大的 ID。完整因果链是：**关系锁确定成功事务顺序 → outbox id 递增 → NOT EXISTS 顺序 claim → Kafka offset 顺序前进**。
 
 值得注意的是 `NOT EXISTS` 里把 `dead` 也算作"未完成"——这是刻意为之。如果某条 `like.created` 因坏 payload 或长期 Kafka 故障进入 dead，**后续同 aggregate 的 `like.deleted` 会被强制阻塞、等待人工介入**，宁可整条 aggregate 停摆也不允许"跳过点赞发取消赞"这种破坏因果的事发生。
 
-##### 三、投递到 Kafka：partition key 双保险
+另一个边界是“Kafka 已经收到前序点赞，但 Dispatcher 回写 `sent` 失败”。这时前序事件超时后会被重新认领，可能产生：
+
+```text
+offset 500  like.created
+offset 501  like.created（重投）
+offset 502  like.deleted
+```
+
+后续取消点赞仍要等前序点赞最终标记为 `sent` 才能被 claim，因此允许“前序重复”，不允许“后序越过前序”。Consumer 使用 `processed_events(event_id,consumer_name)` 去掉重复副作用。
+
+##### 四、投递到 Kafka：partition key 双保险
 
 Claim 到事件后，`publishEvents` 组装消息发到 Kafka：
 
@@ -4425,7 +4549,7 @@ Kafka 的分区规则是 `partition = hash(Key) mod partitionCount`。因此 `Ag
 
 **两者缺一不可**：只有 partition key 没有 NOT EXISTS，投递顺序会乱；只有 NOT EXISTS 没有 partition key，投递顺序对但消息进了不同 partition，Kafka 仍无法保证跨 partition 顺序。
 
-##### 四、Consumer 侧：topic+partition 组内保序，组间并发
+##### 五、Consumer 侧：topic+partition 组内保序，组间并发
 
 Kafka 只保证**单个 partition 内消息有序**，不保证跨 partition。所以 consumer 端不能对同一 partition 的消息并发处理，否则会破坏 Kafka 精心维持的顺序性。以 `interaction_sync` 的 `HandleBatch` 为例：
 
@@ -4440,7 +4564,7 @@ func messageGroupKey(msg kafkax.Message) string {
 }
 ```
 
-把 500 条消息拆成若干个"保序小队列"，每个队列内部保持 Kafka 原始拉取顺序（同 partition 消息按 offset 递增排列，`append` 尾插不打乱顺序）。**组内不需要主动排序**——slice 里的顺序天然就是 offset 递增顺序。
+把 500 条消息拆成若干个“保序小队列”，每个队列内部保持 Kafka Reader 的原始拉取顺序（同 partition 消息按 offset 递增排列，`append` 尾插不打乱顺序）。**分组函数没有再次排序**，它依赖正常 Kafka 消费路径提供的分区内有序输入；如果测试代码手工向 `HandleBatch` 传入一份已经打乱 offset 的切片，分组函数不会替调用方纠正。
 
 **为什么 group key 用 `topic:partition` 而不是只用 `partition`？**因为 consumer 同时订阅了 `interaction.like.events` 和 `interaction.comment.events` 两个 topic，两者各自都有 partition 0~5，只用 partition 号会错误合并 `like.events:0` 和 `comment.events:0`——虽然合并后处理不会破坏顺序（两者是不同事件类型），但会不必要地降低并发度。
 
@@ -4464,23 +4588,34 @@ for i := 0; i < workerCount; i++ {
 
 **worker 数为什么设 4 而 partition 有 6 个？** 一个 partition 一次只能被一个 worker 处理，多余 worker 也没用；但也不需要严格等于 partition 数，因为一批 500 条消息通常不会平均散布到全部 6 个 partition。`normalizeSyncWorkerCount(workerCount, groupCount)` 取两者的较小值，分组少时不会启满 4 个 worker，避免 goroutine 空转。
 
-##### 五、四层机制的因果传导全景
+**跨批次也不会越过失败消息**：`RunBatch` 必须等待所有 group 处理成功后，才统一提交这批消息的 offset 并拉取下一批。任意 group 返回错误时，当前批次不提交，等待 1 秒后原地重试；已经成功的 group 可能被再次执行，因此还需要 `processed_events` 幂等。永久性坏消息会先写 `dead_letter_events` 再放行，避免单条脏消息永远卡住分区。
+
+**“组内保序”不等于互动统计逐事件执行 SQL**：`interaction_sync` 保留消息的 offset 顺序完成解码和分片，但 Flush RPC 会按 `event_id` 固定幂等插入顺序，并把同一视频的 `+1/-1` 聚合为净增量，再按 `video_id` 升序更新。这是安全的，因为点赞计数使用有符号加法，满足交换律；权威点赞关系已经在同步接口的 `likes` 表中变更，Kafka 负责的是计数、热度和通知等派生状态。保序是通用基础设施保证，互动统计本身又额外具备“即使重放或暂时乱序也能按净增量收敛”的韧性。
+
+##### 六、五层机制的因果传导全景
 
 ```mermaid
 flowchart TD
+    subgraph L0[层 0: 业务入口确定成功顺序]
+        CLICK[同一用户对同一视频<br/>先点赞 后取消点赞]
+        LOCK[LikeActionLockKey<br/>同一时刻只允许一个状态事务]
+        CLICK --> LOCK
+    end
+
     subgraph L1[层 1: DB 层跨事务保序]
         A1[事务 A: INSERT id=1001 like.created]
         A2[事务 B: INSERT id=1002 like.deleted]
+        A1 --> A2
         A1 --> NE["dispatcher SELECT ... NOT EXISTS<br/>同 aggregate 严格按 id 递增 claim"]
         A2 --> NE
     end
-
-    NE --> L2
 
     subgraph L2[层 2: Kafka 层 partition key]
         PK["Key=aggregate_id=100:42<br/>hash 到同一 partition"]
     end
 
+    LOCK --> A1
+    NE --> PK
     PK --> P3
 
     subgraph L3[层 3: Kafka partition 内 offset 有序]
@@ -4504,20 +4639,21 @@ flowchart TD
     end
 ```
 
-**四层机制的角色分工**：
+**五层机制的角色分工**：
 
 | 层 | 机制 | 保证的性质 | 缺失会怎样 |
 |---|---|---|---|
+| 0 | `LikeActionLockKey(videoID,userID)` + 状态幂等判断 | 同一点赞关系的成功事务串行化，确定服务端认可的业务顺序 | 并发点赞/取消可能基于旧状态交叉写入，Outbox ID 无法稳定表达状态转换顺序 |
 | 1 | `NOT EXISTS` 谓词 | 同 aggregate 严格按 outbox id 顺序离开表 | dispatcher 并发投递会乱序（先取消赞后点赞） |
 | 2 | partition key = aggregate_id | 同 aggregate 消息进同一 partition | 消息分散到多 partition，跨 partition 无序 |
 | 3 | Kafka partition 内 offset 有序 | 单 partition 内消息按写入顺序读出 | Kafka 协议保证，无需自己维护 |
 | 4 | topic+partition 分组 + worker pool | 组内保序（正确性）+ 组间并发（吞吐） | 单 partition 内并发会打乱顺序；不分组则退化为单线程消费 |
 
-**每一层解决前一层无法解决的问题，每一层又依赖前一层的输出作为输入**——保序是正确性底线（不允许妥协），并发是性能上限（在保序前提下榨干 CPU），四层叠加起来在两者之间取了最优的平衡点。
+**每一层解决前一层无法解决的问题，每一层又依赖前一层的输出作为输入**：保序是正确性底线，并发是性能上限；五层叠加后，只在互相独立的 aggregate 和 partition 之间并发。
 
-##### 六、一句话总结
+##### 七、一句话总结
 
-**跨事务保序**靠 `NOT EXISTS` 谓词把 outbox 表变成 aggregate 粒度的严格串行流水线；**跨节点保序**靠 Kafka partition key = AggregateID 让同聚合消息必然进同一 partition；**消费端保序 + 并发**靠 topic+partition 分组：组内交给同一个 worker 串行处理保住 Kafka 顺序，组间用 worker pool 并行处理榨干吞吐。这条从 MySQL 两行 INSERT 到 consumer worker 处理的完整因果链，是本项目"最终一致性但业务顺序绝不错乱"的核心保证。
+**业务顺序**先由同一点赞关系的 Redis 短锁和状态幂等判断确定；**跨事务保序**再由 `NOT EXISTS` 谓词把 Outbox 变成 aggregate 粒度的严格串行流水线；**跨节点保序**靠 Kafka partition key = AggregateID 让同聚合消息进入同一 partition；**消费端保序与并发**则靠 topic+partition 分组，让组内由同一个 worker 处理、组间由 worker pool 并行。相同 Partition 只是这条链路的中间一环，不能单独保证“点赞一定先于取消点赞”。
 
 ### 9.2 Consumer 通用模式
 
